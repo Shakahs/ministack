@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SES v2 — configuration set event publishing to SNS** — `SendEmail` and `SendBulkEmail` through a configuration set stored the message and published nothing, so an application consuming SES feedback from an SNS event destination saw no events. A send now publishes its `Send` event and each recipient's `Delivery`, `Bounce` and `Complaint` events, the mailbox simulator deciding the outcome as it does for identity notifications, to every enabled SNS event destination whose `MatchingEventTypes` include it. The records follow the documented event publishing format (`eventType`; `mail` with `source`, `sourceArn`, `destination`, `headers`, `commonHeaders` and `tags` holding `ses:operation`, `ses:configuration-set`, `ses:from-domain` and the send's `EmailTags`, or a bulk entry's `ReplacementTags` in place of `DefaultEmailTags`). One `Delivery` event lists a domain's delivered recipients and one `Bounce` event its recipients that bounced alike. Sending through a configuration set that does not exist answers 404 `NotFoundException`. Evidence: the SES developer guide's event publishing contents and examples, and the SESv2 Smithy model in `aws/api-models-aws`; not validated against AWS.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

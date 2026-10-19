@@ -1117,6 +1117,15 @@ _SIMULATOR_OUTCOMES = {
     # Accepted and delivered, then marked as spam.
     "complaint": (("Delivery", None), ("Complaint", None)),
 }
+_DELIVERED = (("Delivery", None),)
+
+
+def _recipient_outcomes(rcpt: str) -> tuple:
+    """The (notificationType, bounceSubType) pairs a send produces for one recipient address."""
+    local, _, domain = rcpt.partition("@")
+    if domain.lower() == _SIMULATOR_DOMAIN:
+        return _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], _DELIVERED)
+    return _DELIVERED
 
 
 def _notification_identity(source: str) -> tuple[str, dict] | None:
@@ -1144,28 +1153,29 @@ def _publish_notification(topic_arn: str, payload: dict) -> None:
         logger.warning("SES notification publish to %s failed", topic_arn, exc_info=True)
 
 
-def _notification_detail(kind: str, rcpt: str, ts: str, bounce_subtype: str | None = None) -> dict:
+def _notification_detail(kind: str, rcpts: list, ts: str, bounce_subtype: str | None = None) -> dict:
+    """The delivery / bounce / complaint object of one record, covering every recipient in *rcpts*."""
     if kind == "Delivery":
         return {"delivery": {
-            "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
+            "timestamp": ts, "processingTimeMillis": 0, "recipients": list(rcpts),
             "smtpResponse": "250 2.6.0 Message received",
             "reportingMTA": "a0-0.smtp-out.amazonses.com"}}
     if kind == "Bounce" and bounce_subtype == "Suppressed":
         # SES suppressed the send, so no remote MTA returned a DSN.
         return {"bounce": {
             "bounceType": "Permanent", "bounceSubType": "Suppressed",
-            "bouncedRecipients": [{"emailAddress": rcpt}],
+            "bouncedRecipients": [{"emailAddress": rcpt} for rcpt in rcpts],
             "timestamp": ts, "feedbackId": new_uuid()}}
     if kind == "Bounce":
         return {"bounce": {
             "bounceType": "Permanent", "bounceSubType": "General",
             "bouncedRecipients": [{
                 "emailAddress": rcpt, "action": "failed", "status": "5.1.1",
-                "diagnosticCode": "smtp; 550 5.1.1 user unknown"}],
+                "diagnosticCode": "smtp; 550 5.1.1 user unknown"} for rcpt in rcpts],
             "timestamp": ts, "feedbackId": new_uuid(),
             "reportingMTA": "dsn; a0-0.smtp-out.amazonses.com"}}
     return {"complaint": {
-        "complainedRecipients": [{"emailAddress": rcpt}],
+        "complainedRecipients": [{"emailAddress": rcpt} for rcpt in rcpts],
         "timestamp": ts, "feedbackId": new_uuid(),
         "userAgent": "Amazon SES Mailbox Simulator",
         "complaintFeedbackType": "abuse", "arrivalDate": ts}}
@@ -1194,15 +1204,11 @@ def _send_notifications(msg_id, source, recipients):
         "destination": recipients,
     }
     for rcpt in recipients:
-        local, _, domain = rcpt.partition("@")
-        outcomes = (("Delivery", None),)
-        if domain.lower() == _SIMULATOR_DOMAIN:
-            outcomes = _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], outcomes)
-        for kind, bounce_subtype in outcomes:
+        for kind, bounce_subtype in _recipient_outcomes(rcpt):
             topic = topics.get(kind)
             if not topic:
                 continue
-            detail = _notification_detail(kind, rcpt, ts, bounce_subtype)
+            detail = _notification_detail(kind, [rcpt], ts, bounce_subtype)
             _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
 
 

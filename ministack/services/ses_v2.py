@@ -21,6 +21,8 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           CreateDedicatedIpPool, GetDedicatedIpPool, ListDedicatedIpPools,
           DeleteDedicatedIpPool.
 Email templates live in the v1 store, so either API version sees the other's.
+SendEmail and SendBulkEmail through a configuration set publish their Send,
+Delivery, Bounce and Complaint events to its enabled SNS event destinations.
 """
 
 import base64
@@ -30,6 +32,9 @@ import logging
 import os
 import re
 import time
+from email.parser import HeaderParser
+from email.policy import default as default_policy
+from email.utils import parseaddr
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -45,8 +50,12 @@ from ministack.services.ses import (
     _account_details,
     _build_mime_message,
     _dkim_tokens,
+    _domain_and_parents,
     _message_rejection,
+    _notification_detail,
     _parse_raw_mime,
+    _publish_notification,
+    _recipient_outcomes,
     _render_template,
     _restore_regional_store,
     _sent_emails_list,
@@ -781,6 +790,121 @@ def _event_destinations_request(method, name, dest_name, data):
     return None
 
 
+# The events a send publishes, as a record's eventType names them and an event
+# destination's MatchingEventTypes lists them.
+_SEND_EVENT_TYPES = {"Send": "SEND", "Delivery": "DELIVERY", "Bounce": "BOUNCE", "Complaint": "COMPLAINT"}
+
+
+def _sns_event_topics(config_set):
+    """(TopicArn, matched event types) of each enabled SNS event destination of a configuration set."""
+    destinations = (_config_sets.get(config_set) or {}).get("EventDestinations") or {}
+    return [(d["SnsDestination"]["TopicArn"], set(d["MatchingEventTypes"]))
+            for d in destinations.values()
+            if d.get("Enabled") and (d.get("SnsDestination") or {}).get("TopicArn")]
+
+
+def _sending_identity_arn(sender):
+    """The ARN of the identity an address sends as: its address identity, else
+    the identity of its domain or nearest parent domain."""
+    stores = (_identities, _v1_identities)
+    if any(sender in store for store in stores):
+        return _resource_arn("identity", sender)
+    domains = {k.lower(): k for store in stores for k in store if "@" not in k}
+    for domain in _domain_and_parents(sender.rpartition("@")[2].lower()):
+        if domain in domains:
+            return _resource_arn("identity", domains[domain])
+    return _resource_arn("identity", sender)
+
+
+def _raw_message_text(raw_data):
+    """A Raw content's message, which the SDK sends base64-encoded."""
+    try:
+        return base64.b64decode(raw_data).decode("utf-8", errors="replace")
+    except (ValueError, TypeError):
+        return raw_data if isinstance(raw_data, str) else ""
+
+
+def _mail_headers(message_text, msg_id):
+    """The headers and commonHeaders of a published record's mail object, read
+    from the message as SES sends it."""
+    msg = HeaderParser(policy=default_policy).parsestr(message_text or "")
+    common = {}
+    for key, name in (("from", "From"), ("replyTo", "Reply-To"), ("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")):
+        header = msg.get(name)
+        if header is not None:
+            common[key] = [str(a) for a in getattr(header, "addresses", ())] or [str(header)]
+    if msg.get("Date") is not None:
+        common["date"] = str(msg["Date"])
+    # The ID SES assigned, not one the sender's message carried.
+    common["messageId"] = msg_id
+    common["subject"] = str(msg.get("Subject", ""))
+    return {
+        "headersTruncated": False,
+        "headers": [{"name": name, "value": str(value)} for name, value in msg.items()],
+        "commonHeaders": common,
+    }
+
+
+def _publish_send_events(config_set, *, operation, msg_id, source, identity_arn, recipients,
+                         message_text, email_tags):
+    """Publish a send's Send, Delivery, Bounce and Complaint events to the SNS
+    event destinations of its configuration set that match them.
+
+    A recipient's outcome follows the mailbox simulator, as the identity
+    notifications do: bounce@ bounces, complaint@ is delivered and then
+    complains, and any other address is delivered. One Delivery event lists the
+    delivered recipients of a domain, whose mail server takes the message once;
+    one Bounce event lists a domain's recipients that bounced alike.
+    """
+    topics = _sns_event_topics(config_set)
+    if not topics:
+        return
+    sender = parseaddr(source)[1]
+    recipients = [a for a in (parseaddr(r)[1] for r in recipients) if a]
+    tags = {
+        "ses:operation": [operation],
+        "ses:configuration-set": [config_set],
+        "ses:from-domain": [sender.rpartition("@")[2]],
+    }
+    for tag in email_tags:
+        tags[tag["Name"]] = [tag["Value"]]
+    mail = {
+        "timestamp": now_iso(),
+        "source": source,
+        "sourceArn": identity_arn or _sending_identity_arn(sender),
+        "sendingAccountId": get_account_id(),
+        "messageId": msg_id,
+        "destination": recipients,
+        **_mail_headers(message_text, msg_id),
+        "tags": tags,
+    }
+
+    delivered, bounced, complained = {}, {}, []
+    for rcpt in recipients:
+        domain = rcpt.rpartition("@")[2].lower()
+        for kind, bounce_subtype in _recipient_outcomes(rcpt):
+            if kind == "Delivery":
+                delivered.setdefault(domain, []).append(rcpt)
+            elif kind == "Bounce":
+                bounced.setdefault((domain, bounce_subtype), []).append(rcpt)
+            else:
+                complained.append(rcpt)
+    ts = now_iso()
+    records = [("Send", {"send": {}})]
+    records += [("Delivery", _notification_detail("Delivery", rcpts, ts)) for rcpts in delivered.values()]
+    records += [("Bounce", _notification_detail("Bounce", rcpts, ts, bounce_subtype))
+                for (_, bounce_subtype), rcpts in bounced.items()]
+    for rcpt in complained:
+        detail = _notification_detail("Complaint", [rcpt], ts)
+        detail["complaint"]["complaintSubType"] = None
+        records.append(("Complaint", detail))
+
+    for kind, detail in records:
+        for topic_arn, matching in topics:
+            if _SEND_EVENT_TYPES[kind] in matching:
+                _publish_notification(topic_arn, {"eventType": kind, "mail": mail, **detail})
+
+
 async def handle_request(method, path, headers, body, query_params):
     # The SES dispatcher also accepts unprefixed REST paths when selected by
     # a SESv2 target header. Preserve those paths and trailing-slash handling
@@ -843,6 +967,7 @@ async def handle_request(method, path, headers, body, query_params):
     if sub == "/outbound-emails" and method == "POST":
         msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
+        config_set = data.get("ConfigurationSetName", "")
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
         cc_addrs = dest.get("CcAddresses", [])
@@ -866,11 +991,11 @@ async def handle_request(method, path, headers, body, query_params):
             for part_info in parsed.get("BodyParts", []):
                 if isinstance(part_info, dict):
                     ct = part_info.get("ContentType", "")
-                    data = part_info.get("Data", "")
+                    part_data = part_info.get("Data", "")
                     if "text/plain" in ct:
-                        body_text = data
+                        body_text = part_data
                     elif "text/html" in ct:
-                        body_html = data
+                        body_html = part_data
             # Extract Cc/Bcc from raw MIME headers when not provided via Destination
             if not cc_addrs:
                 cc_addrs = [e.strip() for e in parsed.get("Cc", "").split(",") if e.strip()]
@@ -885,13 +1010,16 @@ async def handle_request(method, path, headers, body, query_params):
             body_text = rendered.get("Text", "")
             body_html = rendered.get("Html", "")
 
+        if config_set and config_set not in _config_sets:
+            return _missing_config_set(config_set)
         all_addrs = to_addrs + cc_addrs + bcc_addrs
-        rejected = _message_rejection(source or (parsed.get("From", "") if raw else ""), all_addrs)
+        sender = source or (parsed.get("From", "") if raw else "")
+        rejected = _message_rejection(sender, all_addrs)
         if rejected:
             return _json_err("MessageRejected", rejected)
+        mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                       subj, body_text, body_html, msg_id)
         if source and all_addrs:
-            mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
-                                           subj, body_text, body_html, msg_id)
             _smtp_relay(source, all_addrs, mime_str)
 
         # Append to shared sent_emails list for inspection endpoint visibility
@@ -911,7 +1039,15 @@ async def handle_request(method, path, headers, body, query_params):
             record["TemplateData"] = tpl.get("TemplateData", "")
             if template_name:
                 record["Template"] = template_name
+        if config_set:
+            record["ConfigurationSetName"] = config_set
         _sent_emails_list().append(record)
+        if config_set:
+            _publish_send_events(
+                config_set, operation="SendEmail", msg_id=msg_id, source=sender,
+                identity_arn=data.get("FromEmailAddressIdentityArn", ""), recipients=all_addrs,
+                message_text=_raw_message_text(raw.get("Data", "")) if raw else mime_str,
+                email_tags=data.get("EmailTags") or [])
 
         logger.info("SESv2 SendEmail: MessageId=%s | %s -> %s%s", msg_id, source, to_addrs,
                     f" | template={template_name}" if template_name else "")
@@ -931,6 +1067,8 @@ async def handle_request(method, path, headers, body, query_params):
         entries = data.get("BulkEmailEntries", [])
         if not entries:
             return _json_err("BadRequestException", "BulkEmailEntries is required")
+        if config_set and config_set not in _config_sets:
+            return _missing_config_set(config_set)
 
         rejected = _message_rejection(source)
         if rejected:
@@ -957,9 +1095,9 @@ async def handle_request(method, path, headers, body, query_params):
             msg_id = f"{new_uuid()}@email.amazonses.com"
 
             all_addrs = to_addrs + cc_addrs + bcc_addrs
+            mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                           subj, body_text, body_html, msg_id)
             if source and all_addrs:
-                mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
-                                               subj, body_text, body_html, msg_id)
                 _smtp_relay(source, all_addrs, mime_str)
 
             record = {
@@ -980,6 +1118,14 @@ async def handle_request(method, path, headers, body, query_params):
             if config_set:
                 record["ConfigurationSetName"] = config_set
             _sent_emails_list().append(record)
+            if config_set:
+                # An entry's ReplacementTags stand in for the request's DefaultEmailTags,
+                # as its ReplacementEmailContent does for the DefaultContent.
+                _publish_send_events(
+                    config_set, operation="SendBulkEmail", msg_id=msg_id, source=source,
+                    identity_arn=data.get("FromEmailAddressIdentityArn", ""), recipients=all_addrs,
+                    message_text=mime_str,
+                    email_tags=entry.get("ReplacementTags") or data.get("DefaultEmailTags") or [])
             results.append({"Status": "SUCCESS", "MessageId": msg_id})
 
         logger.info("SESv2 SendBulkEmail: %s | template=%s | %s entries",

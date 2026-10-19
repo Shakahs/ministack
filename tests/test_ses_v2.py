@@ -3,6 +3,7 @@ import copy
 import json
 import re
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
@@ -1318,5 +1319,190 @@ def test_dedicated_ip_pool_lifecycle(sesv2):
         sesv2.delete_dedicated_ip_pool(PoolName=name)
     with pytest.raises(ClientError) as exc:
         sesv2.get_dedicated_ip_pool(PoolName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+@pytest.fixture
+def ses_v2_event_queue(sesv2, sns, sqs):
+    """A configuration set, a sending domain, and an SQS queue subscribed with raw
+    message delivery to an SNS topic; `destination(types, enabled)` adds an event
+    destination publishing to the topic, and `drain(n)` collects published records."""
+    from conftest import sqs_policy_allow_sns
+
+    suffix = uuid.uuid4().hex[:8]
+    domain = f"events-{suffix}.example.com"
+    config_set = f"events-{suffix}"
+    sesv2.create_email_identity(EmailIdentity=domain)
+    sesv2.create_configuration_set(ConfigurationSetName=config_set)
+    topic_arn = sns.create_topic(Name=f"ses-events-{suffix}")["TopicArn"]
+    queue_url = sqs.create_queue(QueueName=f"ses-events-{suffix}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(QueueUrl=queue_url, Attributes={
+        "Policy": json.dumps(sqs_policy_allow_sns(queue_arn, topic_arn))})
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn,
+                  Attributes={"RawMessageDelivery": "true"})
+    names = iter(range(100))
+
+    def destination(types, enabled=True):
+        sesv2.create_configuration_set_event_destination(
+            ConfigurationSetName=config_set, EventDestinationName=f"sns-{next(names)}",
+            EventDestination={"Enabled": enabled, "MatchingEventTypes": types,
+                              "SnsDestination": {"TopicArn": topic_arn}})
+
+    def drain(expected):
+        """The records received once *expected* have arrived and no more follow."""
+        got = []
+        for _ in range(10):
+            batch = sqs.receive_message(
+                QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
+            got += [json.loads(m["Body"]) for m in batch]
+            if len(got) >= expected and not batch:
+                break
+        return got
+
+    yield SimpleNamespace(domain=domain, config_set=config_set, destination=destination, drain=drain)
+    sqs.delete_queue(QueueUrl=queue_url)
+    sns.delete_topic(TopicArn=topic_arn)
+    sesv2.delete_configuration_set(ConfigurationSetName=config_set)
+    sesv2.delete_email_identity(EmailIdentity=domain)
+
+
+_SIMULATOR = "simulator.amazonses.com"
+_EVENT_CONTENT = {"Simple": {"Subject": {"Data": "Statement"}, "Body": {"Text": {"Data": "b"}}}}
+
+
+def test_ses_v2_send_email_publishes_configuration_set_events(sesv2, ses_v2_event_queue):
+    q = ses_v2_event_queue
+    q.destination(["SEND", "DELIVERY", "BOUNCE", "COMPLAINT"])
+    sender = f"billing@{q.domain}"
+    to = [f"success@{_SIMULATOR}", f"bounce@{_SIMULATOR}"]
+    cc = [f"complaint@{_SIMULATOR}"]
+
+    msg_id = sesv2.send_email(
+        FromEmailAddress=f'"Billing" <{sender}>', Destination={"ToAddresses": to, "CcAddresses": cc},
+        Content=_EVENT_CONTENT, ConfigurationSetName=q.config_set,
+        EmailTags=[{"Name": "purpose", "Value": "statement"}],
+    )["MessageId"]
+
+    records = q.drain(4)
+    by_type = {}
+    for r in records:
+        by_type.setdefault(r["eventType"], []).append(r)
+    assert sorted(by_type) == ["Bounce", "Complaint", "Delivery", "Send"]
+    assert all(len(rs) == 1 for rs in by_type.values()), records
+    assert by_type["Send"][0]["send"] == {}
+    # complaint@ is delivered before it complains; both share the simulator's mail server.
+    assert sorted(by_type["Delivery"][0]["delivery"]["recipients"]) == sorted([to[0], cc[0]])
+    bounce = by_type["Bounce"][0]["bounce"]
+    assert (bounce["bounceType"], bounce["bounceSubType"]) == ("Permanent", "General")
+    assert [b["emailAddress"] for b in bounce["bouncedRecipients"]] == [to[1]]
+    complaint = by_type["Complaint"][0]["complaint"]
+    assert [c["emailAddress"] for c in complaint["complainedRecipients"]] == cc
+    assert complaint["complaintSubType"] is None
+
+    for r in records:
+        mail = r["mail"]
+        assert mail["messageId"] == msg_id
+        assert mail["source"] == f'"Billing" <{sender}>'
+        assert mail["sourceArn"] == f"arn:aws:ses:us-east-1:000000000000:identity/{q.domain}"
+        assert mail["sendingAccountId"] == "000000000000"
+        assert mail["destination"] == to + cc
+        assert mail["headersTruncated"] is False
+        assert mail["commonHeaders"]["from"] == [f"Billing <{sender}>"]
+        assert mail["commonHeaders"]["to"] == to
+        assert mail["commonHeaders"]["cc"] == cc
+        assert mail["commonHeaders"]["subject"] == "Statement"
+        assert mail["commonHeaders"]["messageId"] == msg_id
+        assert {h["name"] for h in mail["headers"]} >= {"From", "To", "Cc", "Subject"}
+        assert mail["tags"] == {
+            "ses:operation": ["SendEmail"],
+            "ses:configuration-set": [q.config_set],
+            "ses:from-domain": [q.domain],
+            "purpose": ["statement"],
+        }
+
+
+def test_ses_v2_events_follow_destination_matching_and_enabled(sesv2, ses_v2_event_queue):
+    q = ses_v2_event_queue
+    q.destination(["BOUNCE"])
+    q.destination(["SEND", "DELIVERY", "BOUNCE", "COMPLAINT"], enabled=False)
+
+    sesv2.send_email(
+        FromEmailAddress=f"billing@{q.domain}",
+        Destination={"ToAddresses": [f"success@{_SIMULATOR}", f"bounce+label@{_SIMULATOR}"]},
+        Content=_EVENT_CONTENT, ConfigurationSetName=q.config_set,
+    )
+
+    assert [r["eventType"] for r in q.drain(1)] == ["Bounce"]
+
+
+def test_ses_v2_send_without_event_destination_publishes_nothing(sesv2, ses_v2_event_queue):
+    q = ses_v2_event_queue
+    sesv2.send_email(
+        FromEmailAddress=f"billing@{q.domain}", Destination={"ToAddresses": [f"success@{_SIMULATOR}"]},
+        Content=_EVENT_CONTENT, ConfigurationSetName=q.config_set,
+    )
+
+    assert q.drain(0) == []
+
+
+def test_ses_v2_raw_send_events_carry_the_raw_message_headers(sesv2, ses_v2_event_queue):
+    q = ses_v2_event_queue
+    q.destination(["SEND"])
+    sender = f"billing@{q.domain}"
+    raw = (f"From: {sender}\r\nTo: success@{_SIMULATOR}\r\nSubject: Raw statement\r\n"
+           "X-Erp-Batch: 7\r\n\r\nbody").encode()
+
+    msg_id = sesv2.send_email(
+        FromEmailAddress=sender, Destination={"ToAddresses": [f"success@{_SIMULATOR}"]},
+        Content={"Raw": {"Data": raw}}, ConfigurationSetName=q.config_set,
+    )["MessageId"]
+
+    [record] = q.drain(1)
+    assert record["eventType"] == "Send"
+    assert record["mail"]["messageId"] == msg_id
+    assert {"name": "X-Erp-Batch", "value": "7"} in record["mail"]["headers"]
+    assert record["mail"]["commonHeaders"]["subject"] == "Raw statement"
+
+
+def test_ses_v2_bulk_send_publishes_events_per_entry(sesv2, ses_v2_event_queue):
+    q = ses_v2_event_queue
+    q.destination(["SEND"])
+    tpl = f"events-tpl-{uuid.uuid4().hex[:8]}"
+    sesv2.create_email_template(
+        TemplateName=tpl, TemplateContent={"Subject": "Hi {{name}}", "Text": "t"})
+    try:
+        result = sesv2.send_bulk_email(
+            FromEmailAddress=f"billing@{q.domain}", ConfigurationSetName=q.config_set,
+            DefaultContent={"Template": {"TemplateName": tpl, "TemplateData": '{"name": "a"}'}},
+            DefaultEmailTags=[{"Name": "purpose", "Value": "default"}],
+            BulkEmailEntries=[
+                {"Destination": {"ToAddresses": [f"success@{_SIMULATOR}"]}},
+                {"Destination": {"ToAddresses": [f"success+2@{_SIMULATOR}"]},
+                 "ReplacementTags": [{"Name": "purpose", "Value": "replaced"}]},
+            ],
+        )["BulkEmailEntryResults"]
+        ids = [r["MessageId"] for r in result]
+
+        records = {r["mail"]["messageId"]: r for r in q.drain(2)}
+        assert sorted(records) == sorted(ids)
+        assert records[ids[0]]["mail"]["tags"]["purpose"] == ["default"]
+        assert records[ids[1]]["mail"]["tags"]["purpose"] == ["replaced"]
+        assert records[ids[0]]["mail"]["tags"]["ses:operation"] == ["SendBulkEmail"]
+        assert records[ids[0]]["mail"]["commonHeaders"]["subject"] == "Hi a"
+    finally:
+        sesv2.delete_email_template(TemplateName=tpl)
+
+
+def test_ses_v2_send_through_missing_configuration_set_is_not_found(sesv2, ses_v2_event_queue):
+    q = ses_v2_event_queue
+    missing = f"missing-{uuid.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        sesv2.send_email(
+            FromEmailAddress=f"billing@{q.domain}", Destination={"ToAddresses": [f"success@{_SIMULATOR}"]},
+            Content=_EVENT_CONTENT, ConfigurationSetName=missing,
+        )
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
