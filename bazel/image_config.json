@@ -1,0 +1,7 @@
+{
+  "config": {
+    "ExposedPorts": {
+      "4566/tcp": {}
+    }
+  }
+}

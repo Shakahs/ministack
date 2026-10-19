@@ -1,0 +1,83 @@
+"""MiniStack, the AWS emulator the ERP's Amazon Services Dev Services run, built by rules_py and
+packaged by rules_img on UBI 10's minimal image (the base the RDP proxy's image uses too).
+
+The Dev Services start it by its image's name (quarkus.aws.devservices.ministack.image-name):
+dev mode once `bazel run //vendor/ministack:image_load` has loaded it, the tests once their
+session has loaded :image_stream into their container runtime.
+"""
+
+load("@aspect_rules_py//py:defs.bzl", "py_image_layer", "py_library")
+load("@aspect_rules_py//py/unstable:defs.bzl", "py_venv_binary")
+load("@rules_img//img:image.bzl", "image_manifest")
+load("@rules_img//img:load.bzl", "image_load")
+load("@rules_img_images.bzl", "image")
+
+# The name the image is loaded under, which the Dev Services start it by.
+IMAGE_TAG = "ministack:erp"
+
+py_library(
+    name = "ministack_lib",
+    srcs = glob(["ministack/**/*.py"]),
+    imports = ["."],
+    deps = [
+        "@ministack_pypi//botocore",
+        "@ministack_pypi//cryptography",
+        "@ministack_pypi//defusedxml",
+        "@ministack_pypi//graphql_core",
+        "@ministack_pypi//hypercorn",
+        "@ministack_pypi//jsonata_python",
+        "@ministack_pypi//pyyaml",
+    ],
+)
+
+# The server, as the upstream image runs it (`python -m ministack`), in the virtualenv of the
+# hub's `server` dependency group, which rules_py assembles at build time rather than at start.
+# Not named after the package: the binary's runfiles hold its sources' ministack/ directory at
+# the path a binary of that name would take.
+py_venv_binary(
+    name = "server",
+    srcs = ["ministack/__main__.py"],
+    main = "ministack/__main__.py",
+    python_version = "3.13",
+    venv = "server",
+    deps = [":ministack_lib"],
+)
+
+# The binary under /vendor/ministack, split into its interpreter's layer, its packages' and its
+# own sources'.
+image_manifest(
+    name = "image",
+    base = image("ubi_minimal"),
+    config_fragment = "//vendor/ministack/bazel:image_config.json",
+    entrypoint = ["/" + package_name() + "/server"],
+    # The upstream image's settings for the server: the one port every service answers on, and
+    # unbuffered output, so its log reaches the container's as it is written.
+    env = {
+        "GATEWAY_PORT": "4566",
+        "MINISTACK_VERSION": "1.5.29-erp",
+        "PYTHONUNBUFFERED": "1",
+    },
+    layers = py_image_layer(
+        name = "layers",
+        binary = ":server",
+    ),
+    platform = "//vendor/ministack/bazel:linux_x86_64_glibc",
+)
+
+# `bazel run //vendor/ministack:image_load` loads the image into the local container runtime,
+# where dev mode's Dev Services start it.
+image_load(
+    name = "image_load",
+    image = ":image",
+    tag = IMAGE_TAG,
+)
+
+# Writes the image, as `docker save` does, to its standard output: the ERP's tests load it into
+# their container runtime through Testcontainers before their Dev Services start it.
+image_load(
+    name = "image_stream",
+    daemon = "tar",
+    image = ":image",
+    tag = IMAGE_TAG,
+    visibility = ["//web/jvm:__pkg__"],
+)

@@ -1,0 +1,29 @@
+# The Python packages the Bazel-built server (//vendor/ministack:server) runs on, locked in
+# uv.lock for rules_py's uv extension. They are the package's own runtime dependencies
+# (../pyproject.toml), and cryptography, without which Cognito signs no token and ACM issues no
+# certificate (the Docker image installs it too).
+#
+# `server` is the one dependency group, and so the hub's one venv, which the server's binary
+# selects. Regenerate the lock with `uv lock` in this directory.
+[project]
+name = "ministack-server"
+version = "1.5.29"
+requires-python = "==3.13.*"
+dependencies = []
+
+[dependency-groups]
+server = [
+    "hypercorn>=0.18.0",
+    "pyyaml>=6.0",
+    "defusedxml>=0.7",
+    "botocore==1.43.106",
+    "jsonata-python>=0.7.0",
+    "graphql-core==3.2.12",
+    # Below 50.0.2, the first release with cp315-abi3.abi3t wheels, a tag aspect_rules_py 1.12.1's
+    # uv hub cannot select on (its abi3t constraint arrives in 2.0).
+    "cryptography>=41.0,<50.0.2",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux'"]
