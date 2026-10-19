@@ -701,3 +701,103 @@ def test_acm_certificates_are_region_isolated(acm_client):
         assert arn not in west
     finally:
         acm_client.delete_certificate(CertificateArn=arn)
+
+
+# ── Issued certificates and ExportCertificate ─────────────────────────
+
+
+def _load_cert(pem):
+    from cryptography import x509
+
+    return x509.load_pem_x509_certificate(pem.encode("utf-8"))
+
+
+@pytest.mark.parametrize("key_algorithm,key_kind", [
+    ("RSA_2048", "rsa-2048"),
+    ("EC_prime256v1", "secp256r1"),
+    ("EC_secp384r1", "secp384r1"),
+])
+def test_requested_certificate_is_issued_for_its_names(acm_client, key_algorithm, key_kind):
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+    arn = acm_client.request_certificate(
+        DomainName="issued.example.com", SubjectAlternativeNames=["*.issued.example.com"],
+        KeyAlgorithm=key_algorithm,
+    )["CertificateArn"]
+    try:
+        got = acm_client.get_certificate(CertificateArn=arn)
+        leaf, ca = _load_cert(got["Certificate"]), _load_cert(got["CertificateChain"])
+        leaf.verify_directly_issued_by(ca)
+        sans = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        assert sans.get_values_for_type(x509.DNSName) == ["issued.example.com", "*.issued.example.com"]
+        public_key = leaf.public_key()
+        if isinstance(public_key, rsa.RSAPublicKey):
+            assert f"rsa-{public_key.key_size}" == key_kind
+        else:
+            assert isinstance(public_key, ec.EllipticCurvePublicKey)
+            assert public_key.curve.name == key_kind
+        assert (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days == 198
+        described = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]
+        assert described["KeyAlgorithm"] == key_algorithm
+        assert described["NotAfter"].timestamp() == int(leaf.not_valid_after_utc.timestamp())
+    finally:
+        acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_export_certificate_returns_the_key_encrypted_under_the_passphrase(acm_client):
+    from cryptography.hazmat.primitives import serialization
+
+    arn = acm_client.request_certificate(
+        DomainName="export.example.com", Options={"Export": "ENABLED"})["CertificateArn"]
+    try:
+        assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == {
+            "Export": "ENABLED"}
+        exported = acm_client.export_certificate(CertificateArn=arn, Passphrase=b"correct horse")
+        got = acm_client.get_certificate(CertificateArn=arn)
+        assert exported["Certificate"] == got["Certificate"]
+        assert exported["CertificateChain"] == got["CertificateChain"]
+        assert exported["PrivateKey"].startswith("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+        with pytest.raises(TypeError):
+            serialization.load_pem_private_key(exported["PrivateKey"].encode(), password=None)
+        key = serialization.load_pem_private_key(exported["PrivateKey"].encode(), password=b"correct horse")
+        public = serialization.PublicFormat.SubjectPublicKeyInfo
+        assert (key.public_key().public_bytes(serialization.Encoding.PEM, public)
+                == _load_cert(exported["Certificate"]).public_key().public_bytes(serialization.Encoding.PEM, public))
+    finally:
+        acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_export_certificate_refuses_a_certificate_requested_without_export(acm_client):
+    arn = acm_client.request_certificate(DomainName="noexport.example.com")["CertificateArn"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            acm_client.export_certificate(CertificateArn=arn, Passphrase=b"passphrase")
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_export_certificate_needs_a_passphrase_of_four_to_128_bytes(acm_client):
+    arn = acm_client.request_certificate(
+        DomainName="passphrase.example.com", Options={"Export": "ENABLED"})["CertificateArn"]
+    try:
+        for passphrase in (b"abc", b"a" * 129):
+            with pytest.raises(ClientError) as exc:
+                acm_client.export_certificate(CertificateArn=arn, Passphrase=passphrase)
+            assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_export_certificate_of_a_missing_certificate_is_not_found(acm_client):
+    missing = "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ClientError) as exc:
+        acm_client.export_certificate(CertificateArn=missing, Passphrase=b"passphrase")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_request_certificate_refuses_an_import_only_key_algorithm(acm_client):
+    with pytest.raises(ClientError) as exc:
+        acm_client.request_certificate(DomainName="rsa4096.example.com", KeyAlgorithm="RSA_4096")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"

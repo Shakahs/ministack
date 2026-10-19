@@ -132,7 +132,7 @@ def sign_leaf_certificate(
         san_dns: Optional list of DNS names to include as SubjectAltName.
         san_ips: Optional list of IPv4/IPv6 strings to include as SubjectAltName.
         days_valid: Validity period in days (default 825, AWS-style).
-        key_type: ``"rsa2048"`` (default) or ``"ec256"``.
+        key_type: ``"rsa2048"`` (default), ``"ec256"`` or ``"ec384"``.
         subject_rdns: extra subject attributes after the CN, as
             ``[("OU", "RDS"), ("O", "Amazon.com"), ...]`` in wire order.
 
@@ -148,6 +148,8 @@ def sign_leaf_certificate(
 
     if key_type == "ec256":
         leaf_key = ec.generate_private_key(ec.SECP256R1())
+    elif key_type == "ec384":
+        leaf_key = ec.generate_private_key(ec.SECP384R1())
     elif key_type == "rsa2048":
         leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     else:

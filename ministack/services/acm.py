@@ -6,15 +6,23 @@ JSON-based API via X-Amz-Target.
 Supports: RequestCertificate, DescribeCertificate, ListCertificates,
           DeleteCertificate, GetCertificate, ImportCertificate,
           AddTagsToCertificate, RemoveTagsFromCertificate, ListTagsForCertificate,
-          UpdateCertificateOptions, RenewCertificate, ResendValidationEmail.
+          UpdateCertificateOptions, RenewCertificate, ResendValidationEmail,
+          ExportCertificate.
+
+With `cryptography` installed, RequestCertificate issues a real X.509
+certificate for the requested names, signed by a local CA whose certificate
+is the chain, and one requested with Options.Export ENABLED exports with its
+private key.
 """
 
+import base64
 import copy
 import datetime
 import hashlib
 import json
 import logging
 import os
+import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -59,8 +67,9 @@ def get_state():
 
 def _synthetic_pem(domain):
     """A clearly-synthetic but syntactically PEM-decodable placeholder
-    for RequestCertificate-issued certs. The emulator does not generate
-    real X.509, so anything that actually parses ASN.1 will still fail,
+    for RequestCertificate-issued certs when `cryptography` is not
+    installed, and so no real X.509 can be generated: anything that
+    actually parses ASN.1 will still fail,
     but the PEM body must remain valid base64 so consumers that pre-
     decode (PyOpenSSL, cryptography) don't error before they get to the
     parser. The requested domain lives in DomainName / SubjectAlternative
@@ -73,6 +82,52 @@ def _synthetic_pem(domain):
         "AQIDBAUGBwgJCgsMDQ4PEA==\n"
         "-----END CERTIFICATE-----\n"
     )
+
+
+# The key algorithms ACM issues a requested certificate with; the others are
+# for imported certificates only.
+_ISSUED_KEY_TYPES = {"RSA_2048": "rsa2048", "EC_prime256v1": "ec256", "EC_secp384r1": "ec384"}
+# ACM certificates are valid for 198 days.
+_ISSUED_DAYS_VALID = 198
+
+_ca_lock = threading.Lock()
+_ca: tuple[str, str] | None = None
+
+
+def _issuing_ca() -> tuple[str, str]:
+    """The (certificate, key) PEMs of the CA that signs requested certificates, minted on first use."""
+    global _ca
+    with _ca_lock:
+        if _ca is None:
+            from ministack.core.x509_utils import generate_ca
+
+            _ca = generate_ca(org_name="MiniStack", common_name="MiniStack ACM Local CA")
+            logger.info("ACM: generated the issuing CA")
+        return _ca
+
+
+def _issued_certificate(domain, sans, key_algorithm):
+    """The PEM fields and validity of a certificate for *domain* and *sans*, or
+    None without `cryptography`, when the synthetic placeholder stands in."""
+    from ministack.core import x509_utils
+
+    if not x509_utils.HAS_CRYPTO:
+        return None
+    from cryptography import x509
+
+    ca_cert, ca_key = _issuing_ca()
+    cert_pem, key_pem, _public = x509_utils.sign_leaf_certificate(
+        ca_cert, ca_key, common_name=domain, san_dns=sans,
+        days_valid=_ISSUED_DAYS_VALID, key_type=_ISSUED_KEY_TYPES[key_algorithm],
+    )
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    return {
+        "NotBefore": cert.not_valid_before_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "NotAfter": cert.not_valid_after_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "_pem_body": cert_pem,
+        "_pem_chain": ca_cert,
+        "_private_key": key_pem,
+    }
 
 
 def _region_from_arn(value, fallback):
@@ -206,7 +261,7 @@ def _cert_shape(cert):
         "SubjectAlternativeNames": cert.get("SubjectAlternativeNames", [cert["DomainName"]]),
         "Status": cert["Status"],
         "Type": cert.get("Type", "AMAZON_ISSUED"),
-        "KeyAlgorithm": "RSA_2048",
+        "KeyAlgorithm": cert.get("KeyAlgorithm", "RSA_2048"),
         "SignatureAlgorithm": "SHA256WITHRSA",
         "InUseBy": cert.get("InUseBy", []) + _signing_profiles_using(cert["CertificateArn"]),
         "CreatedAt": _epoch(cert["CreatedAt"]),
@@ -241,6 +296,7 @@ async def handle_request(method, path, headers, body, query_params):
         "UpdateCertificateOptions": _update_options,
         "RenewCertificate": _renew_certificate,
         "ResendValidationEmail": _resend_validation_email,
+        "ExportCertificate": _export_certificate,
     }
 
     handler = handlers.get(action)
@@ -257,6 +313,13 @@ def _request_certificate(data):
     sans = data.get("SubjectAlternativeNames", [domain])
     if domain not in sans:
         sans = [domain] + sans
+    key_algorithm = data.get("KeyAlgorithm") or "RSA_2048"
+    if key_algorithm not in _ISSUED_KEY_TYPES:
+        return error_response_json(
+            "InvalidParameterException",
+            f"KeyAlgorithm {key_algorithm} is not supported for requested certificates; "
+            f"use one of {', '.join(_ISSUED_KEY_TYPES)}.", 400)
+    options = data.get("Options") or {}
     arn = _cert_arn()
     now = now_iso()
     _certificates[arn] = {
@@ -271,12 +334,19 @@ def _request_certificate(data):
         "NotAfter": _future_iso(365 * 24 * 3600),
         "DomainValidationOptions": [_validation_options(d, method) for d in sans],
         "ValidationMethod": method,
+        "KeyAlgorithm": key_algorithm,
         "Tags": data.get("Tags", []),
-        "Options": {},
+        # The members the request set; Export, which only the request sets, decides
+        # whether the certificate exports.
+        "Options": {k: options[k] for k in ("CertificateTransparencyLoggingPreference", "Export")
+                    if options.get(k)},
         "_pem_body": _synthetic_pem(domain),
         "_pem_chain": "",
         "_private_key": "",
     }
+    issued = _issued_certificate(domain, sans, key_algorithm)
+    if issued:
+        _certificates[arn].update(issued)
     logger.info("RequestCertificate: %s -> %s", domain, arn)
     return json_response({"CertificateArn": arn})
 
@@ -452,6 +522,45 @@ def _renew_certificate(data):
     if _get_local_certificate(arn) is None:
         return _certificate_not_found(arn)
     return json_response({})
+
+
+def _export_certificate(data):
+    arn = data.get("CertificateArn", "")
+    cert = _get_local_certificate(arn)
+    if cert is None:
+        return _certificate_not_found(arn)
+    raw_passphrase = data.get("Passphrase")
+    try:
+        # A blob member, which the JSON protocol carries base64-encoded.
+        passphrase = base64.b64decode(raw_passphrase) if isinstance(raw_passphrase, str) else b""
+    except ValueError:
+        passphrase = b""
+    if raw_passphrase is None or not 4 <= len(passphrase) <= 128:
+        constraint = ("Member must not be null" if raw_passphrase is None
+                      else "Member must have length between 4 and 128")
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value at 'passphrase' failed to satisfy constraint: {constraint}", 400)
+    # Only a certificate ACM issued on a request with export enabled exports; a
+    # placeholder issued without `cryptography`, or restored without its key, has none.
+    exportable = (cert.get("Type", "AMAZON_ISSUED") == "AMAZON_ISSUED"
+                  and cert.get("Options", {}).get("Export") == "ENABLED"
+                  and cert.get("_private_key"))
+    if not exportable:
+        return error_response_json("ValidationException", f"Certificate ARN: {arn} is not exportable.", 400)
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(cert["_private_key"].encode("utf-8"), password=None)
+    # Encrypted PKCS #8: cryptography writes PBES2 with 2048 PBKDF2 rounds and
+    # AES-256-CBC, the scheme of the key in the ACM user guide's export example.
+    private_key = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(passphrase))
+    return json_response({
+        "Certificate": cert["_pem_body"],
+        "CertificateChain": cert.get("_pem_chain", ""),
+        "PrivateKey": private_key.decode("utf-8"),
+    })
 
 
 def _resend_validation_email(data):
