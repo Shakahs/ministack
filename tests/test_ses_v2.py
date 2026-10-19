@@ -1386,15 +1386,15 @@ def test_ses_v2_send_email_publishes_configuration_set_events(sesv2, ses_v2_even
         EmailTags=[{"Name": "purpose", "Value": "statement"}],
     )["MessageId"]
 
-    records = q.drain(4)
+    records = q.drain(5)
     by_type = {}
     for r in records:
         by_type.setdefault(r["eventType"], []).append(r)
-    assert sorted(by_type) == ["Bounce", "Complaint", "Delivery", "Send"]
-    assert all(len(rs) == 1 for rs in by_type.values()), records
+    assert {t: len(rs) for t, rs in by_type.items()} == {"Send": 1, "Delivery": 2, "Bounce": 1, "Complaint": 1}
     assert by_type["Send"][0]["send"] == {}
-    # complaint@ is delivered before it complains; both share the simulator's mail server.
-    assert sorted(by_type["Delivery"][0]["delivery"]["recipients"]) == sorted([to[0], cc[0]])
+    # complaint@ is delivered before it complains; each delivery is its own event.
+    assert sorted(r["delivery"]["recipients"][0] for r in by_type["Delivery"]) == sorted([to[0], cc[0]])
+    assert all(len(r["delivery"]["recipients"]) == 1 for r in by_type["Delivery"])
     bounce = by_type["Bounce"][0]["bounce"]
     assert (bounce["bounceType"], bounce["bounceSubType"]) == ("Permanent", "General")
     assert [b["emailAddress"] for b in bounce["bouncedRecipients"]] == [to[1]]
@@ -1436,6 +1436,21 @@ def test_ses_v2_events_follow_destination_matching_and_enabled(sesv2, ses_v2_eve
     )
 
     assert [r["eventType"] for r in q.drain(1)] == ["Bounce"]
+
+
+def test_ses_v2_simulated_bounces_of_one_send_are_one_bounce_event(sesv2, ses_v2_event_queue):
+    """The mailbox simulator combines the bounces of one sending request into a single response."""
+    q = ses_v2_event_queue
+    q.destination(["BOUNCE"])
+    bounced = [f"bounce+1@{_SIMULATOR}", f"bounce+2@{_SIMULATOR}"]
+
+    sesv2.send_email(
+        FromEmailAddress=f"billing@{q.domain}", Destination={"ToAddresses": bounced},
+        Content=_EVENT_CONTENT, ConfigurationSetName=q.config_set,
+    )
+
+    [record] = q.drain(1)
+    assert [b["emailAddress"] for b in record["bounce"]["bouncedRecipients"]] == bounced
 
 
 def test_ses_v2_send_without_event_destination_publishes_nothing(sesv2, ses_v2_event_queue):

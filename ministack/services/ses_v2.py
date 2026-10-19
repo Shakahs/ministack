@@ -852,9 +852,12 @@ def _publish_send_events(config_set, *, operation, msg_id, source, identity_arn,
 
     A recipient's outcome follows the mailbox simulator, as the identity
     notifications do: bounce@ bounces, complaint@ is delivered and then
-    complains, and any other address is delivered. One Delivery event lists the
-    delivered recipients of a domain, whose mail server takes the message once;
-    one Bounce event lists a domain's recipients that bounced alike.
+    complains, and any other address is delivered.
+
+    SES makes no batching guarantee: an event may cover one recipient or
+    several. Each recipient's Delivery and Complaint is its own event, the
+    shape real SES has been seen to publish, while the bounces of one send
+    alike are one Bounce event, as the mailbox simulator combines them.
     """
     topics = _sns_event_topics(config_set)
     if not topics:
@@ -879,21 +882,20 @@ def _publish_send_events(config_set, *, operation, msg_id, source, identity_arn,
         "tags": tags,
     }
 
-    delivered, bounced, complained = {}, {}, []
+    delivered, bounced, complained = [], {}, []
     for rcpt in recipients:
-        domain = rcpt.rpartition("@")[2].lower()
         for kind, bounce_subtype in _recipient_outcomes(rcpt):
             if kind == "Delivery":
-                delivered.setdefault(domain, []).append(rcpt)
+                delivered.append(rcpt)
             elif kind == "Bounce":
-                bounced.setdefault((domain, bounce_subtype), []).append(rcpt)
+                bounced.setdefault(bounce_subtype, []).append(rcpt)
             else:
                 complained.append(rcpt)
     ts = now_iso()
     records = [("Send", {"send": {}})]
-    records += [("Delivery", _notification_detail("Delivery", rcpts, ts)) for rcpts in delivered.values()]
+    records += [("Delivery", _notification_detail("Delivery", [rcpt], ts)) for rcpt in delivered]
     records += [("Bounce", _notification_detail("Bounce", rcpts, ts, bounce_subtype))
-                for (_, bounce_subtype), rcpts in bounced.items()]
+                for bounce_subtype, rcpts in bounced.items()]
     for rcpt in complained:
         detail = _notification_detail("Complaint", [rcpt], ts)
         detail["complaint"]["complaintSubType"] = None
