@@ -3,7 +3,7 @@ packaged by rules_img on UBI 10's minimal image (the base the RDP proxy's image 
 
 The image is loaded as ministack:<digest> (:image_load), the name the Dev Services start it by
 (quarkus.aws.devservices.ministack.image-name): dev mode once dev.sh has run :image_load, an
-application test once its ministack_test (defs.bzl) has.
+application test once the dev_services_test it runs under (//web/jvm/images:defs.bzl) has.
 """
 
 load("@aspect_rules_py//py:defs.bzl", "py_image_layer", "py_library")
@@ -90,7 +90,7 @@ filegroup(
     name = "image_digest",
     srcs = [":image"],
     output_group = "digest",
-    visibility = ["//web/jvm:__pkg__"],
+    visibility = ["//web/jvm/images:__pkg__"],
 )
 
 # Loads the image into the local container runtime as ministack:<digest>, so the name always
@@ -106,5 +106,5 @@ image_load(
     tag = "docker.io/library/ministack:{{slice .digest 7}}",
     tool_cfg = "target",
     tracks_content = True,
-    visibility = ["//web/jvm:__pkg__"],
+    visibility = ["//web/jvm/images:__pkg__"],
 )
