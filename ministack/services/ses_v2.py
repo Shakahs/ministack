@@ -970,6 +970,11 @@ async def handle_request(method, path, headers, body, query_params):
         msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
         config_set = data.get("ConfigurationSetName", "")
+        if not _config_sets.get(config_set, {}).get("SendingOptions", {"SendingEnabled": True})["SendingEnabled"]:
+            return _json_err(
+                "SendingPausedException",
+                f"Email sending is disabled for the configuration set <{config_set}>.",
+            )
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
         cc_addrs = dest.get("CcAddresses", [])

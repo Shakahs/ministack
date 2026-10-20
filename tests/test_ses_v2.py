@@ -284,6 +284,25 @@ def test_ses_v2_configuration_set_options_and_destinations_survive_persistence(s
             _call(ses_v2, "GET", f"{path}/persisted/event-destinations")[1]) == before
 
 
+def test_ses_v2_send_email_through_a_paused_configuration_set_is_refused(ses_v2):
+    _verify(ses_v2)
+    path = "/v2/email/configuration-sets"
+    assert _call(ses_v2, "POST", path, body={
+        "ConfigurationSetName": "paused", "SendingOptions": {"SendingEnabled": False}})[0] == 200
+    send = {
+        "FromEmailAddress": "sender@example.com",
+        "Destination": {"ToAddresses": ["to@example.net"]},
+        "Content": {"Simple": {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}}},
+        "ConfigurationSetName": "paused",
+    }
+    status, body = _call(ses_v2, "POST", "/v2/email/outbound-emails", body=send)
+    assert (status, body["name"]) == (400, "SendingPausedException")
+    assert not ses_v2._sent_emails_list()
+
+    assert _call(ses_v2, "PUT", f"{path}/paused/sending", body={"SendingEnabled": True})[0] == 200
+    assert _call(ses_v2, "POST", "/v2/email/outbound-emails", body=send)[0] == 200
+
+
 @pytest.mark.parametrize(
     "bad_arn",
     [
