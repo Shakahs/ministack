@@ -1,19 +1,17 @@
 """MiniStack, the AWS emulator the ERP's Amazon Services Dev Services run, built by rules_py and
 packaged by rules_img on UBI 10's minimal image (the base the RDP proxy's image uses too).
 
-The Dev Services start it by its image's name (quarkus.aws.devservices.ministack.image-name):
-dev mode once `bazel run //vendor/ministack:image_load` has loaded it, the tests once their
-session has loaded :image_stream into their container runtime.
+The image is loaded as ministack:<digest> (:image_load), the name the Dev Services start it by
+(quarkus.aws.devservices.ministack.image-name): dev mode once dev.sh has run :image_load, an
+application test once its ministack_test (defs.bzl) has.
 """
 
 load("@aspect_rules_py//py:defs.bzl", "py_image_layer", "py_library")
 load("@aspect_rules_py//py/unstable:defs.bzl", "py_venv_binary")
 load("@rules_img//img:image.bzl", "image_manifest")
+load("@rules_img//img:layer.bzl", "layer_from_tar")
 load("@rules_img//img:load.bzl", "image_load")
 load("@rules_img_images.bzl", "image")
-
-# The name the image is loaded under, which the Dev Services start it by.
-IMAGE_TAG = "ministack:erp"
 
 py_library(
     name = "ministack_lib",
@@ -38,13 +36,39 @@ py_venv_binary(
     name = "server",
     srcs = ["ministack/__main__.py"],
     main = "ministack/__main__.py",
-    python_version = "3.13",
+    python_version = "3.14",
     venv = "server",
     deps = [":ministack_lib"],
 )
 
 # The binary under /vendor/ministack, split into its interpreter's layer, its packages' and its
-# own sources'.
+# own sources'. The runfiles hold a symlink and its target as two files (the interpreter's python,
+# python3 and python3.14; its libpython3.14.so and libpython3.14.so.1.0), so each layer is rewritten
+# with identical files hardlinked, leaving one copy of each. The rewrite compresses the layers, so
+# their tars are left uncompressed.
+#
+# The interpreter's executable is statically linked, as are python-build-standalone's: its shared
+# library is only for embedding the interpreter in another program, so it is grouped into a layer
+# of its own, which the image leaves out.
+EMBEDDING_LAYER = "layers_embedding"
+
+LAYERS = py_image_layer(
+    name = "layers",
+    binary = ":server",
+    compress = "",
+    layer_groups = {"embedding": "/lib/libpython3[.]14[.]so"},
+)
+
+[
+    layer_from_tar(
+        name = layer + "_deduplicated",
+        src = layer,
+        optimize = True,
+    )
+    for layer in LAYERS
+    if layer != EMBEDDING_LAYER
+]
+
 image_manifest(
     name = "image",
     base = image("ubi_minimal"),
@@ -57,27 +81,30 @@ image_manifest(
         "MINISTACK_VERSION": "1.5.29-erp",
         "PYTHONUNBUFFERED": "1",
     },
-    layers = py_image_layer(
-        name = "layers",
-        binary = ":server",
-    ),
+    layers = [layer + "_deduplicated" for layer in LAYERS if layer != EMBEDDING_LAYER],
     platform = "//vendor/ministack/bazel:linux_x86_64_glibc",
 )
 
-# `bazel run //vendor/ministack:image_load` loads the image into the local container runtime,
-# where dev mode's Dev Services start it.
+# The digest of the image's manifest, which the tests and dev.sh name the image by.
+filegroup(
+    name = "image_digest",
+    srcs = [":image"],
+    output_group = "digest",
+    visibility = ["//web/jvm:__pkg__"],
+)
+
+# Loads the image into the local container runtime as ministack:<digest>, so the name always
+# means the image this build made. Its layers are in its runfiles (eager), not fetched from the
+# remote cache at load, and the loader is built for the target platform, so an application test
+# that has it as data runs it in the test's own environment.
 image_load(
     name = "image_load",
     image = ":image",
-    tag = IMAGE_TAG,
-)
-
-# Writes the image, as `docker save` does, to its standard output: the ERP's tests load it into
-# their container runtime through Testcontainers before their Dev Services start it.
-image_load(
-    name = "image_stream",
-    daemon = "tar",
-    image = ":image",
-    tag = IMAGE_TAG,
+    strategy = "eager",
+    # Fully qualified: Docker's containerd image store hides a loaded name that is not, and
+    # resolves the Dev Services' ministack:<digest> to this one.
+    tag = "docker.io/library/ministack:{{slice .digest 7}}",
+    tool_cfg = "target",
+    tracks_content = True,
     visibility = ["//web/jvm:__pkg__"],
 )

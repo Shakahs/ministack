@@ -5,7 +5,9 @@ exports_files([
 ])
 
 # The platform the image runs on: x86_64 Linux on UBI 10's glibc (2.39), against which the uv
-# hub chooses each package's manylinux wheel.
+# hub chooses each package's manylinux wheel. The interpreter leaves out what a server never
+# runs: C headers and build configuration, documentation, the GUI and its editor, pip's
+# bootstrapper, pydoc's templates, and the Python 2 converter.
 platform(
     name = "linux_x86_64_glibc",
     constraint_values = [
@@ -15,6 +17,19 @@ platform(
     flags = [
         "--@aspect_rules_py//uv/private/constraints/platform:platform_libc=glibc",
         "--@aspect_rules_py//uv/private/constraints/platform:platform_version=2.39",
+    ] + [
+        "--@aspect_rules_py//py/private/interpreter:exclude_feature=" + feature
+        for feature in [
+            "config",
+            "docs",
+            "ensurepip",
+            "headers",
+            "idle",
+            "lib2to3",
+            "pydoc",
+            "tkinter",
+            "turtle",
+        ]
     ],
     visibility = ["//vendor/ministack:__pkg__"],
 )
