@@ -2,8 +2,8 @@
 packaged by rules_img on UBI 10's minimal image (the base the RDP proxy's image uses too).
 
 The image is loaded as ministack:<digest> (:image_load), the name the Dev Services start it by
-(quarkus.aws.devservices.ministack.image-name): dev mode once dev.sh has run :image_load, an
-application test once the dev_services_test it runs under (//web/jvm/images:defs.bzl) has.
+(quarkus.aws.devservices.ministack.image-name): dev mode and an application test once the
+dev_services_run or dev_services_test they run under (//web/jvm/images:defs.bzl) has run it.
 """
 
 load("@aspect_rules_py//py:defs.bzl", "py_image_layer", "py_library")
@@ -85,7 +85,7 @@ image_manifest(
     platform = "//vendor/ministack/bazel:linux_x86_64_glibc",
 )
 
-# The digest of the image's manifest, which the tests and dev.sh name the image by.
+# The digest of the image's manifest, which dev mode and the tests name the image by.
 filegroup(
     name = "image_digest",
     srcs = [":image"],
