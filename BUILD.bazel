@@ -10,8 +10,7 @@ load("@aspect_rules_py//py:defs.bzl", "py_image_layer", "py_library")
 load("@aspect_rules_py//py/unstable:defs.bzl", "py_venv_binary")
 load("@rules_img//img:image.bzl", "image_manifest")
 load("@rules_img//img:layer.bzl", "layer_from_tar")
-load("@rules_img//img:load.bzl", "image_load")
-load("//tools/images:defs.bzl", "publish_package_images")
+load("//tools/images:defs.bzl", "ecr_image_load", "publish_package_images")
 
 py_library(
     name = "ministack_lib",
@@ -94,18 +93,14 @@ filegroup(
 )
 
 # Loads the image into the local container runtime as ministack:<digest>, so the name always
-# means the image this build made. Its layers are in its runfiles (eager), not fetched from the
-# remote cache at load, and the loader is built for the target platform, so an application test
-# that has it as data runs it in the test's own environment.
-image_load(
+# means the image this build made. Bazel publishes its SOCI index to ECR before
+# the loader pulls it through the test VM's SOCI-enabled Docker daemon.
+ecr_image_load(
     name = "image_load",
-    image = ":image",
-    strategy = "eager",
     # Fully qualified: Docker's containerd image store hides a loaded name that is not, and
     # resolves the Dev Services' ministack:<digest> to this one.
-    tag = "docker.io/library/ministack:{{slice .digest 7}}",
-    tool_cfg = "target",
-    tracks_content = True,
+    digest_tag_prefix = "docker.io/library/ministack",
+    image = ":image",
     visibility = ["//web/jvm/images:__pkg__"],
 )
 
