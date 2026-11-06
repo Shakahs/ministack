@@ -11,7 +11,7 @@ load("@aspect_rules_py//py/unstable:defs.bzl", "py_venv_binary")
 load("@rules_img//img:image.bzl", "image_manifest")
 load("@rules_img//img:layer.bzl", "layer_from_tar")
 load("@rules_img//img:load.bzl", "image_load")
-load("@rules_img_images.bzl", "image")
+load("//tools/images:defs.bzl", "publish_package_images")
 
 py_library(
     name = "ministack_lib",
@@ -71,7 +71,7 @@ LAYERS = py_image_layer(
 
 image_manifest(
     name = "image",
-    base = image("ubi_minimal"),
+    base = "//tools/images:ubi_minimal_gzip",
     config_fragment = "//vendor/ministack/bazel:image_config.json",
     entrypoint = ["/" + package_name() + "/server"],
     # The upstream image's settings for the server: the one port every service answers on, and
@@ -108,3 +108,5 @@ image_load(
     tracks_content = True,
     visibility = ["//web/jvm/images:__pkg__"],
 )
+
+publish_package_images()
