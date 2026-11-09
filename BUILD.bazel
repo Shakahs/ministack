@@ -71,7 +71,7 @@ LAYERS = py_image_layer(
 
 image_manifest(
     name = "image",
-    base = "//tools/images:ubi_minimal_gzip",
+    base = "//tools/images:ubi_minimal_zstd",
     config_fragment = "//vendor/ministack/bazel:image_config.json",
     entrypoint = ["/" + package_name() + "/server"],
     # The upstream image's settings for the server: the one port every service answers on, and
@@ -95,8 +95,8 @@ filegroup(
 )
 
 # Loads the image into the local container runtime as ministack:<digest>, so the name always
-# means the image this build made. Bazel publishes its SOCI index to ECR before
-# the loader pulls it through the test VM's SOCI-enabled Docker daemon.
+# means the image this build made. Bazel publishes its OCI index to ECR before
+# the loader pulls it through the test VM's Docker daemon.
 ecr_image_load(
     name = "image_load",
     # Fully qualified: Docker's containerd image store hides a loaded name that is not, and
