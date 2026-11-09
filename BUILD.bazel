@@ -1,7 +1,7 @@
 """MiniStack, the AWS emulator the ERP's Amazon Services Dev Services run, built by rules_py and
 packaged by rules_img on UBI 10's minimal image (the base the RDP proxy's image uses too).
 
-Dev mode and the application tests name the image by its published index in ECR
+Dev mode and the application tests name the image by its digest
 (//web/jvm/images:ministack_registry_reference), the name the Dev Services start it by
 (quarkus.aws.devservices.ministack.image-name). The Rust integration tests load it as
 ministack:<digest> (:image_load).
@@ -9,9 +9,9 @@ ministack:<digest> (:image_load).
 
 load("@aspect_rules_py//py:defs.bzl", "py_image_layer", "py_library")
 load("@aspect_rules_py//py/unstable:defs.bzl", "py_venv_binary")
-load("@rules_img//img:image.bzl", "image_manifest")
+load("@rules_img//img:image.bzl", "image_index", "image_manifest")
 load("@rules_img//img:layer.bzl", "layer_from_tar")
-load("//tools/images:defs.bzl", "ecr_image_load", "publish_package_images")
+load("@rules_img//img:load.bzl", "image_load")
 
 py_library(
     name = "ministack_lib",
@@ -85,6 +85,14 @@ image_manifest(
     platform = "//vendor/ministack/bazel:linux_x86_64_glibc",
 )
 
+# The image's OCI index, whose digest names it to the Dev Services and which their container
+# store unpacks (//web/jvm/images).
+image_index(
+    name = "image_index",
+    manifests = [":image"],
+    visibility = ["//web/jvm/images:__pkg__"],
+)
+
 # The digest of the image's manifest, which the Rust integration tests name the image by, and which
 # identifies the image to a retained Quarkus test runtime (//web/jvm/images:dev_services_runtime_digests).
 filegroup(
@@ -95,15 +103,13 @@ filegroup(
 )
 
 # Loads the image into the local container runtime as ministack:<digest>, so the name always
-# means the image this build made. Bazel publishes its OCI index to ECR before
-# the loader pulls it through the test VM's Docker daemon.
-ecr_image_load(
+# means the image this build made.
+image_load(
     name = "image_load",
+    image = ":image",
     # Fully qualified: Docker's containerd image store hides a loaded name that is not, and
     # resolves the Dev Services' ministack:<digest> to this one.
-    digest_tag_prefix = "docker.io/library/ministack",
-    image = ":image",
+    tag = "docker.io/library/ministack:{{slice .digest 7}}",
+    tracks_content = True,
     visibility = ["//web/jvm/images:__pkg__"],
 )
-
-publish_package_images()
