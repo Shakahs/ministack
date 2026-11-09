@@ -1,3 +1,5 @@
+load("//tools/lint:starlark_sources.bzl", "starlark_sources")
+
 exports_files([
     "image_config.json",
     "pyproject.toml",
@@ -33,3 +35,5 @@ platform(
     ],
     visibility = ["//vendor/ministack:__pkg__"],
 )
+
+starlark_sources(name = "starlark_sources")
