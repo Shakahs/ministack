@@ -98,6 +98,16 @@ def _error_response(sqlstate, message, detail=None):
     return _frame(b"E", payload)
 
 
+def _notice_response(severity, sqlstate, message):
+    payload = (
+        b"S" + severity.encode() + b"\0V" + severity.encode() + b"\0"
+        + b"C" + sqlstate.encode() + b"\0"
+        + b"M" + message.encode() + b"\0"
+        + b"\0"
+    )
+    return _frame(b"N", payload)
+
+
 def _ready(status=b"I"):
     return _frame(b"Z", status)
 
@@ -604,7 +614,7 @@ def classify_statement(sql):
     elif kw == "EXPLAIN":
         inner = _explain_inner(s)
         return classify_statement(inner) if inner is not None else "other"
-    if kw in _DDL_KEYWORDS:
+    if kw in _DDL_KEYWORDS or (kw == "AWS" and _AWS_IAM_RE.match(s)):
         return "ddl"
     if kw in _DML_KEYWORDS:
         return "dml"
@@ -1531,9 +1541,14 @@ def validate(sql, txn_state=None):
 class _Conn:
     def __init__(self, cluster_id):
         self.cluster_id = cluster_id
+        self.user = "admin"  # the role the client signed in as
+        self.database = "postgres"
         self.txn = TxnState()
         self.capture = None  # asyncio.Queue while swallowing backend frames
         self.catalog_version = None  # last catalog version this conn has seen
+        # One entry per forwarded statement still owed a result: the command tag
+        # to report for an AWS IAM statement sent to the backend as DO, else None.
+        self.result_tags = []
         # Extended-protocol state, reset at each Sync.
         self.ext_skip = False  # dropping messages until Sync after an error
         self.ext_forwarded = False  # any message reached the backend this cycle
@@ -1579,9 +1594,9 @@ async def _connect_backend_once(host, port, database):
     reader, writer = await asyncio.open_connection(host, port)
     params = b"user\0postgres\0database\0" + database.encode() + b"\0\0"
     payload = struct.pack("!I", _PROTOCOL_3) + params
-    writer.write(struct.pack("!I", len(payload) + 4) + payload)
-    await writer.drain()
     try:
+        writer.write(struct.pack("!I", len(payload) + 4) + payload)
+        await writer.drain()
         while True:
             type_byte, payload = await _read_frame(reader)
             if type_byte == b"E":
@@ -1592,7 +1607,7 @@ async def _connect_backend_once(host, port, database):
                     raise RuntimeError(f"backend requested unsupported auth method {code}")
             elif type_byte == b"Z":
                 return reader, writer
-    except Exception:
+    except BaseException:
         writer.close()
         raise
 
@@ -1608,11 +1623,27 @@ async def _backend_relay(conn, b_reader, c_writer):
         type_byte, payload = await _read_frame(b_reader)
         if type_byte == b"Z" and payload:
             conn.txn.note_backend_status(payload[:1])
+        if conn.capture is None and conn.result_tags:
+            type_byte, payload = _relabel_iam_result(conn, type_byte, payload)
+        if type_byte == b"Z":
+            conn.result_tags.clear()
         if conn.capture is not None:
             conn.capture.put_nowait((type_byte, payload))
         else:
             c_writer.write(_frame(type_byte, payload))
             await c_writer.drain()
+
+
+def _relabel_iam_result(conn, type_byte, payload):
+    """Report an AWS IAM statement's DO result under its own command tag."""
+    tag = conn.result_tags[0]
+    if type_byte in (b"C", b"E", b"I", b"s"):
+        conn.result_tags.pop(0)
+        if tag and type_byte == b"C":
+            return type_byte, tag.encode() + b"\0"
+    if tag and type_byte in (b"N", b"E"):
+        return type_byte, _without_context(payload)
+    return type_byte, payload
 
 
 async def _run_backend_capture(conn, b_writer, sql):
@@ -1908,6 +1939,265 @@ def _deferred(cols, param, resolve):
     }
 
 
+# --- AWS IAM GRANT / REVOKE and sys.iam_pg_role_mappings -------------------
+#
+# Measured on Aurora DSQL, eu-west-1 2026-10-26. The mappings live in the
+# definition of a real sys.iam_pg_role_mappings view that a GRANT or REVOKE
+# rewrites in the client's transaction, so a rollback undoes it.
+
+_AWS_IAM_RE = re.compile(r"\s*AWS\s+IAM\s+(GRANT|REVOKE)\b", re.I)
+_IAM_ARN_RE = re.compile(r"arn:[^:]+:iam::")
+_IAM_VIEW_SQL = (
+    "VIEW sys.iam_pg_role_mappings AS "
+    "SELECT v.iam_oid, v.arn COLLATE \"C\" AS arn, v.pg_role_oid, r.rolname AS pg_role_name, "
+    "g.oid AS grantor_pg_role_oid, v.grantor AS grantor_pg_role_name "
+    "FROM (VALUES {rows}) AS v(iam_oid, arn, pg_role_oid, grantor) "
+    "JOIN pg_roles r ON r.oid = v.pg_role_oid LEFT JOIN pg_roles g ON g.rolname = v.grantor"
+)
+_IAM_NO_ROWS = "(0::oid, ''::text, 0::oid, ''::name)"
+_IAM_ROW_FORMAT = "(%s::oid, %L::text, %s::oid, %L::name)"
+_IAM_LOCK = "pg_advisory_xact_lock(hashtext('sys.iam_pg_role_mappings'))"
+_IAM_SETUP_SQL = (
+    f"SELECT {_IAM_LOCK}; "
+    "DO $$ BEGIN CREATE ROLE admin WITH LOGIN; "
+    "EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; "
+    "DO $$ BEGIN CREATE SCHEMA IF NOT EXISTS sys; "
+    "EXCEPTION WHEN duplicate_schema OR unique_violation THEN NULL; END $$; "
+    "DO $$ BEGIN IF to_regclass('sys.iam_pg_role_mappings') IS NULL THEN CREATE "
+    + _IAM_VIEW_SQL.replace("{rows}", _IAM_NO_ROWS)
+    + "; END IF; EXCEPTION WHEN duplicate_table OR unique_violation THEN NULL; END $$"
+)
+_DROP_ROLE_RE = re.compile(
+    r"\s*DROP\s+(?:ROLE|USER|GROUP)\s+(?:IF\s+EXISTS\s+)?(.*?)\s*;?\s*$", re.I | re.S
+)
+_iam_ready = set()  # (cluster_id, database) pairs with admin and the view in place
+
+
+class IamTrust:
+    """A parsed ``AWS IAM GRANT <role> TO '<arn>'[, ...]`` (or REVOKE ... FROM)."""
+
+    def __init__(self, action, role, arns):
+        self.action = action
+        self.role = role
+        self.arns = arns
+
+    @property
+    def tag(self):
+        return f"AWS IAM {self.action}"
+
+
+_IAM_TOKEN_RE = re.compile(
+    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<qid>\"(?:[^\"]|\"\")*\")"
+    r"|(?P<word>[A-Za-z_][A-Za-z0-9_$]*)|(?P<punct>.))",
+    re.S,
+)
+
+
+def _iam_tokens(text):
+    tokens, i, n = [], 0, len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+            continue
+        if text.startswith(("--", "/*"), i):
+            i = _skip_noise(text, i)
+            continue
+        m = _IAM_TOKEN_RE.match(text, i)
+        tokens.append((m.lastgroup, m.group(m.lastgroup)))
+        i = m.end()
+    return tokens
+
+
+def _iam_syntax_error(token):
+    if token is None:
+        return DsqlError("42601", "syntax error at end of input")
+    return DsqlError("42601", f'syntax error at or near "{token[1]}"')
+
+
+def match_aws_iam(sql):
+    """IamTrust for an ``AWS IAM GRANT``/``REVOKE``, a DsqlError, or None."""
+    m = _AWS_IAM_RE.match(sql)
+    if not m:
+        return None
+    action = m.group(1).upper()
+    tokens = _iam_tokens(sql[m.end():].rstrip().rstrip(";"))
+    pos = 0
+
+    def take():
+        nonlocal pos
+        token = tokens[pos] if pos < len(tokens) else None
+        pos += 1
+        return token
+
+    role_token = take()
+    if role_token is None or role_token[0] not in ("word", "qid"):
+        return _iam_syntax_error(role_token)
+    role, _ = fold_identifier(role_token[1])
+
+    keyword = take()
+    if keyword is None or keyword[0] != "word" or keyword[1].upper() != (
+        "TO" if action == "GRANT" else "FROM"
+    ):
+        return _iam_syntax_error(keyword)
+
+    arns = []
+    while True:
+        literal = take()
+        if literal is None or literal[0] != "str":
+            return _iam_syntax_error(literal)
+        arn = literal[1][1:-1].replace("''", "'")
+        if arn not in arns:
+            arns.append(arn)
+        separator = take()
+        if separator is None:
+            break
+        if separator != ("punct", ","):
+            return _iam_syntax_error(separator)
+
+    for arn in arns:
+        if not _IAM_ARN_RE.match(arn):
+            return DsqlError("0P000", "IAM role must look like an IAM ARN")
+    return IamTrust(action, role, arns)
+
+
+def _sql_literal(value):
+    """A literal that reads the same whatever ``standard_conforming_strings`` is."""
+    return "E'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def _iam_trust_sql(trust, grantor):
+    """One DO block that applies an IamTrust, raising DSQL's errors and notices."""
+    role = _sql_literal(trust.role)
+    arns = "ARRAY[" + ", ".join(_sql_literal(a) for a in trust.arns) + "]::text[]"
+    view = _sql_literal("CREATE OR REPLACE " + _IAM_VIEW_SQL)
+    row_format = _sql_literal(_IAM_ROW_FORMAT)
+    current_rows = (
+        f"SELECT string_agg(format({row_format}, m.iam_oid, m.arn, m.pg_role_oid, "
+        "m.grantor_pg_role_name), ', ') INTO _rows FROM sys.iam_pg_role_mappings m"
+    )
+    if trust.action == "GRANT":
+        loop = (
+            "SELECT m.grantor_pg_role_name INTO _grantor FROM sys.iam_pg_role_mappings m "
+            "WHERE m.arn = _arn AND m.pg_role_oid = _role_oid; "
+            "IF FOUND THEN RAISE NOTICE '%', format('IAM role \"%s\" has already been granted "
+            f"access to role \"%s\" by role \"%s\"', _arn, {role}, _grantor); CONTINUE; END IF; "
+            "SELECT m.iam_oid INTO _oid FROM sys.iam_pg_role_mappings m WHERE m.arn = _arn LIMIT 1; "
+            "IF _oid IS NULL THEN "
+            "SELECT (max(m.iam_oid)::int8 + 1)::oid INTO _oid FROM sys.iam_pg_role_mappings m; "
+            "_oid := COALESCE(_oid, pg_nextoid('pg_authid', 'oid', 'pg_authid_oid_index')); "
+            "WHILE EXISTS (SELECT 1 FROM pg_authid WHERE oid = _oid) LOOP "
+            "_oid := (_oid::int8 + 1)::oid; END LOOP; END IF; "
+            f"{current_rows}; "
+            f"_rows := concat_ws(', ', _rows, format({row_format}, _oid, _arn, _role_oid, "
+            f"{_sql_literal(grantor)})); "
+        )
+    else:
+        loop = (
+            "IF NOT EXISTS (SELECT 1 FROM sys.iam_pg_role_mappings m "
+            "WHERE m.arn = _arn AND m.pg_role_oid = _role_oid) THEN "
+            "RAISE WARNING '%', format('IAM role \"%s\" has not been granted access to role "
+            f"\"%s\"', _arn, {role}); CONTINUE; END IF; "
+            f"{current_rows} WHERE NOT (m.arn = _arn AND m.pg_role_oid = _role_oid); "
+            f"_rows := COALESCE(_rows, {_sql_literal(_IAM_NO_ROWS)}); "
+        )
+    body = (
+        "DECLARE _role_oid oid; _arn text; _grantor name; _oid oid; _rows text; BEGIN "
+        f"SELECT oid INTO _role_oid FROM pg_roles WHERE rolname = {role}; "
+        "IF _role_oid IS NULL THEN RAISE EXCEPTION USING ERRCODE = '42704', "
+        f"MESSAGE = format('role \"%s\" does not exist', {role}); END IF; "
+        f"PERFORM {_IAM_LOCK}; "
+        f"FOREACH _arn IN ARRAY {arns} LOOP {loop}"
+        f"EXECUTE replace({view}, '{{rows}}', _rows); END LOOP; END"
+    )
+    return _do_block(body)
+
+
+def _do_block(body):
+    tag = "$iam$"
+    while tag in body:
+        tag = f"$iam_{secrets.token_hex(4)}$"
+    return f"DO {tag} {body} {tag}"
+
+
+def _without_context(payload):
+    """An ErrorResponse/NoticeResponse payload without its PL/pgSQL CONTEXT field."""
+    fields = [f for f in payload.split(b"\0") if f and f[:1] != b"W"]
+    return b"\0".join(fields) + b"\0\0"
+
+
+async def _prepare_backend(conn, b_reader, b_writer):
+    """Give a database the admin role and sys.iam_pg_role_mappings DSQL has, once."""
+    key = (conn.cluster_id, conn.database)
+    if key in _iam_ready:
+        return
+    b_writer.write(_frame(b"Q", _IAM_SETUP_SQL.encode() + b"\0"))
+    await b_writer.drain()
+    error = None
+    while True:
+        type_byte, payload = await _read_frame(b_reader)
+        if type_byte == b"E" and error is None:
+            error = "%s %s" % _error_payload_fields(payload)
+        if type_byte == b"Z":
+            break
+    if error:
+        logger.warning(
+            "pgproxy: could not create sys.iam_pg_role_mappings (cluster %s, database %s): %s",
+            conn.cluster_id, conn.database, error,
+        )
+        return
+    _iam_ready.add(key)
+
+
+async def _run_iam_trust(conn, b_writer, trust):
+    """Apply an IamTrust on the backend; return (frames for the client, backend_error)."""
+    frames = await _run_backend_capture(conn, b_writer, _iam_trust_sql(trust, conn.user))
+    backend_err = next((p for t, p in frames if t == b"E"), None)
+    if backend_err is not None:
+        return None, _without_context(backend_err)
+    conn.catalog_version = _bump_catalog(conn.cluster_id)
+    out = b"".join(_frame(t, _without_context(p)) for t, p in frames if t == b"N")
+    return out + _command_complete(trust.tag), None
+
+
+def _drop_role_sql(conn, sql):
+    """A DO block that refuses (2BP01) to drop a role with an IAM mapping, else runs the DROP."""
+    m = _DROP_ROLE_RE.match(sql)
+    if not m or (conn.cluster_id, conn.database) not in _iam_ready:
+        return None
+    names = [fold_identifier(n)[0] for n in _split_top_level(m.group(1)) if n.strip()]
+    if not names:
+        return None
+    body = (
+        "DECLARE _name name; BEGIN "
+        "SELECT m.pg_role_name INTO _name FROM sys.iam_pg_role_mappings m WHERE m.pg_role_name IN ("
+        + ", ".join(_sql_literal(n) for n in names) + ") LIMIT 1; "
+        "IF FOUND THEN RAISE EXCEPTION USING ERRCODE = '2BP01', MESSAGE = "
+        "format('role \"%s\" cannot be dropped because some objects depend on it', _name); "
+        f"END IF; EXECUTE {_sql_literal(sql.rstrip().rstrip(';'))}; END"
+    )
+    return _do_block(body)
+
+
+def _check_iam(conn, s, txn):
+    """IamTrust or DsqlError for an AWS IAM statement, else None."""
+    trust = match_aws_iam(s)
+    if trust is None or isinstance(trust, DsqlError):
+        return trust
+    if txn.in_txn and txn.ddl_seen:
+        return DsqlError("0A000", "multiple ddl statements not supported in a transaction")
+    result = validate(s, txn)
+    if isinstance(result, DsqlError):
+        return result
+    if trust.action == "GRANT" and trust.role == conn.user:
+        return DsqlError(
+            "42501",
+            f'permission denied to grant IAM trust with role "{trust.role}"',
+            f'Only roles with the ADMIN option on role "{trust.role}" may grant '
+            "IAM trust to this role.",
+        )
+    return trust
+
+
 async def _plan_statement(conn, s, b_writer, allow_probe=True):
     """Decide what to do with one statement, for either wire protocol.
 
@@ -1915,6 +2205,8 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
       "error"    — payload is a DsqlError to report
       "rows"     — payload describes a synthetic result set (sys.jobs etc.)
       "rewrite"  — payload is a Rewrite to run on the backend as a job
+      "iam"      — payload is an IamTrust to apply
+      "relabel"  — payload is (sql, tag): run sql, report it under tag
       "forward"  — payload is None; relay the statement untouched
 
     ``allow_probe`` is False when the backend is mid extended-protocol
@@ -1949,6 +2241,12 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
             return "error", result
         return "rows", result
 
+    trust = _check_iam(conn, s, conn.txn)
+    if isinstance(trust, DsqlError):
+        return "error", trust
+    if trust is not None:
+        return "iam", trust
+
     result = validate(s, conn.txn)
     if isinstance(result, DsqlError):
         return "error", result
@@ -1972,6 +2270,9 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
         if err:
             return "error", err
 
+    drop = _drop_role_sql(conn, s)
+    if drop:
+        return "relabel", (drop, "DROP ROLE")
     return "forward", None
 
 
@@ -2090,6 +2391,22 @@ async def _handle_query(conn, sql, b_writer, c_writer):
             c_writer.write(out + _ready(_status(conn)))
             await c_writer.drain()
             return
+        if kind == "relabel":
+            _note_catalog(conn, s)
+            txn.apply(s)
+            conn.result_tags = [result[1]]
+            b_writer.write(_frame(b"Q", result[0].encode() + b"\0"))
+            await b_writer.drain()
+            return
+        if kind == "iam":
+            txn.apply(s)
+            out, backend_err = await _run_iam_trust(conn, b_writer, result)
+            if backend_err is not None:
+                c_writer.write(_frame(b"E", backend_err) + _ready(_status(conn)))
+            else:
+                c_writer.write(out + _ready(_status(conn)))
+            await c_writer.drain()
+            return
         if kind == "rewrite":
             txn.apply(s)
             # Run the rewritten statement on the backend, swallow its
@@ -2132,12 +2449,25 @@ async def _handle_query(conn, sql, b_writer, c_writer):
                 return
         sim = txn.copy()
         explicit = False
+        batch, tags = [], []
         if not sim.in_txn and len(stmts) > 1:
             sim.in_txn = True  # implicit transaction
         for s in stmts:
             if classify_statement(s) == "tcl_begin":
                 explicit = True
-            result = validate(s, sim)
+            trust = _check_iam(conn, strip_leading_comments(s), sim)
+            if isinstance(trust, IamTrust):
+                batch.append(_iam_trust_sql(trust, conn.user))
+                tags.append(trust.tag)
+                sim.apply(s)
+                continue
+            result = trust or validate(s, sim)
+            drop = None if isinstance(result, (DsqlError, Rewrite)) else _drop_role_sql(conn, s)
+            if drop:
+                batch.append(drop)
+                tags.append("DROP ROLE")
+                sim.apply(s)
+                continue
             if isinstance(result, (DsqlError, Rewrite)):
                 if isinstance(result, Rewrite):
                     # ASYNC rewrites only supported for single statements.
@@ -2148,7 +2478,12 @@ async def _handle_query(conn, sql, b_writer, c_writer):
                 _reject(conn, c_writer, result)
                 await c_writer.drain()
                 return
+            batch.append(s)
+            tags.append(None if strip_leading_comments(s) else False)
             sim.apply(s)
+        if any(tags):
+            sql = "\n;\n".join(batch)
+            conn.result_tags = [t for t in tags if t is not False]
         if txn.in_txn or explicit:
             txn.in_txn, txn.ddl_seen, txn.dml_seen = (
                 sim.in_txn,
@@ -2254,6 +2589,12 @@ async def _ext_parse(conn, payload, b_writer, c_writer):
         c_writer.write(_frame(b"1", b""))  # ParseComplete
         await c_writer.drain()
         return
+    if kind == "iam":
+        kind, result = "relabel", (_iam_trust_sql(result, conn.user), result.tag)
+    if kind == "relabel":
+        entry["tag"] = result[1]
+        sql_end = payload.index(b"\0", payload.index(b"\0") + 1)
+        payload = name.encode() + b"\0" + result[0].encode() + payload[sql_end:]
     conn.ext_stmts[name] = entry
     await _ext_forward(conn, b_writer, b"P", payload)
 
@@ -2334,6 +2675,7 @@ async def _ext_execute(conn, payload, b_writer, c_writer):
         if entry is not None and entry["sql"]:
             _note_catalog(conn, entry["sql"])
             conn.txn.apply(entry["sql"])
+        conn.result_tags.append(entry and entry.get("tag"))
         await _ext_forward(conn, b_writer, b"E", payload)
         return
 
@@ -2434,9 +2776,12 @@ async def _handle_client(cluster_id, backend_host, backend_port, c_reader, c_wri
         await c_writer.drain()
 
         database = params.get("database") or "postgres"
+        conn.user = params.get("user") or conn.user
+        conn.database = database
         b_reader, b_writer = await _connect_backend(
             backend_host, backend_port, database
         )
+        await _prepare_backend(conn, b_reader, b_writer)
         relay = asyncio.create_task(_backend_relay(conn, b_reader, c_writer))
 
         while True:
@@ -2494,6 +2839,8 @@ async def stop_proxy(cluster_id):
         server.close()
         await server.wait_closed()
     _jobs.pop(cluster_id, None)
+    for key in [k for k in _iam_ready if k[0] == cluster_id]:
+        _iam_ready.discard(key)
 
 
 async def stop_all_proxies():

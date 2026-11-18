@@ -269,10 +269,17 @@ def _collect_secretsmanager():
         yield secret.get("ARN", ""), _normalise_list(secret.get("Tags"))
 
 
+def _collect_iot():
+    import ministack.services.iot as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
 # ARN service -> collector, for resolving aws:ResourceTag
 _RESOURCE_TAG_COLLECTORS = {
     "dynamodb": _collect_dynamodb,
     "iam": _collect_iam,
+    "iot": _collect_iot,
     "kms": _collect_kms,
     "lambda": _collect_lambda,
     "secretsmanager": _collect_secretsmanager,
@@ -509,7 +516,7 @@ def _cloudfront_resource_exists(spec: Arn, arn: str) -> bool:
     if spec.resource.startswith("function/"):
         return _resource_tail(spec, arn, "function/") in svc._functions
     if spec.resource.startswith("key-value-store/"):
-        return _resource_tail(spec, arn, "key-value-store/") in svc._kvstores
+        return svc._kvs_by_arn(arn) is not None
     return arn in svc._tags
 
 

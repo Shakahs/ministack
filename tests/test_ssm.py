@@ -788,6 +788,78 @@ def test_ssm_put_parameter_name_error_wins_over_other_checks(ssm):
     assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
 
+def test_ssm_public_latest_ami_parameter_names_a_stub_image(ssm, ec2):
+    param = ssm.get_parameter(Name="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64")["Parameter"]
+    assert param["ARN"].split(":")[4] == ""
+    assert ec2.describe_images(ImageIds=[param["Value"]])["Images"][0]["Name"].startswith("al2023-ami-")
+
+
+def test_ssm_secretsmanager_reference_returns_current_secret(ssm, sm):
+    secret_name = f"ssm-ref-{_uuid_mod.uuid4().hex[:8]}"
+    secret = sm.create_secret(Name=secret_name, SecretString="first")
+    updated = sm.put_secret_value(SecretId=secret_name, SecretString="second")
+    name = f"/aws/reference/secretsmanager/{secret_name}"
+
+    param = ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]
+
+    assert param["Name"] == name
+    assert param["Type"] == "SecureString"
+    assert param["Value"] == "second"
+    assert param["Version"] == 0
+    assert param["ARN"] == secret["ARN"]
+    assert "DataType" not in param
+    source = json.loads(param["SourceResult"])
+    assert source["ARN"] == secret["ARN"]
+    assert source["name"] == secret_name
+    assert source["versionId"] == updated["VersionId"]
+    assert source["secretString"] == "second"
+    assert source["versionStages"] == ["AWSCURRENT"]
+
+
+def test_ssm_secretsmanager_reference_requires_with_decryption(ssm, sm):
+    secret_name = f"ssm-ref-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=secret_name, SecretString="value")
+    name = f"/aws/reference/secretsmanager/{secret_name}"
+
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name)
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == "WithDecryption flag must be True for retrieving a Secret Manager secret."
+
+    resp = ssm.get_parameters(Names=[name])
+    assert resp["Parameters"] == []
+    assert resp["InvalidParameters"] == [name]
+
+
+def test_ssm_secretsmanager_reference_to_missing_secret(ssm):
+    secret_name = f"ssm-ref-missing-{_uuid_mod.uuid4().hex[:8]}"
+    name = f"/aws/reference/secretsmanager/{secret_name}"
+
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name, WithDecryption=True)
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ParameterNotFound"
+    assert err["Message"] == (
+        "An error occurred (ParameterNotFound) when referencing Secrets Manager: "
+        f"Secret aws/reference/secretsmanager/{secret_name} not found. "
+        "Secrets Manager can't find the specified secret."
+    )
+
+
+def test_ssm_get_parameters_mixes_secretsmanager_references(ssm, sm):
+    secret_name = f"ssm-ref-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=secret_name, SecretString="value")
+    found = f"/aws/reference/secretsmanager/{secret_name}"
+    missing = f"/aws/reference/secretsmanager/{secret_name}-missing"
+
+    resp = ssm.get_parameters(Names=[found, missing], WithDecryption=True)
+
+    assert [p["Name"] for p in resp["Parameters"]] == [found]
+    assert resp["Parameters"][0]["Value"] == "value"
+    assert resp["InvalidParameters"] == [missing]
+
+
 def test_ssm_put_parameter_rejects_tags_with_overwrite(ssm):
     tags = [{"Key": "k", "Value": "v"}]
     new_name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"
@@ -1116,3 +1188,447 @@ def test_unicode_ssm_parameter(ssm):
     ssm.put_parameter(Name="/unicode/param", Value="값: τιμή", Type="String")
     resp = ssm.get_parameter(Name="/unicode/param")
     assert resp["Parameter"]["Value"] == "값: τιμή"
+
+
+_HT = "/ssm/parameter-store/high-throughput-enabled"
+_HT_ARN = "arn:aws:ssm:us-east-1:000000000000:servicesetting" + _HT
+_TIER = "/ssm/parameter-store/default-parameter-tier"
+# Independent of the implementation. Observed on AWS (GetServiceSetting, us-east-1, 2026-10-10): value and default
+# LastModifiedDate; high-throughput-enabled is the ResetServiceSetting API reference example.
+_OBSERVED_DEFAULTS = {
+    _HT: ("false", 1555532571.138),
+    _TIER: ("Standard", 1565131339.38),
+    "/ssm/documents/console/public-sharing-permission": ("Enable", 1612382724.747),
+    "/ssm/managed-instance/activation-tier": ("standard", 1579134984.656),
+    "/ssm/managed-instance/default-ec2-instance-management-role": ("$None", 1636561263.576),
+    "/ssm/automation/customer-script-log-destination": ("None", 1572919724.731),
+    "/ssm/automation/customer-script-log-group-name": ("/aws/ssm/automation/executeScript", 1572898415.256),
+    "/ssm/automation/enable-adaptive-concurrency": ("False", 1632330231.776),
+    "/ssm/appmanager/appmanager-enabled": ("False", 1604983265.572),
+    "/ssm/opsinsights/opscenter": ("Disabled", 1622077352.094),
+}
+# Accepted values per UpdateServiceSetting's API reference; the other ids accept any string.
+_ACCEPTED = {
+    _HT: ("true", "false"),
+    _TIER: ("Standard", "Advanced", "Intelligent-Tiering"),
+    "/ssm/documents/console/public-sharing-permission": ("Enable", "Disable"),
+    "/ssm/managed-instance/activation-tier": ("standard", "advanced"),
+    "/ssm/appmanager/appmanager-enabled": ("True", "False"),
+    "/ssm/opsinsights/opscenter": ("Enabled", "Disabled"),
+}
+
+
+@pytest.fixture
+def service_settings(ssm):
+    yield ssm
+    for setting_id in _OBSERVED_DEFAULTS:
+        ssm.reset_service_setting(SettingId=setting_id)
+
+
+def _ssm_model():
+    from botocore.loaders import Loader
+    from botocore.model import ServiceModel
+
+    return ServiceModel(Loader().load_service_model("ssm", "service-2"))
+
+
+def _error_code(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]
+
+
+def test_ssm_service_setting_defaults(service_settings):
+    import re
+
+    # The model lists the SettingIds only in the documentation prose of the request shape.
+    model_ids = set(re.findall(r"/ssm/[a-z0-9/-]+", _ssm_model().shape_for("GetServiceSettingRequest").members["SettingId"].documentation))
+    assert set(_OBSERVED_DEFAULTS) == model_ids
+    for setting_id, (default, modified) in _OBSERVED_DEFAULTS.items():
+        setting = service_settings.get_service_setting(SettingId=setting_id)["ServiceSetting"]
+        assert (setting["SettingValue"], setting["Status"], setting["LastModifiedUser"]) == (default, "Default", "System")
+        assert setting["LastModifiedDate"].timestamp() == pytest.approx(modified), setting_id
+    assert service_settings.get_service_setting(SettingId=_HT)["ServiceSetting"]["ARN"] == _HT_ARN
+
+
+def test_ssm_service_setting_update_and_reset(service_settings):
+    ssm = service_settings
+    assert ssm.update_service_setting(SettingId=_HT_ARN, SettingValue="true")["ResponseMetadata"]["HTTPStatusCode"] == 200
+    setting = ssm.get_service_setting(SettingId=_HT)["ServiceSetting"]
+    assert (setting["SettingValue"], setting["Status"]) == ("true", "Customized")
+    assert "LastModifiedDate" in setting and setting["LastModifiedUser"]
+    reset = ssm.reset_service_setting(SettingId=_HT_ARN)["ServiceSetting"]
+    assert (reset["SettingValue"], reset["Status"], reset["LastModifiedUser"]) == ("false", "Default", "System")
+    for call, extra in ((ssm.get_service_setting, {}), (ssm.reset_service_setting, {}),
+                        (ssm.update_service_setting, {"SettingValue": "x"})):
+        assert _error_code(call, SettingId="/ssm/nope", **extra)["Code"] == "ServiceSettingNotFound"
+
+
+def test_ssm_service_setting_value_validation(service_settings):
+    ssm = service_settings
+    for setting_id, accepted in _ACCEPTED.items():
+        error = _error_code(ssm.update_service_setting, SettingId=setting_id, SettingValue="NotAValue")
+        assert error["Code"] == "ValidationException"
+        assert error["Message"] == f"Invalid setting value, allowed value pattern: {'|'.join(accepted)}"
+        assert ssm.get_service_setting(SettingId=setting_id)["ServiceSetting"]["Status"] == "Default"
+        for value in accepted:
+            ssm.update_service_setting(SettingId=setting_id, SettingValue=value)
+    for setting_id in set(_OBSERVED_DEFAULTS) - set(_ACCEPTED):
+        ssm.update_service_setting(SettingId=setting_id, SettingValue="any")
+
+
+def test_ssm_service_setting_last_modified_user_is_caller(service_settings, iam):
+    username = f"ssm-setting-{_uuid_mod.uuid4().hex[:8]}"
+    arn = iam.create_user(UserName=username)["User"]["Arn"]
+    key = iam.create_access_key(UserName=username)["AccessKey"]
+    try:
+        caller = boto3.client(
+            "ssm",
+            endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            aws_access_key_id=key["AccessKeyId"],
+            aws_secret_access_key=key["SecretAccessKey"],
+            region_name="us-east-1",
+        )
+        caller.update_service_setting(SettingId=_HT, SettingValue="true")
+        assert service_settings.get_service_setting(SettingId=_HT)["ServiceSetting"]["LastModifiedUser"] == arn
+    finally:
+        iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user(UserName=username)
+
+
+def test_ssm_service_setting_per_region(service_settings):
+    west = _regional_ssm("us-west-2")
+    try:
+        west.update_service_setting(SettingId=_HT, SettingValue="true")
+        assert service_settings.get_service_setting(SettingId=_HT)["ServiceSetting"]["Status"] == "Default"
+        assert west.get_service_setting(SettingId=_HT)["ServiceSetting"]["ARN"].startswith("arn:aws:ssm:us-west-2:")
+    finally:
+        west.reset_service_setting(SettingId=_HT)
+
+
+def test_ssm_service_setting_persisted():
+    from ministack.services import ssm as ssm_service
+
+    ssm_service.reset()
+    try:
+        ssm_service._update_service_setting({"SettingId": _HT, "SettingValue": "true"}, "arn:aws:iam::000000000000:root")
+        saved = ssm_service.get_state()
+        ssm_service.reset()
+        ssm_service.load_persisted_state(saved)
+        body = json.loads(ssm_service._get_service_setting({"SettingId": _HT})[2])
+    finally:
+        ssm_service.reset()
+    assert body["ServiceSetting"]["SettingValue"] == "true"
+
+
+def test_ssm_default_parameter_tier_setting(service_settings):
+    ssm = service_settings
+    tiers = set(_ssm_model().shape_for("ParameterTier").enum)
+    big = "x" * 4097
+    name = f"/tier/{_uuid_mod.uuid4().hex[:8]}"
+    cases = {"Standard": ("Standard", None), "Advanced": ("Advanced", "Advanced"),
+             "Intelligent-Tiering": ("Standard", "Advanced")}
+    try:
+        for default_tier, (small_tier, big_tier) in cases.items():
+            ssm.update_service_setting(SettingId=_TIER, SettingValue=default_tier)
+            put = ssm.put_parameter(Name=name, Value="v", Type="String", Overwrite=True)
+            listed = ssm.describe_parameters(ParameterFilters=[{"Key": "Name", "Values": [name]}])["Parameters"][0]
+            assert (put["Tier"], listed["Tier"]) == (small_tier, small_tier)
+            assert {put["Tier"], listed["Tier"]} <= tiers
+            ssm.delete_parameter(Name=name)
+            if big_tier:
+                assert ssm.put_parameter(Name=name, Value=big, Type="String")["Tier"] == big_tier
+                ssm.delete_parameter(Name=name)
+        # An Advanced parameter stays Advanced when overwritten without a Tier.
+        ssm.put_parameter(Name=name, Value="v", Type="String", Tier="Advanced")
+        ssm.update_service_setting(SettingId=_TIER, SettingValue="Standard")
+        assert ssm.put_parameter(Name=name, Value="w", Type="String", Overwrite=True)["Tier"] == "Advanced"
+    finally:
+        ssm.delete_parameters(Names=[name])
+
+
+def _assert_matches_shape(shape, value, path):
+    if shape.type_name == "structure":
+        assert isinstance(value, dict), path
+        assert set(value) <= set(shape.members), (path, set(value) - set(shape.members))
+        assert set(shape.required_members) <= set(value), path
+        for key, member in value.items():
+            _assert_matches_shape(shape.members[key], member, f"{path}.{key}")
+    elif shape.type_name == "string":
+        assert isinstance(value, str), path
+    elif shape.type_name == "timestamp":
+        assert isinstance(value, (int, float)) and not isinstance(value, bool), path  # json protocol: epoch seconds
+
+
+def test_ssm_service_setting_matches_botocore_model(service_settings):
+    """Raw responses and error codes against the installed botocore ssm service-2.json."""
+    from botocore import xform_name
+
+    ssm = service_settings
+    model = _ssm_model()
+    for operation, extra in (("GetServiceSetting", {}), ("UpdateServiceSetting", {"SettingValue": "true"}),
+                             ("GetServiceSetting", {}), ("ResetServiceSetting", {})):
+        captured = []
+        handler = lambda response_dict, **kw: captured.append(json.loads(response_dict["body"]))  # noqa: E731
+        ssm.meta.events.register(f"response-received.ssm.{operation}", handler)
+        try:
+            getattr(ssm, xform_name(operation))(SettingId=_HT, **extra)
+        finally:
+            ssm.meta.events.unregister(f"response-received.ssm.{operation}", handler)
+        _assert_matches_shape(model.operation_model(operation).output_shape, captured[0], operation)
+    modelled = {e.name for op in ("GetServiceSetting", "UpdateServiceSetting", "ResetServiceSetting")
+                for e in model.operation_model(op).error_shapes}
+    assert _error_code(ssm.get_service_setting, SettingId="/ssm/nope")["Code"] in modelled
+    # ValidationException is not modelled for UpdateServiceSetting; observed on AWS (us-east-1, 2026-10-10).
+    assert "ValidationException" not in modelled
+
+
+# ── Documents + Automation (wire shapes captured on real AWS, us-east-2) ──
+
+def _unique_name(prefix):
+    return f"{prefix}-{_uuid_mod.uuid4().hex[:10]}"
+
+
+def _err(fn, **kw):
+    try:
+        fn(**kw)
+    except ClientError as e:
+        return e.response["Error"]
+    raise AssertionError("expected ClientError")
+
+
+_SLEEP_DOC = """schemaVersion: '0.3'
+description: test sleep doc
+mainSteps:
+- name: snooze
+  action: aws:sleep
+  inputs:
+    Duration: PT1S
+"""
+
+_PARAM_DOC = """schemaVersion: '0.3'
+description: param doc
+parameters:
+  WaitTime:
+    type: String
+    default: PT1S
+mainSteps:
+- name: snooze
+  action: aws:sleep
+  inputs:
+    Duration: "{{ WaitTime }}"
+"""
+
+
+def test_ssm_document_lifecycle(ssm):
+    import hashlib
+    name = _unique_name("doc")
+    desc = ssm.create_document(Name=name, DocumentType="Automation",
+                               DocumentFormat="YAML", Content=_SLEEP_DOC)["DocumentDescription"]
+    assert desc["Hash"] == hashlib.sha256(_SLEEP_DOC.encode()).hexdigest()
+    assert desc["HashType"] == "Sha256"
+    assert desc["Status"] == "Creating"
+    assert desc["PlatformTypes"] == ["Windows", "Linux", "MacOS"]
+    assert desc["LatestVersion"] == "1" and desc["DefaultVersion"] == "1"
+    assert desc["Description"] == "test sleep doc"
+    assert desc["Owner"]
+    captured = []
+    handler = lambda **kw: captured.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.DescribeDocument", handler)
+    try:
+        full = ssm.describe_document(Name=name)["Document"]
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.DescribeDocument", handler)
+    # DocumentId is on the wire but not in the botocore DocumentDescription shape.
+    assert captured[0]["Document"]["DocumentId"]
+    assert full["Category"] == [] and full["CategoryEnum"] == []
+    getd = []
+    handler2 = lambda **kw: getd.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.GetDocument", handler2)
+    try:
+        got = ssm.get_document(Name=name, DocumentFormat="YAML")
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.GetDocument", handler2)
+    assert got["Content"] == _SLEEP_DOC and got["DocumentFormat"] == "YAML"
+    assert getd[0]["AllowInvalidContent"] is False
+    got_json = ssm.get_document(Name=name)
+    assert got_json["DocumentFormat"] == "JSON"
+    assert json.loads(got_json["Content"])["schemaVersion"] == "0.3"
+    listed = ssm.list_documents(Filters=[{"Key": "Owner", "Values": ["Self"]}])["DocumentIdentifiers"]
+    assert any(d["Name"] == name for d in listed)
+    ssm.delete_document(Name=name)
+    assert _err(ssm.describe_document, Name=name)["Code"] == "InvalidDocument"
+
+
+def test_ssm_document_timestamps_are_epoch_on_the_wire(ssm):
+    name = _unique_name("doc-ts")
+    captured = []
+    handler = lambda **kw: captured.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.DescribeDocument", handler)
+    try:
+        ssm.create_document(Name=name, DocumentType="Automation",
+                            DocumentFormat="YAML", Content=_SLEEP_DOC)
+        ssm.describe_document(Name=name)
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.DescribeDocument", handler)
+        ssm.delete_document(Name=name)
+    created = captured[0]["Document"]["CreatedDate"]
+    assert isinstance(created, (int, float)) and not isinstance(created, bool)
+
+
+def test_ssm_document_errors(ssm):
+    name = _unique_name("err")
+    e = _err(ssm.describe_document, Name=name)
+    assert e["Code"] == "InvalidDocument" and "does not exist" in e["Message"]
+    e = _err(ssm.delete_document, Name=name)
+    assert e["Code"] == "InvalidDocument" and "does not exist in your account" in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="BogusType",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "ValidationException"
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", Content=_SLEEP_DOC)
+    assert e["Code"] == "InvalidDocumentContent" and "JSON not well-formed" in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", DocumentFormat="YAML",
+             Content="schemaVersion: '0.3'\nmainSteps: []\n")
+    assert e["Code"] == "InvalidDocumentContent" and 'Missing steps in "mainSteps"' in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", DocumentFormat="YAML",
+             Content="schemaVersion: '0.3'\nmainSteps:\n- name: s\n  action: aws:notARealAction\n")
+    assert e["Code"] == "InvalidDocumentContent" and "Unknown action" in e["Message"]
+    e = _err(ssm.create_document, Name="AWS-Reserved", DocumentType="Automation",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "ValidationException" and "Invalid document name" in e["Message"]
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_SLEEP_DOC)
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "DocumentAlreadyExists" and "with same name" in e["Message"]
+    e = _err(ssm.get_document, Name=name, DocumentVersion="99")
+    assert e["Code"] == "InvalidDocumentVersion" and "latest version is 1" in e["Message"]
+    ssm.delete_document(Name=name)
+
+
+def _wait_terminal(ssm, eid, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        d = ssm.get_automation_execution(AutomationExecutionId=eid)["AutomationExecution"]
+        if d["AutomationExecutionStatus"] not in ("Pending", "InProgress"):
+            return d
+        time.sleep(0.4)
+    return d
+
+
+def test_ssm_automation_sleep_success(ssm):
+    name = _unique_name("auto")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_SLEEP_DOC)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Success"
+    assert d["DocumentVersion"] == "1"
+    assert d["ExecutedBy"]
+    assert d["ResolvedTargets"] == {"ParameterValues": [], "Truncated": False}
+    assert "ExecutionEndTime" in d and "CurrentStepName" not in d
+    st = d["StepExecutions"][0]
+    assert st["StepName"] == "snooze" and st["Action"] == "aws:sleep"
+    assert st["StepStatus"] == "Success" and st["StepExecutionId"] != eid
+    assert st["Inputs"]["Duration"] == '"PT1S"'
+    meta = ssm.describe_automation_executions(
+        Filters=[{"Key": "ExecutionId", "Values": [eid]}])["AutomationExecutionMetadataList"]
+    assert len(meta) == 1 and meta[0]["AutomationType"] == "Local"
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_param_resolution(ssm):
+    name = _unique_name("auto-param")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_PARAM_DOC)
+    e = _err(ssm.start_automation_execution, DocumentName=name,
+             Parameters={"Undeclared": ["x"]})
+    assert e["Code"] == "InvalidAutomationExecutionParametersException"
+    assert "Undefined execution inputs" in e["Message"]
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Success"
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_cancel_and_errors(ssm):
+    name = _unique_name("auto-stop")
+    doc = _SLEEP_DOC.replace("PT1S", "PT60S")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    time.sleep(0.5)
+    ssm.stop_automation_execution(AutomationExecutionId=eid)
+    d = ssm.get_automation_execution(AutomationExecutionId=eid)["AutomationExecution"]
+    assert d["AutomationExecutionStatus"] == "Cancelled"
+    assert d["StepExecutions"][0]["StepStatus"] == "Cancelled"
+    e = _err(ssm.start_automation_execution, DocumentName="no-such-doc")
+    assert e["Code"] == "AutomationDefinitionNotFoundException"
+    assert "expected valid document in account" in e["Message"]
+    e = _err(ssm.get_automation_execution, AutomationExecutionId="00000000-0000-0000-0000-000000000000")
+    assert e["Code"] == "AutomationExecutionNotFoundException"
+    assert "does not exist" in e["Message"]
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_unemulated_step_fails(ssm):
+    name = _unique_name("auto-fail")
+    doc = """schemaVersion: '0.3'
+description: calls a missing parameter
+mainSteps:
+- name: read
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: GetParameter
+    Name: /definitely/missing
+"""
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Failed"
+    assert "ParameterNotFound" in d["FailureMessage"]
+    st = d["StepExecutions"][0]
+    assert st["StepStatus"] == "Failed" and st["FailureDetails"]["FailureStage"] == "Invocation"
+    ssm.delete_document(Name=name)
+
+
+@pytest.mark.auth_contract
+def test_ssm_automation_steps_need_the_callers_permissions(ssm, auth_enabled, iam_user):
+    """An automation step calls the API as the caller (or the document's assumeRole), so under AUTH=true
+    it cannot do what the caller may not: a user allowed only to run automations cannot write a parameter."""
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": [
+        "ssm:CreateDocument", "ssm:DeleteDocument", "ssm:StartAutomationExecution", "ssm:GetAutomationExecution"],
+        "Resource": "*"}]})
+    client = user.client("ssm")
+    name, param = _unique_name("auto-auth"), f"/auto-auth/{_uuid_mod.uuid4().hex[:8]}"
+    doc = f"""schemaVersion: '0.3'
+mainSteps:
+- name: write
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: PutParameter
+    Name: {param}
+    Value: x
+    Type: String
+"""
+    client.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    try:
+        d = _wait_terminal(client, client.start_automation_execution(DocumentName=name)["AutomationExecutionId"])
+        if auth_enabled:
+            assert d["AutomationExecutionStatus"] == "Failed"
+            assert "AccessDeniedException" in d["FailureMessage"] and "ssm:PutParameter" in d["FailureMessage"]
+            with pytest.raises(ClientError):
+                ssm.get_parameter(Name=param)
+        else:
+            assert d["AutomationExecutionStatus"] == "Success"
+            ssm.delete_parameter(Name=param)
+    finally:
+        client.delete_document(Name=name)
+
+
+def test_ssm_create_document_refuses_reserved_prefixes(ssm):
+    """botocore CreateDocument Name: aws, amazon, amzn, AWSEC2, AWSConfigRemediation, AWSSupport are reserved."""
+    doc = json.dumps({"schemaVersion": "0.3", "mainSteps": [{"name": "s", "action": "aws:sleep",
+                                                              "inputs": {"Duration": "PT1S"}}]})
+    for name in ("awsMine", "amazonMine", "amznMine", "AWSEC2-Mine", "AWSSupport-Mine"):
+        with pytest.raises(ClientError) as exc:
+            ssm.create_document(Name=name, DocumentType="Automation", Content=doc)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"

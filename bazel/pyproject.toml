@@ -7,7 +7,7 @@
 # selects. Regenerate the lock with `uv lock` in this directory.
 [project]
 name = "ministack-server"
-version = "1.5.29"
+version = "1.5.42"
 requires-python = "==3.14.*"
 dependencies = []
 
@@ -16,7 +16,7 @@ server = [
     "hypercorn>=0.18.0",
     "pyyaml>=6.0",
     "defusedxml>=0.7",
-    "botocore==1.43.106",
+    "botocore==1.43.124",
     "jsonata-python>=0.7.0",
     "graphql-core==3.2.12",
     # Below 50.0.2, the first release with cp315-abi3.abi3t wheels, a tag aspect_rules_py 1.12.1's

@@ -37,6 +37,7 @@ Supports:
                  UpdatePublicKey, DeletePublicKey, ListPublicKeys
   Key groups: CreateKeyGroup, GetKeyGroup, GetKeyGroupConfig,
                  UpdateKeyGroup, DeleteKeyGroup, ListKeyGroups
+  VPC origins: CreateVpcOrigin, GetVpcOrigin, UpdateVpcOrigin, DeleteVpcOrigin, ListVpcOrigins
   Tags: TagResource, UntagResource, ListTagsForResource
   SaaS Manager (multi-tenant distributions):
                  CreateConnectionGroup, GetConnectionGroup,
@@ -52,23 +53,54 @@ Supports:
                  VerifyDnsConfiguration, GetManagedCertificateDetails,
                  ListDomainConflicts, UpdateDomainAssociation,
                  ListDistributionsByConnectionMode
+  Web ACL: AssociateDistributionWebACL, DisassociateDistributionWebACL
+
+Data plane (handle_viewer_request): serves viewer requests to <label>.cloudfront.net /
+<label>.cloudfront.<MINISTACK_HOST>. Not modelled: caching, WAF, logging, geo restrictions,
+signed URLs and cookies, Lambda@Edge, CORS preflight, synthetic CloudFront-Viewer-* headers,
+origins at AWS hostnames (502) other than a load balancer or Function URL in this MiniStack, which is
+served in-process.
 """
 
+import asyncio
 import base64
 import copy
+import fnmatch
+import gzip
+import http.client
 import logging
+import os
 import random
 import re
+import secrets
+import ssl
 import string
+import unicodedata
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import unquote
+from re import compile as _re_compile
+from re import escape as _re_escape
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
 
+try:
+    import brotli
+except ImportError:  # optional: without it, Brotli-only viewers get the uncompressed object
+    brotli = None
+
+from ministack.core import cloudfront_js
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid
+from ministack.core.concurrency import run_offloop, run_reentrant
+from ministack.core.responses import (
+    AccountScopedDict,
+    StreamingResponse,
+    get_account_id,
+    get_region,
+    new_uuid,
+    request_scope,
+)
 
 logger = logging.getLogger("cloudfront")
 
@@ -88,6 +120,10 @@ _TAG_RE = re.compile(r"^/2020-05-31/tagging/?$")
 _OAC_RE = re.compile(r"^/2020-05-31/origin-access-control/?$")
 _OAC_CFG_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/config$")
 _OAC_ID_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/?$")
+
+# VPC origin path regexes
+_VPC_ORIGIN_RE = re.compile(r"^/2020-05-31/vpc-origin/?$")
+_VPC_ORIGIN_ID_RE = re.compile(r"^/2020-05-31/vpc-origin/([^/]+)/?$")
 
 _FUN_LIST_RE = re.compile(r"^/2020-05-31/function/?$")
 _FUN_DESCRIBE_RE = re.compile(r"^/2020-05-31/function/([^/]+)/describe/?$")
@@ -128,6 +164,8 @@ _CONN_GROUP_RE = re.compile(r"^/2020-05-31/connection-group/?$")
 _CONN_GROUP_ID_RE = re.compile(r"^/2020-05-31/connection-group/(.+?)/?$")
 _CONN_GROUPS_LIST_RE = re.compile(r"^/2020-05-31/connection-groups/?$")
 _TENANT_RE = re.compile(r"^/2020-05-31/distribution-tenant/?$")
+_DIST_WEBACL_ASSOC_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/associate-web-acl/?$")
+_DIST_WEBACL_DISASSOC_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/disassociate-web-acl/?$")
 _TENANT_WEBACL_ASSOC_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/associate-web-acl/?$")
 _TENANT_WEBACL_DISASSOC_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/disassociate-web-acl/?$")
 _TENANT_INV_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/invalidation/?$")
@@ -154,7 +192,6 @@ _FLE_PROFILE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption-profile/
 _CDP_LIST_RE = re.compile(r"^/2020-05-31/continuous-deployment-policy/?$")
 _OAI_LIST_RE = re.compile(r"^/2020-05-31/origin-access-identity/cloudfront/?$")
 _STREAMING_DIST_LIST_RE = re.compile(r"^/2020-05-31/streaming-distribution/?$")
-_VPC_ORIGIN_LIST_RE = re.compile(r"^/2020-05-31/vpc-origin/?$")
 _REALTIME_LOG_LIST_RE = re.compile(r"^/2020-05-31/realtime-log-config/?$")
 _ANYCAST_IP_LIST_RE = re.compile(r"^/2020-05-31/anycast-ip-list/?$")
 _MONITORING_SUB_RE = re.compile(r"^/2020-05-31/distributions/([^/]+)/monitoring-subscription/?$")
@@ -176,6 +213,7 @@ _key_groups = AccountScopedDict()  # Id -> key group record
 _connection_groups = AccountScopedDict()  # Id -> connection group record (SaaS Manager)
 _distribution_tenants = AccountScopedDict()  # Id -> distribution tenant record (SaaS Manager)
 _tenant_invalidations = AccountScopedDict()  # tenant_id -> [invalidation record, ...]
+_vpc_origins = AccountScopedDict()  # Id -> VPC origin record
 
 
 def reset():
@@ -193,9 +231,10 @@ def reset():
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
+    _vpc_origins.clear()
+    _vpc_origin_etags_issued.clear()
     # Drop the JS workers so their compiled-function cache does not outlive a
     # reset (mirrors appsync.reset()'s appsync_js.reset()).
-    from ministack.core import cloudfront_js
     cloudfront_js.reset()
 
 
@@ -216,6 +255,8 @@ def get_state():
             "connection_groups": _connection_groups,
             "distribution_tenants": _distribution_tenants,
             "tenant_invalidations": _tenant_invalidations,
+            "vpc_origins": _vpc_origins,
+            "vpc_origin_max_version": max(_vpc_origin_etags_issued.values(), default=0),
         }
     )
 
@@ -238,6 +279,11 @@ def _restore_state(data):
     _key_groups.update(data.get("key_groups", {}))
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
+    _vpc_origins.update(data.get("vpc_origins", {}))
+    # An ETag issued before the restart, also by an origin deleted since, stays a valid If-Match.
+    stored = max((vo.get("Version", 0) for vo in _vpc_origins._data.values()), default=0)
+    for version in range(1, max(stored, data.get("vpc_origin_max_version", 0)) + 1):
+        _vpc_origin_etag(version)
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
@@ -313,13 +359,15 @@ def _xml_response(root_tag: str, builder_fn, status: int = 200, extra_headers: d
     return status, headers, body
 
 
-def _error(code: str, message: str, status: int) -> tuple:
+def _error(code: str, message, status: int) -> tuple:
     # rest-xml error envelope: <?xml?> declaration and <Type> (AWS captures).
+    # A message of None leaves <Message> out, as AWS does for some MalformedInput errors.
     root = Element("ErrorResponse", xmlns=NS)
     err = SubElement(root, "Error")
     SubElement(err, "Type").text = "Sender" if status < 500 else "Receiver"
     SubElement(err, "Code").text = code
-    SubElement(err, "Message").text = message
+    if message is not None:
+        SubElement(err, "Message").text = message
     SubElement(root, "RequestId").text = new_uuid()
     body = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(root, encoding="unicode").encode("utf-8")
     return status, {"Content-Type": "text/xml"}, body
@@ -464,6 +512,32 @@ def _ensure_distribution_config_sdk_compat(config_el):
     if _find(config_el, "OriginGroups") is None:
         og = SubElement(config_el, "OriginGroups")
         SubElement(og, "Quantity").text = "0"
+    # AWS fills in a VPC origin's timeouts when the request leaves them out.
+    for vpc_cfg in _config_vpc_origin_configs(config_el):
+        for tag, default in (("OriginReadTimeout", "30"), ("OriginKeepaliveTimeout", "5")):
+            if _find(vpc_cfg, tag) is None:
+                SubElement(vpc_cfg, tag).text = default
+        # Keep the API's member order when only one timeout was sent.
+        order = ("VpcOriginId", "OwnerAccountId", "OriginReadTimeout", "OriginKeepaliveTimeout")
+        vpc_cfg[:] = sorted(vpc_cfg, key=lambda c: order.index(_local_tag_name(c)) if _local_tag_name(c) in order else len(order))
+
+
+def _distribution_vpc_origin_error(config_el):
+    """An empty VpcOriginId, then one that names no origin."""
+    ids = [_text(vpc_cfg, "VpcOriginId") for vpc_cfg in _config_vpc_origin_configs(config_el)]
+    if any(not vo_id for vo_id in ids):
+        return _error("InvalidArgument", "The parameter vpcOriginId must not be empty for VPC Origin.", 400)
+    if any(vo_id not in _vpc_origins for vo_id in ids):
+        return _error("EntityNotFound", _VPC_ORIGIN_NOT_FOUND, 404)
+    return None
+
+
+def _config_vpc_origin_configs(config_el):
+    """The VpcOriginConfig elements of a DistributionConfig's origins."""
+    origins = _find(config_el, "Origins")
+    items = _find(origins, "Items") if origins is not None else None
+    found = (_find(origin, "VpcOriginConfig") for origin in (items if items is not None else ()))
+    return [vpc_cfg for vpc_cfg in found if vpc_cfg is not None]
 
 
 # CloudFormation's DistributionConfig is the API's, in JSON, with a few
@@ -656,8 +730,14 @@ def _func_arn(name: str) -> str:
     return f"arn:aws:cloudfront::{get_account_id()}:function/{name}"
 
 
-def _kvs_arn(name: str) -> str:
-    return f"arn:aws:cloudfront::{get_account_id()}:key-value-store/{name}"
+def _kvs_arn(kvs_id: str) -> str:
+    """A key value store's ARN ends in its Id, not its Name."""
+    return f"arn:aws:cloudfront::{get_account_id()}:key-value-store/{kvs_id}"
+
+
+def _kvs_by_arn(arn: str):
+    """The key value store record whose ARN is ``arn``, or None."""
+    return next((v for v in _kvstores.values() if v.get("ARN") == arn), None)
 
 
 def _resolve_taggable_cloudfront_arn(arn: str):
@@ -684,13 +764,15 @@ def _resolve_taggable_cloudfront_arn(arn: str):
         "key-value-store": (_kvstores, "EntityNotFound", f"The key value store {name} was not found.", "ARN"),
         "distribution-tenant": (_distribution_tenants, "EntityNotFound", "The distribution tenant was not found.", "Arn"),
         "connection-group": (_connection_groups, "EntityNotFound", "The connection group was not found.", "Arn"),
+        "vpcorigin": (_vpc_origins, "NoSuchResource",
+                      "The specified resource doesn't exist. Update your request and try again.", "Arn"),
     }
     entry = resources.get(resource_type)
     if not entry:
         return None, _error("InvalidArgument", f"Invalid resource ARN: {arn}", 400)
 
     store, code, message, arn_key = entry
-    record = store.get(name)
+    record = _kvs_by_arn(arn) if resource_type == "key-value-store" else store.get(name)
     if not record or record.get(arn_key) != arn:
         return None, _error(code, message, 404)
     return arn, None
@@ -743,12 +825,26 @@ def _function_arns_in(dist):
     return {el.text for el in root.iter() if el.tag.split("}")[-1] == "FunctionARN" and el.text}
 
 
-def _function_dev_status(fn):
-    """DEVELOPMENT-stage Status: UNPUBLISHED until PublishFunction has copied
-    the current development version to LIVE (an UpdateFunction since then makes
-    it UNPUBLISHED again), then DEPLOYED while a distribution's cache behavior
-    references the function and UNASSOCIATED otherwise."""
-    if not fn.get("live_etag") or fn.get("published_dev_etag") != fn["dev_etag"]:
+def _function_etag():
+    return "E" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(13))
+
+
+def _function_version_etag(fn, version):
+    """The ETag of a stage's version; each stage counts its own versions, so LIVE's first
+    published version has the same ETag as DEVELOPMENT's first."""
+    etags = fn.setdefault("version_etags", {})
+    return etags.setdefault(str(version), _function_etag())
+
+
+_FUNCTION_PRECONDITION_FAILED = ("The request failed because it didn't meet the preconditions in one or more "
+                                 "request-header fields.")
+
+
+def _function_status(fn):
+    """UNPUBLISHED until the first PublishFunction, then DEPLOYED while a
+    distribution's cache behavior references the function and UNASSOCIATED
+    otherwise, on both stages; an UpdateFunction does not go back to UNPUBLISHED."""
+    if not fn.get("live_etag"):
         return "UNPUBLISHED"
     if any(fn["arn"] in _function_arns_in(d) for d in _distributions.values()):
         return "DEPLOYED"
@@ -781,16 +877,130 @@ def _cf_decode_function_code(code_b64: str):
     try:
         return base64.b64decode(code_b64.encode("ascii"), validate=True), None
     except Exception:
-        return None, _error("InvalidArgument", "FunctionCode is not valid base64.", 400)
+        return None, _error("MalformedInput", "Invalid Base64 encoding", 400)
+
+
+_FUNCTION_RUNTIMES = ("cloudfront-js-1.0", "cloudfront-js-2.0")
+_TAG_PATTERN = "([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)"
+_TAG_SPECIAL_CHARS = "_.:/=+-@"
+_MAX_LISTED_VALIDATION_ERRORS = 10
+_FUNCTION_TAG_LIMIT = 50
+
+
+def _last_child(el, tag):
+    """The last direct child with this local name; AWS keeps the last of a repeated member."""
+    found = None
+    for child in el:
+        if _local_tag_name(child) == tag:
+            found = child
+    return found
+
+
+def _function_request_tags(el):
+    """CreateFunction's Tags/Items as (Key, Value) pairs, plus AWS's parse error or None."""
+    tags_el = _find(el, "Tags")
+    items_el = _last_child(tags_el, "Items") if tags_el is not None else None
+    tags = []
+    for tag_el in items_el if items_el is not None else []:
+        # Text in a tag without children is malformed, even whitespace.
+        if not len(tag_el) and tag_el.text is not None:
+            return [], "Unexpected complex element termination"
+        if any(len(child) for child in tag_el if _local_tag_name(child) in ("Key", "Value")):
+            return [], "Start of list found where not expected"
+        key_el, value_el = _last_child(tag_el, "Key"), _last_child(tag_el, "Value")
+        tags.append((None if key_el is None else key_el.text or "",
+                     None if value_el is None else value_el.text or ""))
+    return tags, None
+
+
+def _function_tag_constraint_errors(tags):
+    """CreateFunction tag constraint messages: Value before Key, length before pattern."""
+    errors = []
+    for i, (key, value) in enumerate(tags, 1):
+        for field, text, limit in (("value", value, 256), ("key", key, 128)):
+            at = f"at 'tags.items.{i}.member.{field}' failed to satisfy constraint:"
+            if text is None:
+                if field == "key":
+                    errors.append(f"Value null {at} Member must not be null")
+                continue
+            if field == "key" and not text:
+                errors.append(f"Value '' {at} Member must have length greater than or equal to 1")
+            elif len(text) > limit:
+                errors.append(f"Value '{text}' {at} Member must have length less than or equal to {limit}")
+            if not all(unicodedata.category(ch)[0] in "LNZ" or ch in _TAG_SPECIAL_CHARS for ch in text):
+                errors.append(f"Value '{text}' {at} Member must satisfy regular expression pattern: {_TAG_PATTERN}")
+    return errors
+
+
+def _function_code_and_runtime_errors(el):
+    """The functionCode, functionConfig and runtime constraint messages, in AWS's order."""
+    errors = []
+    code_el = _find(el, "FunctionCode")
+    if code_el is None:
+        errors.append("Value at 'functionCode' failed to satisfy constraint: Member must not be null")
+    elif not code_el.text:
+        errors.append("Value at 'functionCode' failed to satisfy constraint: "
+                      "Member must have length greater than or equal to 1")
+    cfg_el = _find(el, "FunctionConfig")
+    runtime_el = _find(cfg_el, "Runtime") if cfg_el is not None else None
+    if cfg_el is None:
+        errors.append("Value null at 'functionConfig' failed to satisfy constraint: Member must not be null")
+    elif runtime_el is None:
+        errors.append("Value null at 'functionConfig.runtime' failed to satisfy constraint: Member must not be null")
+    elif (runtime_el.text or "") not in _FUNCTION_RUNTIMES:
+        errors.append(f"Value '{runtime_el.text or ''}' at 'functionConfig.runtime' failed to satisfy constraint: "
+                      f"Member must satisfy enum value set: [{', '.join(_FUNCTION_RUNTIMES)}]")
+    return errors
+
+
+def _function_name_errors(el):
+    """AWS's constraint messages for a missing or empty Name."""
+    name_el = _find(el, "Name")
+    if name_el is None:
+        return ["Value null at 'name' failed to satisfy constraint: Member must not be null"]
+    if not name_el.text:
+        return ["Value '' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 1",
+                "Value '' at 'name' failed to satisfy constraint: "
+                "Member must satisfy regular expression pattern: [a-zA-Z0-9-_]{1,64}"]
+    return []
+
+
+def _function_tagging_error(tags):
+    """InvalidTagging: a repeated key, then an aws: key, then more than 50 tags."""
+    seen = set()
+    for key, _ in tags:
+        if key in seen:
+            return f"Duplicate tag key: '{key}'."
+        seen.add(key)
+    # A lowercase aws: key anywhere is reported before one in another case.
+    if any(key.startswith("aws:") for key, _ in tags):
+        return "Tag key cannot start with 'aws:'."
+    for key, _ in tags:
+        if key.lower().startswith("aws:"):
+            return f'Invalid System Tag: {key} must be prefixed with "aws:" in lowercase.'
+    if len(tags) > _FUNCTION_TAG_LIMIT:
+        return "Too many tags."
+    return None
 
 
 def _cf_create_function(headers, body):
     el = _parse_body(body)
     if el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
+    tags, tags_parse_error = _function_request_tags(el)
+    if tags_parse_error:
+        return _error("MalformedInput", tags_parse_error, 400)
+    code_el = _find(el, "FunctionCode")
+    if code_el is not None and code_el.text:
+        _, err = _cf_decode_function_code(code_el.text)
+        if err is not None:
+            return err
     name = _text(el, "Name")
-    if not name:
-        return _error("InvalidArgument", "Name is required.", 400)
+    errors = _function_code_and_runtime_errors(el) + _function_name_errors(el) + _function_tag_constraint_errors(tags)
+    if errors:
+        errors = errors[:_MAX_LISTED_VALIDATION_ERRORS]
+        count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected"
+        return _error("MalformedXML", f"{count}: {'; '.join(errors)}", 400)
     if name in _functions:
         return _error("FunctionAlreadyExists", "A function with the same name already exists in this account.", 409)
 
@@ -801,9 +1011,12 @@ def _cf_create_function(headers, body):
     code, err = _cf_decode_function_code(_text(el, "FunctionCode"))
     if err is not None:
         return err
+    tagging_error = _function_tagging_error(tags)
+    if tagging_error:
+        return _error("InvalidTagging", tagging_error, 400)
 
     now = _now_iso()
-    dev_etag = new_uuid()
+    dev_etag = _function_etag()
     fn = {
         "name": name,
         "arn": _func_arn(name),
@@ -815,12 +1028,14 @@ def _cf_create_function(headers, body):
         "last_modified_dev": now,
         "last_modified_live": None,
         "dev_etag": dev_etag,
+        "dev_version": 1,
         "live_etag": None,
-        # The dev_etag PublishFunction last copied to LIVE (see _function_dev_status).
-        "published_dev_etag": None,
+        "live_version": 0,
+        "version_etags": {"1": dev_etag},
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
+    _tags[fn["arn"]] = [{"Key": key, "Value": value or ""} for key, value in tags]
     _functions[name] = fn
     logger.info("CreateFunction name=%s", name)
 
@@ -840,9 +1055,9 @@ def _cf_list_functions(query_params):
     summaries = []
     for fn in _functions.values():
         if stage_filter in ("", "DEVELOPMENT"):
-            summaries.append((fn, "DEVELOPMENT", _function_dev_status(fn), fn["last_modified_dev"]))
+            summaries.append((fn, "DEVELOPMENT", _function_status(fn), fn["last_modified_dev"]))
         if stage_filter in ("", "LIVE") and fn["live_etag"]:
-            summaries.append((fn, "LIVE", "DEPLOYED", fn["last_modified_live"] or fn["last_modified_dev"]))
+            summaries.append((fn, "LIVE", _function_status(fn), fn["last_modified_live"] or fn["last_modified_dev"]))
 
     def build(root):
         SubElement(root, "MaxItems").text = "100"
@@ -858,6 +1073,19 @@ def _cf_list_functions(query_params):
     return _xml_response("FunctionList", build)
 
 
+def _function_stage(query_params):
+    """(stage, error): DEVELOPMENT when Stage is left out, as AWS answers."""
+    stage = _qval(query_params, "Stage", "") or "DEVELOPMENT"
+    if stage not in ("DEVELOPMENT", "LIVE"):
+        return None, _error(
+            "MalformedXML",
+            f"1 validation error detected: Value '{stage}' at 'stage' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [LIVE, DEVELOPMENT]",
+            400,
+        )
+    return stage, None
+
+
 def _cf_describe_function(name: str, stage: str):
     fn = _functions.get(name)
     if not fn:
@@ -867,13 +1095,10 @@ def _cf_describe_function(name: str, stage: str):
             return _error("NoSuchFunctionExists", "The specified function does not exist.", 404)
         etag = fn["live_etag"]
         lm = fn["last_modified_live"] or fn["last_modified_dev"]
-        st = "DEPLOYED"
-    elif stage == "DEVELOPMENT":
+    else:
         etag = fn["dev_etag"]
         lm = fn["last_modified_dev"]
-        st = _function_dev_status(fn)
-    else:
-        return _error("InvalidArgument", "Invalid Stage value.", 400)
+    st = _function_status(fn)
 
     return _xml_response(
         "FunctionSummary",
@@ -894,10 +1119,7 @@ def _cf_get_function(name: str, stage: str):
     elif stage == "DEVELOPMENT":
         etag = fn["dev_etag"]
         code = fn["code"]
-    else:
-        return _error("InvalidArgument", "Invalid Stage value.", 400)
-
-    return 200, {"Content-Type": "application/javascript", "ETag": etag}, code
+    return 200, {"Content-Type": "application/octet-stream", "ETag": etag}, code
 
 
 def _cf_publish_function(name: str, headers):
@@ -910,14 +1132,14 @@ def _cf_publish_function(name: str, headers):
     if if_match != fn["dev_etag"]:
         return _error(
             "PreconditionFailed",
-            "The precondition given in one or more of the request-header fields evaluated to false.",
+            _FUNCTION_PRECONDITION_FAILED,
             412,
         )
 
     now = _now_iso()
-    fn["live_etag"] = new_uuid()
+    fn["live_version"] = fn.get("live_version", 1 if fn.get("live_etag") else 0) + 1
+    fn["live_etag"] = _function_version_etag(fn, fn["live_version"])
     fn["last_modified_live"] = now
-    fn["published_dev_etag"] = fn["dev_etag"]
     # Publishing copies DEVELOPMENT to LIVE; later updates to the development
     # body must not reach the stage that is serving traffic.
     fn["live_body"] = {
@@ -931,8 +1153,7 @@ def _cf_publish_function(name: str, headers):
     lm = fn["last_modified_live"]
     return _xml_response(
         "FunctionSummary",
-        _function_summary_builder(fn, "LIVE", "DEPLOYED", lm),
-        extra_headers={"ETag": fn["live_etag"]},
+        _function_summary_builder(fn, "LIVE", _function_status(fn), lm),
     )
 
 
@@ -967,15 +1188,17 @@ def _cf_update_function(name: str, headers, body):
     fn["kvs_arns"] = cfg["kvs_arns"]
     fn["code"] = code
     fn["last_modified_dev"] = now
-    fn["dev_etag"] = new_uuid()
+    fn["dev_version"] = fn.get("dev_version", 1) + 1
+    fn["dev_etag"] = _function_version_etag(fn, fn["dev_version"])
     # LIVE is untouched: an update changes the DEVELOPMENT stage only, and the
     # published version keeps serving until PublishFunction copies this one.
     logger.info("UpdateFunction name=%s", name)
 
     return _xml_response(
         "FunctionSummary",
-        _function_summary_builder(fn, "DEVELOPMENT", "UNPUBLISHED", fn["last_modified_dev"]),
-        extra_headers={"ETag": fn["dev_etag"]},
+        _function_summary_builder(fn, "DEVELOPMENT", _function_status(fn), fn["last_modified_dev"]),
+        # AWS names this header ETtag, and the SDKs read it from there
+        extra_headers={"ETtag": fn["dev_etag"]},
     )
 
 
@@ -989,11 +1212,15 @@ def _cf_delete_function(name: str, headers):
     if if_match != fn["dev_etag"]:
         return _error(
             "PreconditionFailed",
-            "The precondition given in one or more of the request-header fields evaluated to false.",
+            _FUNCTION_PRECONDITION_FAILED,
             412,
         )
 
+    in_use = sum(1 for d in _distributions.values() if fn["arn"] in _function_arns_in(d))
+    if in_use:
+        return _error("FunctionInUse", f"Cannot delete function {name}, it is in use by {in_use} distributions", 409)
     del _functions[name]
+    _tags.pop(fn["arn"], None)
     logger.info("DeleteFunction name=%s", name)
     return 204, {}, b""
 
@@ -2445,6 +2672,22 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "POST" and operation == "Untag":
             return _untag_resource(resource, body)
 
+    # VPC origin routes
+    m = _VPC_ORIGIN_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_vpc_origin(body)
+        if method == "GET":
+            return _list_vpc_origins(query_params)
+    m = _VPC_ORIGIN_ID_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_vpc_origin(m.group(1))
+        if method == "PUT":
+            return _update_vpc_origin(m.group(1), headers, body)
+        if method == "DELETE":
+            return _delete_vpc_origin(m.group(1), headers)
+
     # OAC routes
     m = _OAC_RE.match(path)
     if m:
@@ -2605,10 +2848,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         name = m.group(1)
         if method == "GET":
-            stage = _qval(query_params, "Stage", "")
-            if not stage:
-                return _error("InvalidArgument", "The Stage query string parameter is required.", 400)
-            return _cf_describe_function(name, stage)
+            stage, err = _function_stage(query_params)
+            return err or _cf_describe_function(name, stage)
 
     m = _FUN_PUBLISH_RE.match(path)
     if m:
@@ -2620,10 +2861,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         name = m.group(1)
         if method == "GET":
-            stage = _qval(query_params, "Stage", "")
-            if not stage:
-                return _error("InvalidArgument", "Stage is required.", 400)
-            return _cf_get_function(name, stage)
+            stage, err = _function_stage(query_params)
+            return err or _cf_get_function(name, stage)
         if method == "PUT":
             return _cf_update_function(name, headers, body)
         if method == "DELETE":
@@ -2656,6 +2895,16 @@ async def handle_request(method, path, headers, body, query_params):
 
     # SaaS Manager routes. Tenant sub-resource routes must be matched before
     # the greedy _TENANT_ID_RE / _CONN_GROUP_ID_RE identifier routes.
+    m = _DIST_WEBACL_ASSOC_RE.match(path)
+    if m:
+        if method == "PUT":
+            return _associate_distribution_webacl(m.group(1), headers, body)
+
+    m = _DIST_WEBACL_DISASSOC_RE.match(path)
+    if m:
+        if method == "PUT":
+            return _disassociate_distribution_webacl(m.group(1), headers)
+
     m = _TENANT_WEBACL_ASSOC_RE.match(path)
     if m:
         if method == "PUT":
@@ -2754,7 +3003,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # Read-only list surface for resource families with no backing store.
     # Family split matches botocore: KeyGroupList-style carry no Marker/
-    # IsTruncated; the OAI/StreamingDistribution/VpcOrigin family does.
+    # IsTruncated; the OAI/StreamingDistribution family does.
     m = _FLE_LIST_RE.match(path)
     if m and method == "GET":
         return _empty_marker_list(query_params, "FieldLevelEncryptionList", with_marker=False)
@@ -2774,10 +3023,6 @@ async def handle_request(method, path, headers, body, query_params):
     m = _STREAMING_DIST_LIST_RE.match(path)
     if m and method == "GET":
         return _empty_marker_list(query_params, "StreamingDistributionList", with_marker=True)
-
-    m = _VPC_ORIGIN_LIST_RE.match(path)
-    if m and method == "GET":
-        return _empty_marker_list(query_params, "VpcOriginList", with_marker=True)
 
     m = _REALTIME_LOG_LIST_RE.match(path)
     if m and method == "GET":
@@ -2826,6 +3071,9 @@ def _create_distribution(headers, body):
         return _error("InvalidArgument", "Origins is required.", 400)
     if _find(config_el, "DefaultCacheBehavior") is None:
         return _error("InvalidArgument", "DefaultCacheBehavior is required.", 400)
+    err = _distribution_vpc_origin_error(config_el)
+    if err:
+        return err
 
     dist_id = _dist_id()
     etag = new_uuid()
@@ -2965,6 +3213,9 @@ def _update_distribution(dist_id, headers, body):
     config_el = _parse_body(body)
     if config_el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
+    err = _distribution_vpc_origin_error(config_el)
+    if err:
+        return err
 
     new_etag = new_uuid()
     dist["config_xml"] = tostring(config_el, encoding="unicode")
@@ -3136,6 +3387,9 @@ def _list_tags(resource_arn):
     if err:
         return err
     tags = _tags.get(resource_arn, [])
+    if ":vpcorigin/" in resource_arn:
+        # AWS lists a VPC origin's tags sorted by key.
+        tags = sorted(tags, key=lambda t: t["Key"])
     root = Element("Tags", xmlns=NS)
     items = SubElement(root, "Items")
     for t in tags:
@@ -3181,6 +3435,447 @@ def _untag_resource(resource_arn, body):
             remove_keys.add(child.text or "")
     _tags[resource_arn] = [t for t in _tags.get(resource_arn, []) if t["Key"] not in remove_keys]
     return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# VPC origin handlers
+# ---------------------------------------------------------------------------
+# Control plane only. Codes, messages and the order of checks follow captures
+# from AWS (ministackorg/ministack#2312). AWS answers a create, update or delete
+# with Status Deploying and finishes it minutes later; MiniStack finishes it at
+# once, so a later read shows Deployed and a deleted origin is gone; AWS's
+# LastModifiedTime also moves on when a deployment ends, MiniStack's doesn't. The endpoint
+# ARN's format and account are checked, and the load balancer or instance must exist
+# in MiniStack's ELBv2 or EC2 state. Viewer requests are never routed to the VPC endpoint.
+
+_VPC_ORIGIN_POLICIES = ("https-only", "http-only", "match-viewer")
+_VPC_ORIGIN_SSL_PROTOCOLS = ("SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2")
+_VPC_ORIGIN_DEFAULT_SSL_PROTOCOLS = ["TLSv1", "TLSv1.1", "TLSv1.2"]
+_VPC_ORIGIN_IP_ADDRESS_TYPES = ("ipv4", "dualstack")
+_VPC_ORIGIN_ID_FORMAT_RE = re.compile(r"^[a-z]+_[A-Za-z0-9]{22}$")
+_VPC_ORIGIN_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_VPC_ORIGIN_NAME_MAX = 64
+_VPC_ORIGIN_INTEGER_RE = re.compile(r"^[-+]?[0-9]+$")
+_VPC_ORIGIN_ENDPOINT_RESOURCE_RE = {
+    "elasticloadbalancing": re.compile(r"^loadbalancer/(app|net)/[^/]+/[^/]+$"),
+    "ec2": re.compile(r"^instance/i-[0-9A-Za-z]+$"),
+}
+_vpc_origin_etags_issued = {}  # ETag -> version, for every version an origin has reached
+_VPC_ORIGIN_LOCATION = "https://cloudfront.amazonaws.com/2020-05-31/vpc-origin/"
+_VPC_ORIGIN_MAX_ITEMS = 100
+_VPC_ORIGIN_NOT_FOUND = "The specified vpc origin does not exist"
+_VPC_ORIGIN_BAD_IF_MATCH = "The If-Match version is missing or not valid for the resource."
+_VPC_ORIGIN_STALE_IF_MATCH = "The request failed because it didn't meet the preconditions in one or more request-header fields."
+_VPC_ORIGIN_NAME_TAKEN = "Another vpc origin with the same name already exists within the aws account."
+_VPC_ORIGIN_IN_USE = ("The specified VPC origin is currently associated with one or more distributions. Please "
+                      "disassociate the VPC origin from all distributions before updating or deleting")
+
+
+def _vpc_origin_etag(version):
+    """AWS's ETag follows the origin's version, so origins at the same version share
+    it. The version counts every change: a create, update or delete, and the end of
+    the deployment that follows it. The value is a uuid5 of the version, like
+    ``_managed_etag`` (real AWS ETags are opaque)."""
+    etag = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-vpc-origin/version/{version}"))
+    _vpc_origin_etags_issued.setdefault(etag, version)
+    return etag
+
+
+def _vpc_origin_validation_error(problems):
+    count = len(problems)
+    noun = "error" if count == 1 else "errors"
+    return _error("MalformedXML", f"{count} validation {noun} detected: " + "; ".join(problems), 400)
+
+
+def _vpc_origin_null(path):
+    return f"Value null at '{path}' failed to satisfy constraint: Member must not be null"
+
+
+def _vpc_origin_int(el, tag):
+    """(value, error) for an integer member; (None, None) when it is absent."""
+    child = _find(el, tag) if el is not None else None
+    if child is None:
+        return None, None
+    raw = child.text or ""
+    if not raw:
+        return None, _error("MalformedInput", "missing value for decimal type", 400)
+    if not _VPC_ORIGIN_INTEGER_RE.match(raw) or not -2**31 <= int(raw) < 2**31:
+        return None, _error("MalformedInput", None, 400)
+    return int(raw), None
+
+
+def _vpc_origin_body(body, root_tag):
+    """(element, error) for a request body. An empty body has no element."""
+    if not body:
+        return None, None
+    el = _parse_body(body)
+    if el is None:
+        return None, _error("MalformedInput", "Could not parse XML", 400)
+    if _local_tag_name(el) != root_tag:
+        return None, _error("MalformedInput", f"{_local_tag_name(el)} is not valid, expected {root_tag}", 400)
+    return el, None
+
+
+def _parse_vpc_origin_endpoint_config(cfg_el, path="vpcOriginEndpointConfig"):
+    """(fields, problems, error) for a VpcOriginEndpointConfig element.
+
+    An integer that doesn't parse is an error at once (MalformedInput). The null and
+    enum problems come back as a list, in AWS's member order, so Update can add its
+    own ``ifMatch`` problem to the same MalformedXML message."""
+    if cfg_el is None:
+        return None, [_vpc_origin_null(path)], None
+    http_port, err = _vpc_origin_int(cfg_el, "HTTPPort")
+    if err:
+        return None, [], err
+    https_port, err = _vpc_origin_int(cfg_el, "HTTPSPort")
+    if err:
+        return None, [], err
+    ssl_el = _find(cfg_el, "OriginSslProtocols")
+    quantity, err = _vpc_origin_int(ssl_el, "Quantity")
+    if err:
+        return None, [], err
+    name_el, arn_el, policy_el = (_find(cfg_el, t) for t in ("Name", "Arn", "OriginProtocolPolicy"))
+    # AWS lists the problems in this member order.
+    problems = []
+    if http_port is None:
+        problems.append(_vpc_origin_null(f"{path}.hTTPPort"))
+    protocols = None
+    if ssl_el is not None:
+        items_el = _find(ssl_el, "Items")
+        if quantity is None:
+            problems.append(_vpc_origin_null(f"{path}.originSslProtocols.quantity"))
+        if items_el is None:
+            problems.append(_vpc_origin_null(f"{path}.originSslProtocols.items"))
+        else:
+            protocols = [i.text or "" for i in items_el if _local_tag_name(i) == "SslProtocol"]
+            if any(p not in _VPC_ORIGIN_SSL_PROTOCOLS for p in protocols):
+                problems.append(
+                    f"Value '[{', '.join(protocols)}]' at '{path}.originSslProtocols.items' failed to satisfy "
+                    "constraint: Member must satisfy constraint: [Member must satisfy enum value set: "
+                    f"[{', '.join(_VPC_ORIGIN_SSL_PROTOCOLS)}]]")
+    if name_el is None:
+        problems.append(_vpc_origin_null(f"{path}.name"))
+    policy = (policy_el.text or "") if policy_el is not None else None
+    if policy is None:
+        problems.append(_vpc_origin_null(f"{path}.originProtocolPolicy"))
+    elif policy not in _VPC_ORIGIN_POLICIES:
+        problems.append(f"Value '{policy}' at '{path}.originProtocolPolicy' failed to satisfy constraint: "
+                        f"Member must satisfy enum value set: [{', '.join(_VPC_ORIGIN_POLICIES)}]")
+    if https_port is None:
+        problems.append(_vpc_origin_null(f"{path}.hTTPSPort"))
+    if arn_el is None:
+        problems.append(_vpc_origin_null(f"{path}.arn"))
+    ip_el = _find(cfg_el, "IpAddressType")
+    ip_type = (ip_el.text or "") if ip_el is not None else "ipv4"
+    if ip_type not in _VPC_ORIGIN_IP_ADDRESS_TYPES:
+        problems.append(f"Value '{ip_type}' at '{path}.ipAddressType' failed to satisfy constraint: "
+                        f"Member must satisfy enum value set: [{', '.join(_VPC_ORIGIN_IP_ADDRESS_TYPES)}]")
+    fields = {
+        "Name": (name_el.text or "") if name_el is not None else "",
+        "Arn": (arn_el.text or "") if arn_el is not None else "",
+        "HTTPPort": http_port,
+        "HTTPSPort": https_port,
+        "OriginProtocolPolicy": policy,
+        "Quantity": quantity,
+        "OriginSslProtocols": protocols,
+        "IpAddressType": ip_type,
+    }
+    return fields, problems, None
+
+
+def _vpc_origin_region_known(region):
+    """AWS refuses a region it doesn't have (xx-fake-1) as an invalid format."""
+    from ministack.services import ec2
+
+    return any(name == region for name, _ in ec2._AWS_REGIONS)
+
+
+def _vpc_origin_endpoint_error(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    pattern = _VPC_ORIGIN_ENDPOINT_RESOURCE_RE.get(spec.service) if spec else None
+    if (not pattern or spec.partition != "aws" or not _vpc_origin_region_known(spec.region)
+            or not spec.account_id or not pattern.match(spec.resource)):
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn Invalid Format.", 400)
+    if spec.account_id != get_account_id():
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn contains a mismatched AWS account.",
+                      400)
+    return _vpc_origin_endpoint_missing(spec, arn)
+
+
+def _vpc_origin_endpoint_missing(spec, arn):
+    """The load balancer or instance must exist in the ARN's account and region."""
+    if spec.service == "elasticloadbalancing":
+        from ministack.services import alb
+
+        if alb._lbs.contains_scoped(spec.account_id, spec.region, arn):
+            return None
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.", 400)
+    from ministack.services import ec2
+
+    instance_id = spec.resource.split("/", 1)[1]
+    if ec2._instances.contains_scoped(spec.account_id, spec.region, instance_id):
+        return None
+    # AWS answers NotFound for a short (8-character) id and Malformed for a long one.
+    reason = "InvalidInstanceID.NotFound" if len(instance_id) == len("i-12345678") else "InvalidInstanceID.Malformed"
+    return _error("InvalidArgument", f"The parameter VpcOriginEndpointConfig Arn {reason}.", 400)
+
+
+def _check_vpc_origin_endpoint_config(fields):
+    """(config, error) for the checks AWS makes after the schema and the If-Match:
+    the ports, the name, the protocol list, then the endpoint ARN."""
+    if not all(p in (80, 443) or 1024 <= p <= 65535 for p in (fields["HTTPPort"], fields["HTTPSPort"])):
+        return None, _error("InvalidArgument", "The parameter origin port is not within allowed range.", 400)
+    name = fields["Name"]
+    if not name:
+        return None, _error("InvalidArgument", "The parameter VPC Origin Name is too small or empty.", 400)
+    if len(name) > _VPC_ORIGIN_NAME_MAX:
+        return None, _error("InvalidArgument", "The parameter VPC Origin Name is too big.", 400)
+    if not _VPC_ORIGIN_NAME_RE.match(name):
+        return None, _error("InvalidArgument",
+                            "The parameter Name contains characters other than alphanumericals, dashes, and underscores.",
+                            400)
+    protocols, quantity = fields["OriginSslProtocols"], fields["Quantity"]
+    if protocols is None:
+        protocols = list(_VPC_ORIGIN_DEFAULT_SSL_PROTOCOLS)
+    elif quantity != len(protocols):
+        return None, _error("InconsistentQuantities",
+                            f"The specified quantity of OriginSslProtocols ({quantity}) does not match the actual "
+                            f"quantity supplied ({len(protocols)}).", 400)
+    elif not protocols:
+        return None, _error("InvalidArgument",
+                            "The parameter OriginSslProtocols is not valid! Should be one or more from SSLv3, TLSv1, "
+                            "TLSv1.1, and TLSv1.2.", 400)
+    err = _vpc_origin_endpoint_error(fields["Arn"])
+    if err:
+        return None, err
+    # Stored once each, in the order of the enum.
+    protocols = [p for p in _VPC_ORIGIN_SSL_PROTOCOLS if p in protocols]
+    return {
+        "Name": name,
+        "Arn": fields["Arn"],
+        "HTTPPort": fields["HTTPPort"],
+        "HTTPSPort": fields["HTTPSPort"],
+        "OriginProtocolPolicy": fields["OriginProtocolPolicy"],
+        "OriginSslProtocols": protocols,
+        "IpAddressType": fields["IpAddressType"],
+    }, None
+
+
+def _vpc_origin_name_taken(name, exclude_id=None):
+    return any(vo["Id"] != exclude_id and vo["VpcOriginEndpointConfig"]["Name"] == name
+               for vo in _vpc_origins.values())
+
+
+def _build_vpc_origin_xml(root, vo):
+    SubElement(root, "Id").text = vo["Id"]
+    SubElement(root, "Arn").text = vo["Arn"]
+    SubElement(root, "AccountId").text = vo["AccountId"]
+    SubElement(root, "Status").text = vo["Status"]
+    SubElement(root, "CreatedTime").text = vo["CreatedTime"]
+    SubElement(root, "LastModifiedTime").text = vo["LastModifiedTime"]
+    cfg = vo["VpcOriginEndpointConfig"]
+    cfg_el = SubElement(root, "VpcOriginEndpointConfig")
+    SubElement(cfg_el, "Name").text = cfg["Name"]
+    SubElement(cfg_el, "Arn").text = cfg["Arn"]
+    SubElement(cfg_el, "HTTPPort").text = str(cfg["HTTPPort"])
+    SubElement(cfg_el, "HTTPSPort").text = str(cfg["HTTPSPort"])
+    SubElement(cfg_el, "OriginProtocolPolicy").text = cfg["OriginProtocolPolicy"]
+    ssl_el = SubElement(cfg_el, "OriginSslProtocols")
+    SubElement(ssl_el, "Quantity").text = str(len(cfg["OriginSslProtocols"]))
+    items_el = SubElement(ssl_el, "Items")
+    for proto in cfg["OriginSslProtocols"]:
+        SubElement(items_el, "SslProtocol").text = proto
+    SubElement(cfg_el, "IpAddressType").text = cfg.get("IpAddressType", "ipv4")
+
+
+def _vpc_origin_response(vo, status=200, deploying=False):
+    """The origin as stored, or, for a create, update or delete, as AWS answers it:
+    Deploying, at the version before its deployment finishes."""
+    version = vo["Version"] - 1 if deploying else vo["Version"]
+    view = dict(vo, Status="Deploying") if deploying else vo
+    return _xml_response("VpcOrigin", lambda root: _build_vpc_origin_xml(root, view), status=status,
+                         extra_headers={"ETag": _vpc_origin_etag(version)})
+
+
+def _create_vpc_origin(body):
+    el, err = _vpc_origin_body(body, "CreateVpcOriginRequest")
+    if err:
+        return err
+    fields, problems, err = _parse_vpc_origin_endpoint_config(
+        _find(el, "VpcOriginEndpointConfig") if el is not None else None)
+    if err:
+        return err
+    if problems:
+        return _vpc_origin_validation_error(problems)
+    cfg, err = _check_vpc_origin_endpoint_config(fields)
+    if err:
+        return err
+    if _vpc_origin_name_taken(cfg["Name"]):
+        return _error("EntityAlreadyExists", _VPC_ORIGIN_NAME_TAKEN, 409)
+    vo_id = "vo_" + "".join(random.choices(_KSUID_CHARS, k=22))
+    now = _now_iso()
+    vo = {
+        "Id": vo_id,
+        "Arn": f"arn:aws:cloudfront::{get_account_id()}:vpcorigin/{vo_id}",
+        "AccountId": get_account_id(),
+        "Status": "Deployed",
+        "CreatedTime": now,
+        "LastModifiedTime": now,
+        "VpcOriginEndpointConfig": cfg,
+        "Version": 2,
+    }
+    _vpc_origins[vo_id] = vo
+    _ingest_distribution_tags_from_xml(vo["Arn"], _find(el, "Tags"))
+    status, headers, payload = _vpc_origin_response(vo, status=202, deploying=True)
+    headers["Location"] = _VPC_ORIGIN_LOCATION + vo_id
+    return status, headers, payload
+
+
+def _vpc_origin_lookup(vo_id):
+    vo = _vpc_origins.get(vo_id)
+    if not vo:
+        return None, _error("EntityNotFound", _VPC_ORIGIN_NOT_FOUND, 404)
+    return vo, None
+
+
+def _vpc_origin_bad_if_match(if_match):
+    """An If-Match that is no version's ETag; checked before the origin is looked up.
+    AWS refuses a well-formed ETag it never issued, and accepts an issued one on any id."""
+    if if_match not in _vpc_origin_etags_issued:
+        return _error("InvalidIfMatchVersion", _VPC_ORIGIN_BAD_IF_MATCH, 400)
+    return None
+
+
+def _vpc_origin_current(vo_id, if_match):
+    """(record, error): the origin, then an If-Match that isn't its current ETag."""
+    vo, err = _vpc_origin_lookup(vo_id)
+    if err:
+        return None, err
+    if if_match != _vpc_origin_etag(vo["Version"]):
+        return None, _error("PreconditionFailed", _VPC_ORIGIN_STALE_IF_MATCH, 412)
+    return vo, None
+
+
+def _get_vpc_origin(vo_id):
+    if not _VPC_ORIGIN_ID_FORMAT_RE.match(vo_id):
+        return _error("InvalidArgument", "Id format is invalid", 400)
+    vo, err = _vpc_origin_lookup(vo_id)
+    if err:
+        return err
+    return _vpc_origin_response(vo)
+
+
+def _update_vpc_origin(vo_id, headers, body):
+    # Errors reading the body come before the id format.
+    el, err = _vpc_origin_body(body, "VpcOriginEndpointConfig")
+    if err:
+        return err
+    fields, problems, err = _parse_vpc_origin_endpoint_config(el)
+    if err:
+        return err
+    if not _VPC_ORIGIN_ID_FORMAT_RE.match(vo_id):
+        return _error("InvalidArgument", "Id format is invalid", 400)
+    if_match = headers.get("if-match")
+    if if_match is None:
+        problems.append(_vpc_origin_null("ifMatch"))
+    if problems:
+        return _vpc_origin_validation_error(problems)
+    err = _vpc_origin_bad_if_match(if_match)
+    if err:
+        return err
+    cfg, err = _check_vpc_origin_endpoint_config(fields)
+    if err:
+        return err
+    vo, err = _vpc_origin_current(vo_id, if_match)
+    if err:
+        return err
+    if _vpc_origin_in_use(vo_id):
+        if cfg != vo["VpcOriginEndpointConfig"]:
+            return _error("CannotUpdateEntityWhileInUse", _VPC_ORIGIN_IN_USE, 409)
+        # An unchanged config is accepted without a new version.
+        return _vpc_origin_response(vo, status=202)
+    if _vpc_origin_name_taken(cfg["Name"], exclude_id=vo_id):
+        return _error("EntityAlreadyExists", _VPC_ORIGIN_NAME_TAKEN, 409)
+    vo["VpcOriginEndpointConfig"] = cfg
+    vo["LastModifiedTime"] = _now_iso()
+    vo["Version"] += 2
+    return _vpc_origin_response(vo, status=202, deploying=True)
+
+
+def _vpc_origin_ids_in(dist):
+    """VpcOriginId values named by a stored distribution's origins."""
+    try:
+        root = fromstring(dist.get("config_xml") or "")
+    except Exception:
+        return set()
+    return {_text(vpc_cfg, "VpcOriginId") for vpc_cfg in _config_vpc_origin_configs(root)}
+
+
+def _vpc_origin_in_use(vo_id):
+    return any(vo_id in _vpc_origin_ids_in(d) for d in _distributions.values())
+
+
+def _delete_vpc_origin(vo_id, headers):
+    if not _VPC_ORIGIN_ID_FORMAT_RE.match(vo_id):
+        return _error("InvalidArgument", "Id format is invalid", 400)
+    if_match = headers.get("if-match")
+    if if_match is None:
+        return _vpc_origin_validation_error([_vpc_origin_null("ifMatch")])
+    err = _vpc_origin_bad_if_match(if_match)
+    if err:
+        return err
+    vo, err = _vpc_origin_current(vo_id, if_match)
+    if err:
+        return err
+    if _vpc_origin_in_use(vo_id):
+        return _error("CannotDeleteEntityWhileInUse", _VPC_ORIGIN_IN_USE, 409)
+    del _vpc_origins[vo_id]
+    _tags.pop(vo["Arn"], None)
+    gone = dict(vo, LastModifiedTime=_now_iso(), Version=vo["Version"] + 2)
+    return _vpc_origin_response(gone, status=202, deploying=True)
+
+
+def _list_vpc_origins(query_params):
+    max_items_raw = _qval(query_params, "MaxItems", "")
+    marker = _qval(query_params, "Marker", "")
+    if max_items_raw:
+        if not _VPC_ORIGIN_INTEGER_RE.match(max_items_raw) or not 0 <= int(max_items_raw) < 2**31:
+            return _error("InvalidArgument", "MaxItems must be a non-zero positive integer.", 400)
+        max_items = min(int(max_items_raw), _VPC_ORIGIN_MAX_ITEMS)
+    else:
+        max_items = _VPC_ORIGIN_MAX_ITEMS
+    items = sorted(_vpc_origins.values(), key=lambda vo: vo["Id"])
+    if marker:
+        ids = [vo["Id"] for vo in items]
+        if marker not in ids:
+            return _error("EntityNotFound", "The request contains an invalid marker.", 404)
+        items = items[ids.index(marker) + 1:]
+    page = items[:max_items]
+    # NextMarker is the last id on a page that leaves items behind; Marker is exclusive.
+    more = bool(page) and len(items) > len(page)
+
+    def build(root):
+        if more:
+            SubElement(root, "NextMarker").text = page[-1]["Id"]
+        SubElement(root, "MaxItems").text = str(max_items)
+        SubElement(root, "Quantity").text = str(len(page))
+        items_el = SubElement(root, "Items")
+        for vo in page:
+            summary = SubElement(items_el, "VpcOriginSummary")
+            SubElement(summary, "Id").text = vo["Id"]
+            SubElement(summary, "Name").text = vo["VpcOriginEndpointConfig"]["Name"]
+            SubElement(summary, "Status").text = vo["Status"]
+            SubElement(summary, "CreatedTime").text = vo["CreatedTime"]
+            SubElement(summary, "LastModifiedTime").text = vo["LastModifiedTime"]
+            SubElement(summary, "Arn").text = vo["Arn"]
+            SubElement(summary, "AccountId").text = vo["AccountId"]
+            SubElement(summary, "OriginEndpointArn").text = vo["VpcOriginEndpointConfig"]["Arn"]
+            SubElement(summary, "IpAddressType").text = vo["VpcOriginEndpointConfig"].get("IpAddressType", "ipv4")
+
+    return _xml_response("VpcOriginList", build)
 
 
 # ---------------------------------------------------------------------------
@@ -3386,7 +4081,7 @@ def _create_kvs(headers, body):
     kvs_id = new_uuid()
     etag = new_uuid()
     now = _now_iso()
-    arn = _kvs_arn(name)
+    arn = _kvs_arn(kvs_id)
 
     # Optional ImportSource (create-only) — AWS spec: structure with required
     # SourceType + SourceARN. We accept and round-trip the values; data import
@@ -3971,6 +4666,22 @@ def _delete_connection_group(identifier, headers):
     return 204, {}, b""
 
 
+def _body_page(el, items):
+    """MaxItems / Marker from a POST list body. Returns ``(page, next_marker)``."""
+    max_raw = _opt_text(el, "MaxItems") if el is not None else None
+    marker = _opt_text(el, "Marker") if el is not None else None
+    try:
+        start = max(int(base64.urlsafe_b64decode((marker or "").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    try:
+        end = start + max(int(max_raw), 1)
+    except (TypeError, ValueError):
+        end = len(items)
+    next_marker = base64.urlsafe_b64encode(str(end).encode()).decode() if end < len(items) else None
+    return items[start:end], next_marker
+
+
 def _list_connection_groups(body):
     el = _parse_body(body)
     anycast_filter = None
@@ -3982,8 +4693,11 @@ def _list_connection_groups(body):
         cg for cg in _connection_groups.values()
         if not anycast_filter or cg.get("AnycastIpListId") == anycast_filter
     ]
+    groups, next_marker = _body_page(el, groups)
 
     def build(root):
+        if next_marker:
+            SubElement(root, "NextMarker").text = next_marker
         items_el = SubElement(root, "ConnectionGroups")
         for cg in groups:
             summary = SubElement(items_el, "ConnectionGroupSummary")
@@ -4192,7 +4906,7 @@ def _list_distribution_tenants(body):
         if (not dist_filter or t["DistributionId"] == dist_filter)
         and (not cg_filter or t["ConnectionGroupId"] == cg_filter)
     ]
-    return _tenant_list_response(tenants, "ListDistributionTenantsResult")
+    return _tenant_list_response(*_body_page(el, tenants), "ListDistributionTenantsResult")
 
 
 def _list_distribution_tenants_by_customization(body):
@@ -4211,19 +4925,88 @@ def _list_distribution_tenants_by_customization(body):
         return True
 
     return _tenant_list_response(
-        [t for t in _distribution_tenants.values() if matches(t)],
+        *_body_page(el, [t for t in _distribution_tenants.values() if matches(t)]),
         "ListDistributionTenantsByCustomizationResult",
     )
 
 
-def _tenant_list_response(tenants, root_tag):
+def _tenant_list_response(tenants, next_marker, root_tag):
     def build(root):
+        if next_marker:
+            SubElement(root, "NextMarker").text = next_marker
         items_el = SubElement(root, "DistributionTenantList")
         for tenant in tenants:
             summary = SubElement(items_el, "DistributionTenantSummary")
             _build_distribution_tenant_summary_xml(summary, tenant)
 
     return _xml_response(root_tag, build)
+
+
+def _set_distribution_webacl(dist, webacl_id):
+    """Set (or clear, with "") ``WebACLId`` in a stored DistributionConfig, and bump the ETag."""
+    config_el = fromstring(dist["config_xml"])
+    el = _find(config_el, "WebACLId")
+    if el is None:
+        ns = config_el.tag.split("}")[0] + "}" if config_el.tag.startswith("{") else ""
+        el = Element(ns + "WebACLId")
+        # WebACLId follows Restrictions in the DistributionConfig, so SDKs that read in order are not surprised.
+        restrictions = _find(config_el, "Restrictions")
+        children = list(config_el)
+        config_el.insert(children.index(restrictions) + 1 if restrictions is not None else len(children), el)
+    el.text = webacl_id
+    dist["config_xml"] = tostring(config_el, encoding="unicode")
+    dist["ETag"] = new_uuid()
+    dist["LastModifiedTime"] = _now_iso()
+
+
+def _distribution_webacl_precondition(dist, headers):
+    if_match = headers.get("if-match", "")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != dist["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    return None
+
+
+def _associate_distribution_webacl(dist_id, headers, body):
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("EntityNotFound", "The specified distribution does not exist.", 404)
+    err = _distribution_webacl_precondition(dist, headers)
+    if err:
+        return err
+    el = _parse_body(body)
+    webacl_arn = _text(el, "WebACLArn") if el is not None else ""
+    if not webacl_arn:
+        return _error("InvalidArgument", "WebACLArn is required.", 400)
+    _set_distribution_webacl(dist, webacl_arn)
+    logger.info("AssociateDistributionWebACL id=%s", dist_id)
+
+    def build(root):
+        SubElement(root, "Id").text = dist_id
+        SubElement(root, "WebACLArn").text = webacl_arn
+
+    return _xml_response("AssociateDistributionWebACLResult", build, extra_headers={"ETag": dist["ETag"]})
+
+
+def _disassociate_distribution_webacl(dist_id, headers):
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("EntityNotFound", "The specified distribution does not exist.", 404)
+    err = _distribution_webacl_precondition(dist, headers)
+    if err:
+        return err
+    _set_distribution_webacl(dist, "")
+    logger.info("DisassociateDistributionWebACL id=%s", dist_id)
+
+    def build(root):
+        SubElement(root, "Id").text = dist_id
+
+    return _xml_response("DisassociateDistributionWebACLResult", build, extra_headers={"ETag": dist["ETag"]})
 
 
 def _associate_tenant_webacl(tenant_id, headers, body):
@@ -4455,6 +5238,7 @@ def _list_domain_conflicts(body):
         for rtype, rid in _domain_owners(domain, wildcard_overlap=True)
         if rid not in exclude_ids
     ]
+    conflicts, next_marker = _body_page(el, conflicts)
 
     def build(root):
         list_el = SubElement(root, "DomainConflicts")
@@ -4465,6 +5249,8 @@ def _list_domain_conflicts(body):
             SubElement(item, "ResourceType").text = rtype
             SubElement(item, "ResourceId").text = rid
             SubElement(item, "AccountId").text = get_account_id()
+        if next_marker:
+            SubElement(root, "NextMarker").text = next_marker
 
     return _xml_response("ListDomainConflictsResult", build)
 
@@ -4549,18 +5335,32 @@ def _list_distributions_by_connection_mode(mode):
 
 
 # ---------------------------------------------------------------------------
-# Data-plane support: cloudfront_dataplane serves traffic through this
-# accessor surface rather than the module-private stores directly.
+# Data-plane support: handle_viewer_request reads distributions through
+# this accessor surface rather than the module-private stores directly.
 # ---------------------------------------------------------------------------
 
 
+# Viewer requests are unsigned, so the lookups search every account.
 def find_distribution_for_label(label: str):
     """The distribution whose DomainName is ``<label>.cloudfront.net``."""
     domain = f"{label}.cloudfront.net"
-    for dist in _distributions.values():
+    for _, dist in _distributions.to_dict().items():
         if dist.get("DomainName", "").lower() == domain:
             return dist
     return None
+
+
+def find_distribution_for_alias(hostname: str):
+    """The distribution claiming ``hostname``: an exact alias, else the longest ``*.`` suffix the host ends with."""
+    hostname = hostname.lower()
+    best, best_len = None, -1
+    for _, dist in _distributions.to_dict().items():
+        for alias in map(str.lower, _get_distribution_aliases(dist)):
+            if alias == hostname:
+                return dist
+            if alias.startswith("*.") and hostname.endswith(alias[1:]) and len(alias) > best_len:
+                best, best_len = dist, len(alias)
+    return best
 
 
 # S3 REST-endpoint domain shapes of an origin's DomainName (Developer Guide, "Amazon S3 origin").
@@ -4639,7 +5439,7 @@ def _dataplane_forwarded_values(behavior_el):
 
 def _dataplane_allowed_methods(behavior_el):
     """The behavior's AllowedMethods.Items, or None when the block is absent
-    (nothing to enforce — see cloudfront_dataplane.py's method check)."""
+    (nothing to enforce — see handle_viewer_request's method check)."""
     am_el = _find(behavior_el, "AllowedMethods")
     if am_el is None:
         return None
@@ -4661,6 +5461,7 @@ def _dataplane_behavior(behavior_el, path_pattern=None):
         "cache_policy_id": _opt_text(behavior_el, "CachePolicyId"),
         "origin_request_policy_id": _opt_text(behavior_el, "OriginRequestPolicyId"),
         "response_headers_policy_id": _opt_text(behavior_el, "ResponseHeadersPolicyId"),
+        "compress": (_opt_text(behavior_el, "Compress") or "").lower() == "true",
         "forwarded_values": _dataplane_forwarded_values(behavior_el),
         "functions": _dataplane_function_associations(behavior_el),
     }
@@ -4738,3 +5539,1135 @@ def live_function_code(function_arn: str):
     if not fn or not fn.get("live_etag"):
         return None
     return _function_view(fn, "LIVE").get("code", fn["code"])
+
+
+# ---------------------------------------------------------------------------
+# Data plane: viewer requests to a distribution
+# ---------------------------------------------------------------------------
+
+_HOP_BY_HOP_REQUEST_HEADERS = {"host", "cookie", "content-length", "connection", "transfer-encoding"}
+# Hop-by-hop headers dropped at the socket boundary (_forward_to_origin).
+_CONNECTION_MANAGEMENT_HEADERS = {"content-length", "connection", "transfer-encoding"}
+
+# Always forwarded, whatever the policies say (Developer Guide, request headers table).
+_ALWAYS_FORWARD_REQUEST_HEADERS = {
+    "range", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
+}
+
+# Connection-management fields dropped from an origin's response.
+_HOP_BY_HOP_RESPONSE_HEADERS = {"connection", "keep-alive", "transfer-encoding", "upgrade", "trailer"}
+
+
+class CloudFrontFunctionError(Exception):
+    """A CloudFront Function threw, timed out, or its code didn't define a
+    handler — CloudFront answers every one of these with a 503."""
+
+
+# ---------------------------------------------------------------------------
+# CloudFront Functions event <-> HTTP conversion (functions-event-structure.html)
+# ---------------------------------------------------------------------------
+
+
+def _title_case_header_name(name: str) -> str:
+    """"example-header-name" -> "Example-Header-Name", as CloudFront Functions title-case header names."""
+    return "-".join(part[:1].upper() + part[1:] if part[:1].isascii() else part for part in name.split("-"))
+
+
+def _event_items(values: dict) -> dict:
+    """A querystring/headers object: one field per name, carrying a
+    ``multiValue`` array when the same name repeated (functions-event-
+    structure.html, "Duplicate query strings, headers, and cookies")."""
+    out = {}
+    for name, value in values.items():
+        items = value if isinstance(value, list) else [value]
+        out[name] = {"value": items[0]}
+        if len(items) > 1:
+            out[name]["multiValue"] = [{"value": v} for v in items]
+    return out
+
+
+def _event_cookies_from_header(cookie_header: str) -> dict:
+    cookies = {}
+    for part in (cookie_header or "").split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name:
+            cookies[name] = {"value": value.strip()}
+    return cookies
+
+
+def _event_cookies_from_set_cookie(set_cookie) -> dict:
+    """The response.cookies event object built from raw Set-Cookie header values."""
+    values = set_cookie if isinstance(set_cookie, list) else ([set_cookie] if set_cookie else [])
+    cookies = {}
+    for raw in values:
+        name_value, _, attrs = raw.partition(";")
+        name, _, value = name_value.partition("=")
+        name = name.strip()
+        if not name:
+            continue
+        entry = {"value": value.strip()}
+        if attrs.strip():
+            entry["attributes"] = attrs.strip()
+        if name in cookies:
+            existing = cookies[name]
+            existing.setdefault("multiValue", [{k: v for k, v in existing.items() if k != "multiValue"}])
+            existing["multiValue"].append(entry)
+        else:
+            cookies[name] = entry
+    return cookies
+
+
+def _set_cookie_values_from_event(cookies: dict) -> list:
+    out = []
+    for name, field in (cookies or {}).items():
+        if not isinstance(field, dict):
+            continue
+        entries = field.get("multiValue") or [field]
+        for entry in entries:
+            line = f"{name}={entry.get('value', '')}"
+            if entry.get("attributes"):
+                line += f"; {entry['attributes']}"
+            out.append(line)
+    return out
+
+
+def _event_querystring(query_params: dict) -> dict:
+    return _event_items({name: values for name, values in (query_params or {}).items()})
+
+
+def _merge_function_headers(original_headers_obj: dict, returned_headers_obj: dict) -> dict:
+    """A name(lowercase)->value dict built from a function's returned headers object."""
+    original = original_headers_obj or {}
+    out = {}
+    for name, field in (returned_headers_obj or {}).items():
+        if not isinstance(field, dict):
+            continue
+        orig_field = original.get(name)
+        orig_multi = orig_field.get("multiValue") if isinstance(orig_field, dict) else None
+        new_multi = field.get("multiValue")
+        if new_multi and new_multi != orig_multi:
+            out[name.lower()] = [str(v.get("value", "")) for v in new_multi]
+        elif orig_multi:
+            out[name.lower()] = [str(field.get("value", ""))] + [str(v.get("value", "")) for v in orig_multi[1:]]
+        elif "value" in field:
+            out[name.lower()] = str(field["value"])
+    return out
+
+
+def _build_function_event(event_type: str, dist_id: str, dist_domain: str, request_id: str,
+                           method: str, uri: str, query_params: dict, headers: dict, client_ip: str) -> dict:
+    request_headers = {k: v for k, v in headers.items() if k != "cookie"}
+    if isinstance(request_headers.get("host"), str):
+        # Captured on AWS: the function sees the Host lower-cased and without its port.
+        host = request_headers["host"].lower()
+        request_headers["host"] = host if host.endswith("]") or ":" not in host else host.rsplit(":", 1)[0]
+    return {
+        "version": "1.0",
+        "context": {
+            "distributionDomainName": dist_domain,
+            "distributionId": dist_id,
+            "eventType": event_type,
+            "requestId": request_id,
+        },
+        # functions-event-structure.html: the TCP peer, not a header value.
+        "viewer": {"ip": client_ip},
+        "request": {
+            "method": method,
+            "uri": uri,
+            "querystring": _event_querystring(query_params),
+            "headers": _event_items(request_headers),
+            "cookies": _event_cookies_from_header(headers.get("cookie", "")),
+        },
+    }
+
+
+def _response_event_fields(status: int, reason: str, headers: dict) -> dict:
+    response_headers = {k: v for k, v in headers.items() if k != "set-cookie"}
+    return {
+        "statusCode": status,
+        "statusDescription": reason or "",
+        "headers": _event_items(response_headers),
+        "cookies": _event_cookies_from_set_cookie(headers.get("set-cookie")),
+    }
+
+
+def _body_from_response_event(response: dict, fallback: bytes) -> bytes:
+    body = response.get("body")
+    if body is None:
+        return fallback
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, dict):
+        data = body.get("data", "")
+        if body.get("encoding") == "base64":
+            return base64.b64decode(data)
+        return str(data).encode("utf-8")
+    return fallback
+
+
+async def _run_function(function_arn: str, event: dict) -> dict:
+    code = live_function_code(function_arn)
+    if code is None:
+        raise CloudFrontFunctionError(f"{function_arn} has no published (LIVE) code")
+    from ministack.services import cloudfront_keyvaluestore
+
+    fn = _functions[function_arn.rsplit("/", 1)[-1]]
+    view = _function_view(fn, "LIVE")
+    kvs_arns = view.get("kvs_arns") or []
+    kvs = cloudfront_keyvaluestore.function_snapshot(kvs_arns[0]) if kvs_arns else None
+    try:
+        # A function cannot call back into MiniStack, so the key value store goes in with the event.
+        return await run_offloop(cloudfront_js.evaluate, code, event, view.get("runtime", fn["runtime"]), kvs)
+    except cloudfront_js.CloudFrontFunctionError as exc:
+        raise CloudFrontFunctionError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Cache behavior matching — CloudFront path-pattern glob, first match wins.
+# ---------------------------------------------------------------------------
+
+
+def _glob_to_regex(pattern: str):
+    # A leading / in a path pattern is optional (Developer Guide, "Path pattern").
+    if not pattern.startswith("/"):
+        pattern = "/" + pattern
+    out = [".*" if ch == "*" else "." if ch == "?" else _re_escape(ch) for ch in pattern]
+    return _re_compile("^" + "".join(out) + "$")
+
+
+def _match_behavior(parsed: dict, path: str):
+    for behavior in parsed["ordered_behaviors"]:
+        if _glob_to_regex(behavior["path_pattern"]).match(path):
+            return behavior
+    return parsed["default_behavior"]
+
+
+# ---------------------------------------------------------------------------
+# Origin-request forwarding: the cache policy / origin request policy combination table (Developer Guide).
+# ---------------------------------------------------------------------------
+
+
+def _behavior_kind(behavior: str, names, lowercase: bool = False):
+    """A cache or origin request policy behavior value as a (kind, set) pair."""
+    names = [n.lower() for n in (names or [])] if lowercase else list(names or [])
+    if behavior in ("all", "allViewer", "allViewerAndWhitelistCloudFront"):
+        return ("all", None)
+    if behavior == "whitelist":
+        return ("whitelist", set(names))
+    if behavior == "allExcept":
+        return ("allExcept", set(names))
+    return ("none", None)
+
+
+def _combine_forward(cache_kind_set, orp_kind_set, name: str) -> bool:
+    """Whether ``name`` reaches the origin, per the cache-policy / origin-request-policy combination table."""
+    cache_kind, cache_set = cache_kind_set
+    if cache_kind == "all":
+        return True  # a cache policy's "all" always wins, even over an ORP block list
+    orp_kind, orp_set = orp_kind_set if orp_kind_set is not None else ("none", None)
+    if orp_kind == "all":
+        return True
+    if cache_kind == "none":
+        if orp_kind == "whitelist":
+            return name in orp_set
+        if orp_kind == "allExcept":
+            return name not in orp_set
+        return False
+    if cache_kind == "whitelist":
+        if name in cache_set:
+            return True
+        if orp_kind == "whitelist":
+            return name in orp_set
+        if orp_kind == "allExcept":
+            return name not in orp_set
+        return False
+    if cache_kind == "allExcept":
+        if name not in cache_set:
+            if orp_kind == "allExcept":
+                return name not in orp_set
+            return True  # cache policy already allows it through unless ORP also blocks it
+        return orp_kind == "whitelist" and name in orp_set  # ORP allow-list rescues a cache-blocked name
+    return False
+
+
+def _legacy_predicates(fv: dict):
+    """Forwarding predicates for a legacy ``ForwardedValues`` behavior (no CachePolicyId)."""
+    header_names = {n.lower() for n in (fv.get("headers") or [])}
+    forward_all_headers = "*" in (fv.get("headers") or [])
+    cookies_forward = fv.get("cookies_forward", "none")
+    cookies_whitelist = fv.get("cookies_whitelist") or []
+    forward_qs = bool(fv.get("query_string"))
+
+    def header_allowed(name):
+        return forward_all_headers or name.lower() in header_names
+
+    def cookie_allowed(name):
+        if cookies_forward == "all":
+            return True
+        if cookies_forward == "whitelist":
+            return any(fnmatch.fnmatchcase(name, pattern) for pattern in cookies_whitelist)
+        return False
+
+    def qs_allowed(_name):
+        return forward_qs
+
+    return header_allowed, cookie_allowed, qs_allowed
+
+
+def _policy_predicates(behavior: dict):
+    cache_params = cache_policy_params(behavior.get("cache_policy_id")) or {}
+    orp_cfg = (
+        origin_request_policy_config(behavior["origin_request_policy_id"])
+        if behavior.get("origin_request_policy_id") else None
+    )
+
+    cache_headers = _behavior_kind(cache_params.get("HeaderBehavior", "none"), cache_params.get("Headers"), lowercase=True)
+    cache_cookies = _behavior_kind(cache_params.get("CookieBehavior", "none"), cache_params.get("Cookies"))
+    cache_qs = _behavior_kind(cache_params.get("QueryStringBehavior", "none"), cache_params.get("QueryStrings"))
+
+    if orp_cfg is not None:
+        orp_headers = _behavior_kind(orp_cfg["HeaderBehavior"], orp_cfg["Headers"], lowercase=True)
+        orp_cookies = _behavior_kind(orp_cfg["CookieBehavior"], orp_cfg["Cookies"])
+        orp_qs = _behavior_kind(orp_cfg["QueryStringBehavior"], orp_cfg["QueryStrings"])
+    else:
+        orp_headers = orp_cookies = orp_qs = None
+
+    def header_allowed(name):
+        return _combine_forward(cache_headers, orp_headers, name.lower())
+
+    def cookie_allowed(name):
+        return _combine_forward(cache_cookies, orp_cookies, name)
+
+    def qs_allowed(name):
+        return _combine_forward(cache_qs, orp_qs, name)
+
+    return header_allowed, cookie_allowed, qs_allowed
+
+
+def _forwarding_predicates(behavior: dict):
+    if behavior.get("cache_policy_id"):
+        return _policy_predicates(behavior)
+    if behavior.get("forwarded_values") is not None:
+        return _legacy_predicates(behavior["forwarded_values"])
+    # Neither a cache policy nor ForwardedValues: only the defaults (Host, User-Agent).
+    return (lambda _n: False), (lambda _n: False), (lambda _n: False)
+
+
+# ---------------------------------------------------------------------------
+# Response-headers policy
+# ---------------------------------------------------------------------------
+
+
+def _cors_origin_allowed(allow_origins: list, viewer_origin: str) -> bool:
+    """Whether ``viewer_origin`` matches an AccessControlAllowOrigins entry ("*" or a glob)."""
+    return any(p == "*" or fnmatch.fnmatchcase(viewer_origin, p) for p in allow_origins or [])
+
+
+def _apply_cors_headers(headers: dict, cors_cfg: dict, viewer_origin: str, method: str) -> dict:
+    """Apply a response headers policy's CORS headers (Developer Guide, "CORS headers")."""
+    if not cors_cfg or not viewer_origin or not _cors_origin_allowed(cors_cfg.get("AllowOrigins"), viewer_origin):
+        return headers
+    result = dict(headers)
+    override = cors_cfg.get("OriginOverride", False)
+
+    def _set(name, value):
+        key = name.lower()
+        if key in result and not override:
+            return
+        result[key] = value
+
+    _set("access-control-allow-origin", "*" if "*" in (cors_cfg.get("AllowOrigins") or []) else viewer_origin)
+    if cors_cfg.get("AllowCredentials"):
+        _set("access-control-allow-credentials", "true")
+    if cors_cfg.get("ExposeHeaders"):
+        _set("access-control-expose-headers", ", ".join(cors_cfg["ExposeHeaders"]))
+    if method == "OPTIONS":
+        if cors_cfg.get("AllowHeaders"):
+            _set("access-control-allow-headers", ", ".join(cors_cfg["AllowHeaders"]))
+        if cors_cfg.get("AllowMethods"):
+            _set("access-control-allow-methods", ", ".join(cors_cfg["AllowMethods"]))
+        if cors_cfg.get("MaxAgeSec") is not None:
+            _set("access-control-max-age", str(cors_cfg["MaxAgeSec"]))
+    return result
+
+
+def _apply_response_headers_policy(headers: dict, policy_cfg: dict, viewer_origin: str, method: str) -> dict:
+    if not policy_cfg:
+        return headers
+    result = _apply_cors_headers(headers, policy_cfg.get("Cors"), viewer_origin, method)
+
+    def _set(name, value, override):
+        key = name.lower()
+        if key in result and not override:
+            return
+        result[key] = value
+
+    # CustomHeaders/RemoveHeaders are None when the policy never supplied that block.
+    for item in policy_cfg.get("CustomHeaders") or []:
+        _set(item["Header"], item["Value"], item["Override"])
+
+    sec = policy_cfg.get("Security") or {}
+    if "ContentTypeOptions" in sec:
+        _set("x-content-type-options", "nosniff", sec["ContentTypeOptions"]["Override"])
+    if "FrameOptions" in sec:
+        _set("x-frame-options", sec["FrameOptions"]["FrameOption"], sec["FrameOptions"]["Override"])
+    if "XSSProtection" in sec:
+        xp = sec["XSSProtection"]
+        value = "1" if xp["Protection"] else "0"
+        if xp["Protection"] and xp.get("ModeBlock"):
+            value += "; mode=block"
+        if xp.get("ReportUri"):
+            value += f"; report={xp['ReportUri']}"
+        _set("x-xss-protection", value, xp["Override"])
+    if "ReferrerPolicy" in sec:
+        _set("referrer-policy", sec["ReferrerPolicy"]["ReferrerPolicy"], sec["ReferrerPolicy"]["Override"])
+    if "ContentSecurityPolicy" in sec:
+        _set("content-security-policy", sec["ContentSecurityPolicy"]["ContentSecurityPolicy"],
+             sec["ContentSecurityPolicy"]["Override"])
+    if "StrictTransportSecurity" in sec:
+        hsts = sec["StrictTransportSecurity"]
+        value = f"max-age={hsts['AccessControlMaxAgeSec']}"
+        if hsts.get("IncludeSubdomains"):
+            value += "; includeSubDomains"
+        if hsts.get("Preload"):
+            value += "; preload"
+        _set("strict-transport-security", value, hsts["Override"])
+
+    for item in policy_cfg.get("RemoveHeaders") or []:
+        result.pop(item["Header"].lower(), None)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CloudFront's own added headers and synthesized error pages
+# ---------------------------------------------------------------------------
+
+
+def _cf_request_id() -> str:
+    return base64.urlsafe_b64encode(os.urandom(40)).decode()
+
+
+def _cf_via_hash() -> str:
+    return os.urandom(16).hex()
+
+
+def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None = None, edge_server: bool = True) -> dict:
+    result = dict(headers)
+    result["via"] = f"1.1 {_cf_via_hash()}.cloudfront.net (CloudFront)"
+    result["x-cache"] = x_cache
+    result["x-amz-cf-pop"] = "LOC50-C1"
+    result["x-amz-cf-id"] = request_id or _cf_request_id()
+    if edge_server and not any(k.lower() == "server" for k in result):
+        result["server"] = "CloudFront"
+    return result
+
+
+def _render_headers(headers: dict, title_case: bool) -> dict:
+    if not title_case:
+        return dict(headers)
+    return {_title_case_header_name(name): value for name, value in headers.items()}
+
+
+# The fixed body of CloudFront's own error pages ("The request could not be satisfied"), byte for byte as a
+# real distribution sends it for a blocked request (919 bytes), a bad request (915) and a refused method (1053).
+_CF_ERROR_TEMPLATE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<HTML><HEAD><META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+<TITLE>ERROR: The request could not be satisfied</TITLE>
+</HEAD><BODY>
+<H1>{status} ERROR</H1>
+<H2>The request could not be satisfied.</H2>
+<HR noshade size="1px">
+{explanation}
+We can't connect to the server for this app or website at this time. There might be too much traffic or a configuration error. Try again later, or contact the app or website owner.
+<BR clear="all">
+If you provide content to customers through CloudFront, you can find steps to troubleshoot and help prevent this error by reviewing the CloudFront documentation.
+<BR clear="all">
+<HR noshade size="1px">
+<PRE>
+Generated by cloudfront (CloudFront)
+Request ID: {request_id}
+</PRE>
+<ADDRESS>
+</ADDRESS>
+</BODY></HTML>"""
+
+
+def _cf_error_response(status: int, explanation: str, x_cache: str) -> tuple:
+    request_id = _cf_request_id()
+    body = _CF_ERROR_TEMPLATE.format(status=status, explanation=explanation,
+                                      request_id=request_id).encode("utf-8")
+    headers = _add_cloudfront_headers({"content-type": "text/html"}, x_cache, request_id=request_id)
+    return status, _render_headers(headers, title_case=True), body
+
+
+# A failed origin TLS handshake is a 502 (Developer Guide, http-502-bad-gateway).
+_ERROR_X_CACHE = "Error from cloudfront"
+
+
+# ---------------------------------------------------------------------------
+# Origin forwarding
+# ---------------------------------------------------------------------------
+
+
+class OriginUnreachable(Exception):
+    pass
+
+
+class OriginTimeout(Exception):
+    """The origin didn't respond within OriginReadTimeout."""
+
+
+# An origin addressed by an AWS-owned hostname is refused with 502, so no traffic reaches real AWS.
+_AWS_OWNED_HOST_SUFFIXES = (".amazonaws.com", ".amazonaws.com.cn", ".on.aws", ".api.aws", ".cloudfront.net")
+
+
+def _normalize_origin_host(host: str) -> str:
+    h = (host or "").strip().lower()
+    return h[:-1] if h.endswith(".") else h
+
+
+def _is_aws_owned_host(host: str) -> bool:
+    return any(host == suffix.removeprefix(".") or host.endswith(suffix) for suffix in _AWS_OWNED_HOST_SUFFIXES)
+
+
+def _origin_connect_target(origin: dict, viewer_is_https: bool) -> tuple:
+    """(connect_host, connect_port, use_https) — the origin's own
+    DomainName and HTTPPort/HTTPSPort, dialed exactly as configured."""
+    policy = origin["protocol_policy"]
+    use_https = policy == "https-only" or (policy == "match-viewer" and viewer_is_https)
+    port = origin["https_port"] if use_https else origin["http_port"]
+    return origin["domain_name"], port, use_https
+
+
+def _origin_ssl_context() -> ssl.SSLContext:
+    """System roots, plus the gateway's own TLS cert under USE_SSL
+    (lambda_svc.py's container CA-trust precedent) — a custom https origin
+    may itself be a MiniStack-served endpoint sharing that cert."""
+    from ministack.core import tls
+
+    ctx = ssl.create_default_context()
+    if tls.use_ssl_enabled():
+        ctx.load_verify_locations(tls.resolve_tls_material()[0])
+        ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    return ctx
+
+
+def _set_header_ci(headers: dict, name: str, value) -> None:
+    """Set ``name: value``, replacing any case-insensitive match."""
+    for existing in [k for k in headers if k.lower() == name.lower()]:
+        del headers[existing]
+    headers[name] = value
+
+
+def _origin_x_forwarded_for(viewer_xff: str, client_ip: str) -> str:
+    """CloudFront Developer Guide, "Client IP addresses": appends the TCP
+    peer's address to an existing viewer-sent X-Forwarded-For, or adds a
+    fresh one carrying just that address."""
+    return f"{viewer_xff}, {client_ip}" if viewer_xff else client_ip
+
+
+def _origin_request_headers(origin: dict, headers: dict, client_ip: str, viewer_x_forwarded_for: str) -> dict:
+    """The header fields sent to a custom origin, one value per name."""
+    fwd_headers = {k: v for k, v in headers.items() if k not in _CONNECTION_MANAGEMENT_HEADERS}
+    for name, value in origin.get("custom_headers") or []:
+        _set_header_ci(fwd_headers, name, value)
+    # Host is the origin's DomainName unless the policies forward the viewer's Host.
+    _set_header_ci(fwd_headers, "Host", headers.get("host", origin["domain_name"]))
+    _set_header_ci(fwd_headers, "Via", f"1.1 {_cf_via_hash()}.cloudfront.net (CloudFront)")
+    _set_header_ci(fwd_headers, "X-Amz-Cf-Id", _cf_request_id())
+    # Always appended (Developer Guide, "Client IP addresses").
+    _set_header_ci(fwd_headers, "X-Forwarded-For",
+                    _origin_x_forwarded_for(viewer_x_forwarded_for, client_ip))
+    # RFC 9110 §5.3: a repeated field value is one comma-joined line.
+    return {
+        name: ", ".join(str(v) for v in value) if isinstance(value, list) else value
+        for name, value in fwd_headers.items()
+    }
+
+
+def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
+                        headers: dict, body: bytes, viewer_is_https: bool, client_ip: str = "127.0.0.1",
+                        viewer_x_forwarded_for: str = "") -> tuple:
+    """Blocking: run under core.concurrency.run_reentrant (the origin may be
+    MiniStack itself). Returns (status, reason, headers, body)."""
+    conn_host, conn_port, use_https = _origin_connect_target(origin, viewer_is_https)
+    if _is_aws_owned_host(_normalize_origin_host(conn_host)):
+        raise OriginUnreachable(f"refusing to dial AWS-owned origin host {conn_host!r}")
+    target_path = uri + (f"?{query_string}" if query_string else "")
+    send_headers = _origin_request_headers(origin, headers, client_ip, viewer_x_forwarded_for)
+
+    conn_cls = http.client.HTTPSConnection if use_https else http.client.HTTPConnection
+    timeout = origin.get("read_timeout", 30)
+    conn = (
+        conn_cls(conn_host, conn_port, timeout=timeout, context=_origin_ssl_context())
+        if use_https else conn_cls(conn_host, conn_port, timeout=timeout)
+    )
+    try:
+        # conn.request() would add "Accept-Encoding: identity" to a request the viewer sent without one.
+        names = {k.lower() for k in send_headers}
+        conn.putrequest(method, target_path, skip_host="host" in names, skip_accept_encoding=True)
+        for name, value in send_headers.items():
+            conn.putheader(name, value)
+        if "content-length" not in names and (body or method in ("POST", "PUT", "PATCH")):
+            conn.putheader("Content-Length", str(len(body or b"")))
+        conn.endheaders(body if body else None)
+        resp = conn.getresponse()
+        data = resp.read()
+        return resp.status, resp.reason, resp.getheaders(), data
+    except TimeoutError as e:
+        raise OriginTimeout(str(e)) from e
+    except Exception as e:
+        # An unreachable origin, or an untrusted or self-signed origin certificate.
+        raise OriginUnreachable(str(e)) from e
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# S3 origin — served from MiniStack's own S3 store in-process, never a socket.
+# ---------------------------------------------------------------------------
+
+
+def _s3_object_key(origin: dict, uri: str) -> str:
+    """OriginPath prefixed to the request URI, as CloudFront builds the origin path."""
+    return unquote((origin.get("origin_path") or "") + uri).lstrip("/")
+
+
+def _serve_s3_origin(origin: dict, method: str, uri: str, headers: dict, dist_arn: str = "") -> tuple:
+    """Fetch from an S3 origin in-process (blocking; run off the event loop)."""
+    from ministack.services import s3
+
+    return s3.serve_cloudfront_origin_fetch(
+        origin["s3_bucket"], _s3_object_key(origin, uri), method, headers,
+        source_arn=dist_arn if origin.get("oac_id") else "", oai_id=origin.get("oai_id", ""))
+
+
+# ---------------------------------------------------------------------------
+# Registered ALB origin: its AWS-owned DNSName is served in-process, never dialed.
+# ---------------------------------------------------------------------------
+
+
+def _registered_alb(origin: dict):
+    """The load balancer an origin's AWS-owned DomainName belongs to, or None."""
+    host = _normalize_origin_host(origin["domain_name"])
+    if not _is_aws_owned_host(host):
+        return None
+    # Imported here so distributions without such an origin never load the ALB module.
+    from ministack.services import alb
+
+    return alb.find_lb_for_host(host)
+
+
+async def _fetch_from_alb_origin(lb: dict, origin: dict, method: str, uri: str, query_string: str, headers: dict,
+                                 body: bytes, viewer_is_https: bool, client_ip: str, viewer_xff: str) -> tuple:
+    """(status, reason, headers, body) from the listener on the origin's port; raises OriginTimeout /
+    OriginUnreachable. The listener's rules and targets answer, as they would a request on the wire."""
+    from ministack.services import alb
+
+    _host, port, use_https = _origin_connect_target(origin, viewer_is_https)
+    # Without a TLS handshake there is no certificate for CloudFront to check, so only HTTP is served.
+    if use_https or not any(
+        listener.get("Port") == port and listener.get("Protocol") == "HTTP" for listener in alb.listeners_of(lb)
+    ):
+        raise OriginUnreachable(f"no HTTP listener on port {port} of {lb['DNSName']}")
+
+    # The ALB data plane takes the gateway's request shape: lowercase header names, parsed query.
+    alb_headers = {k.lower(): v for k, v in _origin_request_headers(origin, headers, client_ip, viewer_xff).items()}
+    read_timeout = origin.get("read_timeout", 30)
+    try:
+        status, response_headers, data = await asyncio.wait_for(
+            alb.dispatch_request(lb, method, uri, alb_headers, body or b"",
+                                 parse_qs(query_string, keep_blank_values=True), port,
+                                 client_ip="127.0.0.1", raw_query_string=query_string),
+            read_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise OriginTimeout(f"no response from {lb['DNSName']} within {read_timeout}s") from e
+    except Exception as e:
+        raise OriginUnreachable(str(e)) from e
+    if isinstance(data, StreamingResponse):
+        data = await _collect_streaming_body(data, read_timeout)
+    pairs = [(name, value) for name, values in response_headers.items()
+             for value in (values if isinstance(values, list) else [values])]
+    return status, http.client.responses.get(status, ""), pairs, data
+
+
+def _registered_function_url(origin: dict):
+    """The Function URL host an origin's AWS-owned DomainName names, when that URL exists in this MiniStack."""
+    host = _normalize_origin_host(origin["domain_name"])
+    if not (_is_aws_owned_host(host) and ".lambda-url." in host):
+        return None
+    from ministack import app
+    from ministack.services import lambda_svc
+
+    parsed = app._parse_lambda_url(host, "/")
+    return host if parsed and lambda_svc.resolve_function_url(parsed[0]) is not None else None
+
+
+async def _fetch_from_function_url_origin(host: str, origin: dict, method: str, uri: str, query_string: str,
+                                          headers: dict, body: bytes, viewer_is_https: bool, client_ip: str,
+                                          viewer_xff: str) -> tuple:
+    """(status, reason, headers, body) from a Function URL, served as a request to its host would be."""
+    from ministack import app
+
+    _host, _port, use_https = _origin_connect_target(origin, viewer_is_https)
+    # A Function URL only answers HTTPS.
+    if not use_https:
+        raise OriginUnreachable(f"{host} does not answer HTTP")
+    url_headers = {k.lower(): v for k, v in _origin_request_headers(origin, headers, client_ip, viewer_xff).items()}
+    # A Function URL refuses a Host other than its own, as when a policy forwards the viewer's.
+    if url_headers.get("host", "").split(":", 1)[0].lower() != host:
+        return 403, "Forbidden", [("Content-Type", "application/json"), ("x-amzn-RequestId", new_uuid()),
+                                  ("x-amzn-ErrorType", "AccessDeniedException")], b'{"Message":null}'
+    read_timeout = origin.get("read_timeout", 30)
+    try:
+        status, response_headers, data = await asyncio.wait_for(
+            app._handle_lambda_url_request(host, uri, method, url_headers, body or b"",
+                                           parse_qs(query_string, keep_blank_values=True), source_ip="127.0.0.1"),
+            read_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise OriginTimeout(f"no response from {host} within {read_timeout}s") from e
+    except Exception as e:
+        raise OriginUnreachable(str(e)) from e
+    pairs = [(name, value) for name, values in response_headers.items()
+             for value in (values if isinstance(values, list) else [values])]
+    return status, http.client.responses.get(status, ""), pairs, data
+
+
+async def _collect_streaming_body(stream: StreamingResponse, read_timeout: float) -> bytes:
+    """Buffer a relayed body; ``read_timeout`` bounds each chunk, and a missing final frame is a failure."""
+    frames: asyncio.Queue = asyncio.Queue()
+    finished = object()
+
+    async def receive():
+        # No viewer disconnect to report; the whole body is buffered.
+        await asyncio.Event().wait()
+
+    async def run():
+        try:
+            await stream.runner(frames.put, receive)
+        finally:
+            frames.put_nowait(finished)
+
+    runner = asyncio.ensure_future(run())
+    chunks, complete = [], False
+    try:
+        while (frame := await asyncio.wait_for(frames.get(), read_timeout)) is not finished:
+            chunks.append(frame.get("body", b""))
+            complete = not frame.get("more_body", False)
+    except asyncio.TimeoutError as e:
+        raise OriginTimeout(f"no response data within {read_timeout}s") from e
+    finally:
+        # Cancelling the runner closes the target connection behind it.
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    if not complete:
+        raise OriginUnreachable("origin response ended before its final body frame")
+    return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Multi-value headers: a repeated name (e.g. Set-Cookie) maps to a list.
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_from_origin(origin: dict, method: str, uri: str, query_string: str, headers: dict, body: bytes,
+                             viewer_is_https: bool, client_ip: str, viewer_xff: str, dist_arn: str) -> tuple:
+    """(status, reason, headers, body) from an S3 or custom origin; raises OriginTimeout / OriginUnreachable."""
+    if origin.get("s3_bucket"):
+        status, header_pairs, data = await run_offloop(_serve_s3_origin, origin, method, uri, headers, dist_arn)
+        pairs = header_pairs.items() if isinstance(header_pairs, dict) else header_pairs
+        return status, http.client.responses.get(status, ""), _with_content_length(_multidict_from_pairs(pairs), data), data
+    lb = _registered_alb(origin)
+    if lb is not None:
+        status, reason, header_pairs, data = await _fetch_from_alb_origin(
+            lb, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
+            viewer_is_https, client_ip, viewer_xff,
+        )
+        return status, reason, _with_content_length(_multidict_from_pairs(header_pairs), data), data
+    url_host = _registered_function_url(origin)
+    if url_host is not None:
+        status, reason, header_pairs, data = await _fetch_from_function_url_origin(
+            url_host, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
+            viewer_is_https, client_ip, viewer_xff,
+        )
+        return status, reason, _with_content_length(_multidict_from_pairs(header_pairs), data), data
+    # The origin may be MiniStack's own gateway, so the call must be reentrant.
+    status, reason, header_pairs, data = await run_reentrant(
+        _forward_to_origin, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
+        viewer_is_https, client_ip, viewer_xff,
+    )
+    return status, reason, _multidict_from_pairs(header_pairs), data
+
+
+def _with_content_length(headers: dict, data: bytes) -> dict:
+    """An in-process origin's buffered body, framed with the Content-Length its wire response carries."""
+    if "content-length" not in headers and "transfer-encoding" not in headers:
+        headers["content-length"] = str(len(data or b""))
+    return headers
+
+
+def _multidict_from_pairs(pairs) -> dict:
+    out: dict = {}
+    for name, value in pairs:
+        key = name.lower()
+        if key in out:
+            existing = out[key]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                out[key] = [existing, value]
+        else:
+            out[key] = value
+    return out
+
+
+# Content-Type values CloudFront compresses (Developer Guide, "File types that CloudFront compresses").
+_COMPRESSIBLE_CONTENT_TYPES = frozenset((
+    "application/dash+xml", "application/eot", "application/font", "application/font-sfnt",
+    "application/javascript", "application/json", "application/opentype", "application/otf", "application/pdf",
+    "application/pkcs7-mime", "application/protobuf", "application/rss+xml", "application/truetype",
+    "application/ttf", "application/vnd.apple.mpegurl", "application/vnd.mapbox-vector-tile",
+    "application/vnd.ms-fontobject", "application/wasm", "application/xhtml+xml", "application/xml",
+    "application/x-font-opentype", "application/x-font-truetype", "application/x-font-ttf",
+    "application/x-httpd-cgi", "application/x-javascript", "application/x-mpegurl", "application/x-opentype",
+    "application/x-otf", "application/x-perl", "application/x-ttf", "font/eot", "font/opentype", "font/otf",
+    "font/ttf", "image/svg+xml", "text/css", "text/csv", "text/html", "text/javascript", "text/js", "text/plain",
+    "text/richtext", "text/tab-separated-values", "text/xml", "text/x-component", "text/x-java-source",
+    "text/x-script", "vnd.apple.mpegurl",
+))
+
+
+def _accept_encoding_formats(behavior: dict) -> tuple:
+    """The encodings whose Accept-Encoding CloudFront normalizes: the cache policy's, or Gzip for legacy compression."""
+    if behavior.get("cache_policy_id"):
+        params = cache_policy_params(behavior["cache_policy_id"]) or {}
+        return tuple(name for name, key in (("br", "EnableAcceptEncodingBrotli"), ("gzip", "EnableAcceptEncodingGzip"))
+                     if params.get(key))
+    return ("gzip",) if behavior.get("compress") else ()
+
+
+def _accepted_encodings(accept_encoding: str, formats: tuple) -> list:
+    """The viewer's encodings among ``formats``, as CloudFront normalizes them: br before gzip."""
+    tokens = set()
+    for part in (accept_encoding or "").split(","):
+        name, _, params = part.partition(";")
+        q = next((p.split("=", 1)[1].strip() for p in params.split(";") if p.strip().lower().startswith("q=")), "1")
+        try:
+            accepted = float(q) > 0
+        except ValueError:
+            accepted = True
+        if accepted:
+            tokens.add(name.strip().lower())
+    return [name for name in ("br", "gzip") if name in formats and name in tokens]
+
+
+def _viewer_compression(formats: tuple, accepted: list):
+    """Brotli when the viewer takes both (Developer Guide, "How CloudFront compression works")."""
+    if "br" in formats and "br" in accepted and brotli is not None:
+        return "br"
+    if "gzip" in formats and "gzip" in accepted:
+        return "gzip"
+    return None
+
+
+def _compress_response(status: int, headers: dict, body: bytes, encoding: str) -> tuple:
+    """Compress an origin response when CloudFront's conditions for compression hold."""
+    if status not in (200, 403, 404) or not body or "content-encoding" in headers:
+        return headers, body
+    try:
+        length = int(str(headers.get("content-length", "")).strip())
+    except ValueError:
+        return headers, body
+    if not 1000 <= length <= 10_000_000:
+        return headers, body
+    if str(headers.get("content-type", "")).split(";", 1)[0].strip().lower() not in _COMPRESSIBLE_CONTENT_TYPES:
+        return headers, body
+    compressed = brotli.compress(body) if encoding == "br" else gzip.compress(body)
+    headers = dict(headers)
+    headers["content-encoding"] = encoding
+    # Observed on AWS: a compressed response carries no Content-Length.
+    headers.pop("content-length", None)
+    etag = headers.get("etag")
+    if isinstance(etag, str):
+        if etag.startswith('"') and etag.endswith('"') and len(etag) > 1:
+            headers["etag"] = "W/" + etag
+        elif not etag.startswith("W/"):
+            headers.pop("etag")
+    return headers, compressed
+
+
+def _strip_hop_by_hop_response_headers(headers: dict) -> dict:
+    """Connection management is this module's concern, not the origin's."""
+    return {k: v for k, v in headers.items() if k not in _HOP_BY_HOP_RESPONSE_HEADERS
+            and not k.startswith("proxy-")}
+
+
+# ---------------------------------------------------------------------------
+# Behavior-level settings: ViewerProtocolPolicy, AllowedMethods, DefaultRootObject
+# ---------------------------------------------------------------------------
+
+
+def _check_viewer_protocol_policy(behavior: dict, method: str, viewer_is_https: bool, request_uri: str,
+                                   query_string: str, headers: dict):
+    """A redirect/forbid response, or None to continue."""
+    policy = behavior.get("viewer_protocol_policy", "allow-all")
+    if viewer_is_https or policy == "allow-all":
+        return None
+    if policy == "redirect-to-https":
+        host = headers.get("host", "")
+        location = f"https://{host}{request_uri}" + (f"?{query_string}" if query_string else "")
+        redirect_status = 301 if method in ("GET", "HEAD") else 307
+        status, resp_headers, body = _cf_error_response(redirect_status, "The document has moved.", _ERROR_X_CACHE)
+        resp_headers["Location"] = location
+        return status, resp_headers, body
+    if policy == "https-only":
+        return _cf_error_response(403, "Viewers must use HTTPS to request this object.", _ERROR_X_CACHE)
+    return None
+
+
+def _check_allowed_methods(behavior: dict, method: str):
+    allowed = behavior.get("allowed_methods")
+    if allowed is not None and method not in allowed:
+        # CloudFront's 403 page text for this case (see _CF_ERROR_TEMPLATE).
+        return _cf_error_response(
+            403,
+            "This distribution is not configured to allow the HTTP request method that was used for this "
+            "request. The distribution supports only cachable requests.",
+            _ERROR_X_CACHE,
+        )
+    return None
+
+
+def _apply_default_root_object(default_root_object: str, request_uri: str) -> str:
+    """CloudFront Developer Guide, "Default root object": the configured
+    object is requested from the origin when a viewer requests the
+    distribution's root URL."""
+    if default_root_object and request_uri == "/":
+        return "/" + default_root_object
+    return request_uri
+
+
+def _check_stacked_distribution(headers: dict):
+    """403 for a request that already passed through this hop (Developer Guide, stacked distributions)."""
+    if "(cloudfront)" in headers.get("via", "").lower():
+        return _cf_error_response(
+            403, "This distribution is configured to serve another CloudFront distribution as its origin.",
+            _ERROR_X_CACHE,
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+async def handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
+                          headers: dict, body: bytes, query_params: dict, client_ip: str = "127.0.0.1",
+                          http_version: str = "1.1") -> tuple:
+    """Serve one viewer request against ``dist`` (a cloudfront.py distribution record) in its owner's account."""
+    owner = next((account for (account, _), d in _distributions.to_dict().items() if d is dist), get_account_id())
+    with request_scope(owner, get_region()):
+        return await _handle_viewer_request(dist, method, path, raw_uri, raw_query_string, headers, body,
+                                            query_params, client_ip, http_version)
+
+
+# A "%" in the request path that two hex digits do not follow.
+_BARE_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
+                                 headers: dict, body: bytes, query_params: dict, client_ip: str,
+                                 http_version: str = "1.1") -> tuple:
+    if _BARE_PERCENT_RE.search(raw_uri):
+        # A real distribution answers GET /% or /api/% itself, before any function.
+        return _cf_error_response(400, "Bad request.", _ERROR_X_CACHE)
+    stacked_response = _check_stacked_distribution(headers)
+    if stacked_response is not None:
+        return stacked_response
+
+    dist_id = dist["Id"]
+    dist_domain = dist["DomainName"]
+    request_id = new_uuid()
+    viewer_is_https = headers.get("x-forwarded-proto", "http") == "https"
+
+    parsed = parse_distribution_dataplane_config(dist)
+    behavior = _match_behavior(parsed, path)
+    if behavior is None:
+        return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
+
+    protocol_response = _check_viewer_protocol_policy(
+        behavior, method, viewer_is_https, raw_uri, raw_query_string, headers,
+    )
+    if protocol_response is not None:
+        return protocol_response
+    methods_response = _check_allowed_methods(behavior, method)
+    if methods_response is not None:
+        return methods_response
+
+    request_headers = dict(headers)
+    if http_version == "1.0":
+        # Developer Guide, "Serve compressed files": an HTTP 1.0 request loses its Accept-Encoding.
+        request_headers.pop("accept-encoding", None)
+    request_uri = _apply_default_root_object(parsed.get("default_root_object", ""), raw_uri)
+    request_query = dict(query_params or {})
+    literal_query_string = None  # set when a function rearranges querystring into a literal string
+    function_touched_querystring = False  # set when a function returns a changed querystring object
+
+    request_function_arn = behavior["functions"].get("viewer-request")
+    if request_function_arn:
+        event = _build_function_event(
+            "viewer-request", dist_id, dist_domain, request_id,
+            method, request_uri, request_query, request_headers, client_ip,
+        )
+        try:
+            result = await _run_function(request_function_arn, event)
+        except CloudFrontFunctionError:
+            logger.exception("viewer-request function error (distribution=%s)", dist_id)
+            return _cf_error_response(503, "The Lambda function failed to execute.", _ERROR_X_CACHE)
+
+        if isinstance(result, dict) and "statusCode" in result:
+            # A function-generated response goes straight to the viewer, skipping the origin.
+            resp_headers = _merge_function_headers(None, result.get("headers"))
+            resp_headers = _add_cloudfront_headers(resp_headers, "FunctionGeneratedResponse from cloudfront")
+            set_cookie_values = _set_cookie_values_from_event(result.get("cookies"))
+            if set_cookie_values:
+                resp_headers["set-cookie"] = (
+                    set_cookie_values if len(set_cookie_values) > 1 else set_cookie_values[0]
+                )
+            # statusDescription is dropped: ASGI carries no reason phrase.
+            resp_body = _body_from_response_event(result, b"")
+            return result["statusCode"], _render_headers(resp_headers, title_case=True), resp_body
+
+        # Request headers stay lowercase internally; responses are Title-Cased once, on return.
+        req = result if isinstance(result, dict) else event["request"]
+        request_uri = req.get("uri", request_uri)
+        request_headers = _merge_function_headers(event["request"]["headers"], req.get("headers"))
+        cookie_pairs = [f"{n}={(f.get('value') if isinstance(f, dict) else f)}"
+                        for n, f in (req.get("cookies") or {}).items()]
+        if cookie_pairs:
+            request_headers["cookie"] = "; ".join(cookie_pairs)
+        qs_field = req.get("querystring")
+        if isinstance(qs_field, str):
+            # A function rewrote the querystring as a literal string (functions-event-structure).
+            literal_query_string = qs_field
+            request_query = {}
+        elif qs_field is not None and qs_field != event["request"]["querystring"]:
+            function_touched_querystring = True
+            request_query = {}
+            for name, field in qs_field.items():
+                if not isinstance(field, dict):
+                    continue
+                values = [field.get("value", "")]
+                values += [v.get("value", "") for v in field.get("multiValue", [])[1:]]
+                request_query[name] = values
+
+    origin = parsed["origins"].get(behavior["target_origin_id"])
+    if origin is None:
+        return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
+
+    header_allowed, cookie_allowed, qs_allowed = _forwarding_predicates(behavior)
+    request_cookies = _event_cookies_from_header(request_headers.get("cookie", ""))
+    forward_host = header_allowed("host")
+
+    fwd_headers = {
+        name: value for name, value in request_headers.items()
+        if name not in _HOP_BY_HOP_REQUEST_HEADERS
+        and (header_allowed(name) or name in _ALWAYS_FORWARD_REQUEST_HEADERS)
+    }
+    if header_allowed("user-agent") and "user-agent" in request_headers:
+        fwd_headers["user-agent"] = request_headers["user-agent"]
+    else:
+        # User-Agent is "Amazon CloudFront" unless forwarded (Developer Guide, "User-Agent header").
+        fwd_headers["user-agent"] = "Amazon CloudFront"
+    if forward_host:
+        fwd_headers["host"] = request_headers.get("host", "")
+    encoding_formats = _accept_encoding_formats(behavior)
+    compression_formats = encoding_formats if behavior.get("compress") else ()
+    accepted_encodings = _accepted_encodings(request_headers.get("accept-encoding", ""), encoding_formats)
+    if encoding_formats:
+        # Developer Guide, "Compression support": a normalized Accept-Encoding, identity when nothing matches.
+        fwd_headers.pop("accept-encoding", None)
+        if "accept-encoding" in request_headers:
+            fwd_headers["accept-encoding"] = ",".join(accepted_encodings) or "identity"
+    cookie_pairs = [f"{name}={field['value']}" for name, field in request_cookies.items() if cookie_allowed(name)]
+    if cookie_pairs:
+        fwd_headers["cookie"] = "; ".join(cookie_pairs)
+    if literal_query_string is not None:
+        forward_qs = literal_query_string
+    elif not function_touched_querystring and all(qs_allowed(name) for name in request_query):
+        # Unrewritten and fully forwarded: keep the viewer's bytes.
+        forward_qs = raw_query_string
+    else:
+        forward_qs = urlencode(
+            [(name, v) for name, values in request_query.items() if qs_allowed(name) for v in values],
+            quote_via=quote,
+        )
+
+    try:
+        status, reason, origin_headers, origin_body = await _fetch_from_origin(
+            origin, method, request_uri, forward_qs, fwd_headers, body, viewer_is_https,
+            client_ip, request_headers.get("x-forwarded-for", ""), dist.get("ARN", ""),
+        )
+        origin_status = status
+        error_response = parsed["custom_error_responses"].get(status)
+        if error_response:
+            # The page is requested through the cache behavior its path matches (Developer Guide,
+            # "Store objects and custom error pages in different locations").
+            origin = parsed["origins"].get(_match_behavior(parsed, error_response["page"])["target_origin_id"])
+            if origin is None:
+                return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
+            status, reason, origin_headers, origin_body = await _fetch_from_origin(
+                origin, "GET", error_response["page"], "", {"user-agent": "Amazon CloudFront"}, b"",
+                viewer_is_https, client_ip, "", dist.get("ARN", ""),
+            )
+            # An unavailable page is answered with the status its origin returned (Developer Guide,
+            # "Generate custom error responses").
+            if status < 400:
+                status = error_response["response_code"]
+    except OriginTimeout:
+        logger.warning("Origin timed out for distribution=%s origin=%s", dist_id, origin["domain_name"])
+        return _cf_error_response(504, "The request could not be satisfied.", _ERROR_X_CACHE)
+    except OriginUnreachable:
+        logger.warning("Origin unreachable for distribution=%s origin=%s", dist_id, origin["domain_name"])
+        return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
+
+    origin_headers = _strip_hop_by_hop_response_headers(origin_headers)
+    encoding = _viewer_compression(compression_formats, accepted_encodings)
+    if encoding:
+        origin_headers, origin_body = _compress_response(status, origin_headers, origin_body, encoding)
+    policy_cfg = response_headers_policy_config(behavior.get("response_headers_policy_id"))
+    response_headers = _apply_response_headers_policy(
+        origin_headers, policy_cfg, request_headers.get("origin", ""), method,
+    )
+    response_body = origin_body
+
+    response_function_arn = behavior["functions"].get("viewer-response")
+    # No viewer-response function runs when the origin answers 400 or above.
+    if response_function_arn and origin_status < 400:
+        event = _build_function_event(
+            "viewer-response", dist_id, dist_domain, request_id,
+            method, request_uri, request_query, headers, client_ip,
+        )
+        event["response"] = _response_event_fields(status, reason, response_headers)
+        try:
+            result = await _run_function(response_function_arn, event)
+        except CloudFrontFunctionError:
+            logger.exception("viewer-response function error (distribution=%s)", dist_id)
+            return _cf_error_response(503, "The Lambda function failed to execute.", _ERROR_X_CACHE)
+        response = result if isinstance(result, dict) else event["response"]
+        status = response.get("statusCode", status)
+        # Replace, not merge: a header the function deleted stays gone.
+        response_headers = _merge_function_headers(event["response"]["headers"], response.get("headers"))
+        set_cookie_values = _set_cookie_values_from_event(response.get("cookies"))
+        if set_cookie_values:
+            response_headers["set-cookie"] = set_cookie_values if len(set_cookie_values) > 1 else set_cookie_values[0]
+        response_body = _body_from_response_event(response, origin_body)
+
+    # An origin response without Server gets CloudFront's only when a viewer-response function ran (observed on AWS).
+    ran_response_function = bool(response_function_arn) and origin_status < 400
+    final_headers = _add_cloudfront_headers(response_headers, "Miss from cloudfront", edge_server=ran_response_function)
+    return status, _render_headers(final_headers, title_case=True), response_body

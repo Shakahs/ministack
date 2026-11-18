@@ -241,6 +241,16 @@ AUTH=false pytest tests/ -m auth_contract -v
 
 ---
 
+## Pull Request Rules
+
+- **Brand-new GitHub accounts can only open issues**, not PRs.
+- **At most 5 open PRs per contributor.** If the work was agreed beforehand in an issue, we may lift the limit temporarily.
+- **Real AWS evidence.** Every behavior change should be backed by a response captured from a real AWS account. PRs based on documentation, botocore model reading, LocalStack or other third-party recordings, or inference that turn out to differ from AWS will be closed.
+- **PRs that are not in line with AWS are closed**, and we implement the behavior ourselves.
+- **No AWS account?** Open an issue describing the behavior and your workflow instead of a PR, and we'll take it from there.
+
+---
+
 ## Pull Request Checklist
 
 - [ ] New service file in `ministack/services/`
@@ -257,13 +267,7 @@ AUTH=false pytest tests/ -m auth_contract -v
 
 ## What We're Looking For
 
-High-value contributions right now:
-
-- **CloudFront** — distribution CRUD, invalidations, origin configuration
-- **CodeBuild / CodePipeline** — CI/CD pipeline stubs
-- **AppSync** — GraphQL API CRUD
-- **SQS FIFO** — message group / deduplication support
-- **More Cognito flows** — hosted UI, federated identity providers, custom auth triggers
+ONLY REAL AWS USERS WHO BUMP INTO REAL LIFE ISSUES.
 
 ---
 

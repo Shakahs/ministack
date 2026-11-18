@@ -99,6 +99,64 @@ def test_localstack_unknown_paths_return_json_404():
             )
 
 
+def test_responses_do_not_advertise_the_emulator_server():
+    """No AWS endpoint answers with Hypercorn's Server value."""
+    import urllib.request
+
+    resp = urllib.request.urlopen(f"{ENDPOINT}/_ministack/health")
+    assert not (resp.headers.get("Server") or "").startswith("hypercorn")
+
+
+def test_http_and_websocket_responses_carry_one_date_header():
+    """Regression guard: with Hypercorn's own Date off, an http response and a WebSocket handshake
+    response each still carry exactly one."""
+    import asyncio
+    import urllib.request
+    from urllib.parse import urlparse
+
+    websockets = pytest.importorskip("websockets")
+    parsed = urlparse(ENDPOINT)
+
+    async def handshake():
+        url = f"ws://prefix-ats.iot.us-east-1.{parsed.hostname}:{parsed.port}/mqtt"
+        async with websockets.connect(url, subprotocols=["mqtt"]) as ws:
+            return ws.response.headers.get_all("Date")
+
+    assert len(urllib.request.urlopen(f"{ENDPOINT}/_ministack/health").headers.get_all("Date")) == 1
+    assert len(asyncio.run(handshake())) == 1
+
+
+def test_a_malformed_request_is_answered_with_one_date():
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(ENDPOINT)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\n")
+        head = sock.recv(65536).split(b"\r\n\r\n")[0].lower().split(b"\r\n")
+    assert head[0].startswith(b"http/1.1 400")
+    assert sum(line.startswith(b"date:") for line in head) == 1
+
+
+def test_a_refused_websocket_handshake_carries_one_date():
+    import asyncio
+    from urllib.parse import urlparse
+
+    websockets = pytest.importorskip("websockets")
+    parsed = urlparse(ENDPOINT)
+
+    async def refused():
+        url = f"ws://{parsed.hostname}:{parsed.port}/_aws/execute-api/nosuchapi/stage"
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+            async with websockets.connect(url):
+                pass
+        return exc.value.response
+
+    response = asyncio.run(refused())
+    assert response.status_code == 403
+    assert len(response.headers.get_all("Date")) == 1
+
+
 def test_localstack_health_still_returns_200():
     """/_localstack/health must still return 200 after the interceptor is wired in."""
     import urllib.request
@@ -549,6 +607,19 @@ def test_unit_h11_informational_has_reason_phrase():
         f"expected canonical reason phrase, got: {out!r}"
 
 
+def test_unit_h11_response_has_reason_phrase():
+    """A final response carries its standard reason phrase too: AWS endpoints answer 'HTTP/1.1 404 Not Found'."""
+    import h11
+
+    import ministack.app  # noqa: F401
+
+    conn = h11.Connection(our_role=h11.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    conn.next_event()
+    out = conn.send(h11.Response(status_code=404, headers=[]))
+    assert out.startswith(b"HTTP/1.1 404 Not Found\r\n"), f"expected canonical reason phrase, got: {out!r}"
+
+
 def test_wire_expect_100_continue_returns_canonical_status_line():
     """End-to-end: a raw PUT with Expect: 100-continue against ministack must
     receive a 100 Continue with the reason phrase intact (issue #389)."""
@@ -817,6 +888,34 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("service,labels", [
+    ("opensearch", {"com.ministack.service": "opensearch"}),
+    ("opensearchserverless", {"com.ministack.service": "opensearchserverless"}),
+    ("dsql", {}),
+    ("ecs", {}),
+    ("eks", {}),
+])
+def test_service_reset_spares_other_instances_containers(fake_docker, monkeypatch, service, labels):
+    """A reset clears this instance's containers; another MiniStack on the daemon keeps its own."""
+    import importlib
+
+    from ministack.core import container_reaper
+    from ministack.services import rds
+
+    mod = importlib.import_module(f"ministack.services.{service}")
+    for name, port in (("theirs", "4777"), ("ours", "4566")):
+        monkeypatch.setenv("GATEWAY_PORT", port)
+        fake_docker.containers.run(name=name, labels={**container_reaper.own_labels(service), **labels})
+    monkeypatch.setattr(rds if service == "dsql" else mod, "_get_docker", lambda: fake_docker)
+    if service == "dsql":
+        monkeypatch.setattr(mod, "_docker_available", lambda: True)
+
+    mod.reset()
+
+    assert fake_docker.live() == ["theirs"], f"{service} reset removed another instance's container"
+
+
+@pytest.mark.serial
 def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monkeypatch):
     """A full listing inspects every container, so one failed inspect used to cost the whole sweep."""
     from ministack.core import container_reaper
@@ -836,6 +935,93 @@ def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monk
     monkeypatch.setattr(container_reaper, "_boot_nonce", "run-2")
     assert container_reaper.reap_all(fake_docker, include_unlabelled=True) == 3
     assert fake_docker.live() == []
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("label,module,mark_live", [
+    ("glue", "glue", lambda m, cid: m._live_job_containers.add(cid)),
+    ("codebuild", "codebuild", lambda m, cid: m._live_build_containers.add(cid)),
+    ("dsql", "dsql", lambda m, cid: m._backend_containers.__setitem__("cl", cid)),
+    ("agentcore", "bedrock_agentcore", lambda m, cid: m._containers.__setitem__(("a", "r", "rt", "1"),
+                                                                                type("C", (), {"id": cid})())),
+])
+def test_reaper_reclaims_each_services_abandoned_containers(fake_docker, monkeypatch, label, module, mark_live):
+    """Glue, CodeBuild, DSQL and AgentCore report what they still own, so the reaper reclaims the rest."""
+    import importlib
+
+    from ministack.core import container_reaper
+
+    svc = importlib.import_module(f"ministack.services.{module}")
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    for store in ("_live_job_containers", "_live_build_containers", "_backend_containers", "_containers"):
+        if hasattr(svc, store):
+            monkeypatch.setattr(svc, store, type(getattr(svc, store))())
+    kept, leaked = (fake_docker.containers.run(name=n, labels=container_reaper.own_labels(label))
+                    for n in ("kept", "leaked"))
+    for c in (kept, leaked):
+        c.status = "exited"
+        c.attrs["State"] = {"FinishedAt": ""}
+    mark_live(svc, kept.id)
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert "kept" in fake_docker.live() and "leaked" not in fake_docker.live()
+
+
+@pytest.mark.serial
+def test_spawned_containers_carry_the_testcontainers_session_labels(monkeypatch):
+    """In a Testcontainers-run MiniStack, spawned containers carry its session labels, so Ryuk removes them when the
+    test process dies; never the reuse hash (Testcontainers would take a spawned container for MiniStack)."""
+    import docker
+
+    from ministack.core import container_reaper
+
+    own = {"org.testcontainers": "true", "org.testcontainers.sessionId": "s-java",
+           "org.testcontainers.resource-reaper-session": "s-dotnet", "org.testcontainers.golang": "true",
+           "org.testcontainers.golang.sessionId": "s-go", "org.testcontainers.hash": "reuse",
+           "org.testcontainers.lang": "java", "ministack": "spoofed", "other": "x"}
+    client = type("C", (), {"containers": type("Cs", (), {
+        "get": staticmethod(lambda name: type("Me", (), {"labels": own})() if name == "ms-host" else None)})()})()
+    monkeypatch.setattr(container_reaper, "_testcontainers_labels", None)
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: path == "/.dockerenv")
+    monkeypatch.setenv("HOSTNAME", "ms-host")
+    monkeypatch.setattr(docker, "from_env", lambda **_kw: client)
+    try:
+        labels = container_reaper.own_labels("lambda")
+        assert {k: v for k, v in labels.items() if k.startswith("org.testcontainers")} == {
+            "org.testcontainers": "true", "org.testcontainers.sessionId": "s-java",
+            "org.testcontainers.resource-reaper-session": "s-dotnet", "org.testcontainers.golang": "true",
+            "org.testcontainers.golang.sessionId": "s-go"}
+        assert labels["ministack"] == "lambda" and "other" not in labels
+    finally:
+        container_reaper._testcontainers_labels = None
+
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: False)
+    try:
+        assert not any(k.startswith("org.testcontainers") for k in container_reaper.own_labels("rds"))
+    finally:
+        container_reaper._testcontainers_labels = None
+
+
+@pytest.mark.serial
+def test_reaper_reclaims_stopped_lambda_containers_the_pool_no_longer_holds(fake_docker, monkeypatch):
+    """A Lambda container whose removal failed (a slow daemon) is reclaimed once stopped; pooled ones are kept."""
+    from ministack.core import container_reaper
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    pooled, leaked = (fake_docker.containers.run(name=n, labels=container_reaper.own_labels("lambda"))
+                      for n in ("pooled", "leaked"))
+    for c in (pooled, leaked):
+        c.status = "exited"
+        c.attrs["State"] = {"FinishedAt": ""}
+    monkeypatch.setattr(lambda_svc, "_warm_pool", {"fn": [{"container": pooled}]})
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert "pooled" in fake_docker.live() and "leaked" not in fake_docker.live()
 
 
 @pytest.mark.serial
@@ -1570,3 +1756,43 @@ def test_auth_contracts_are_excluded_from_existing_shards(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     counts = json.loads((tmp_path / ".pytest_collect_plan.json").read_text())
     assert counts == {"test_lanes.py": {"parallel": 1, "serial": 1, "data_plane": 1}}
+
+
+@pytest.mark.parametrize("bind_host, loopback", [
+    (None, False), ("0.0.0.0", False), ("127.0.0.1", True), ("localhost", True), ("::1", True), ("10.0.0.5", False),
+])
+def test_published_ports_follow_a_host_run_gateway(monkeypatch, bind_host, loopback):
+    """A host-run MiniStack publishes the containers it starts on loopback only when BIND_HOST is loopback."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(container_reaper, "_publish_on_loopback", None)
+    if bind_host is None:
+        monkeypatch.delenv("BIND_HOST", raising=False)
+    else:
+        monkeypatch.setenv("BIND_HOST", bind_host)
+    assert container_reaper.published_port(15432) == (("127.0.0.1", 15432) if loopback else 15432)
+
+
+@pytest.mark.parametrize("bindings, loopback", [
+    ([{"HostIp": "127.0.0.1", "HostPort": "4566"}], True),
+    ([{"HostIp": "127.0.0.1", "HostPort": "4566"}, {"HostIp": "::1", "HostPort": "4566"}], True),
+    ([{"HostIp": "0.0.0.0", "HostPort": "4566"}, {"HostIp": "::", "HostPort": "4566"}], False),
+    ([], False),
+    (None, False),
+])
+def test_published_ports_follow_a_containerised_gateway(monkeypatch, bindings, loopback):
+    """In Docker, MiniStack publishes the containers it starts the way its own 4566 is published."""
+    import sys
+    import types
+
+    from ministack.core import container_reaper
+
+    me = types.SimpleNamespace(attrs={"NetworkSettings": {"Ports": {"4566/tcp": bindings}}})
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda _name: me))
+    monkeypatch.setitem(sys.modules, "docker", types.SimpleNamespace(from_env=lambda **_: client))
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda p: p == "/.dockerenv")
+    monkeypatch.setattr(container_reaper, "_publish_on_loopback", None)
+    monkeypatch.delenv("GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("EDGE_PORT", raising=False)
+    assert container_reaper.published_port(None) == (("127.0.0.1", None) if loopback else None)

@@ -956,8 +956,57 @@ def test_iot_thing_group_membership(iot_client):
     iot_client.delete_thing_group(thingGroupName=gname)
 
 
+def test_iot_thing_group_membership_by_arn(iot_client):
+    """Either side may be named by ARN; a name and an ARN must agree, and the ARN's region is not checked."""
+    gname, other, tname = _unique("group"), _unique("group"), _unique("thing")
+    group = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    other_group = iot_client.create_thing_group(thingGroupName=other)["thingGroupArn"]
+    thing = iot_client.create_thing(thingName=tname)["thingArn"]
+    _, _, _, region, account, _ = group.split(":", 5)
+    elsewhere = group.replace(f":{region}:", ":eu-west-3:" if region != "eu-west-3" else ":us-east-1:")
+    foreign = group.replace(f":{account}:", ":123456789012:" if account != "123456789012" else ":210987654321:")
+    try:
+        for kwargs in ({"thingGroupArn": group, "thingArn": thing},
+                       {"thingGroupArn": elsewhere, "thingName": tname},
+                       {"thingGroupName": gname, "thingGroupArn": group, "thingName": tname, "thingArn": thing}):
+            iot_client.add_thing_to_thing_group(**kwargs)
+            assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+            iot_client.remove_thing_from_thing_group(**kwargs)
+            assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        refused = (
+            ({"thingGroupName": gname, "thingGroupArn": other_group, "thingName": tname},
+             "ThingGroupName from thingGroupArn does not match specified thingGroupName in request"),
+            ({"thingGroupName": gname, "thingName": _unique("thing"), "thingArn": thing},
+             "ThingName in thingArn does not match specified thingName in request"),
+            ({"thingName": tname},
+             "Both thingGroupArn and thingGroupName are empty. Need to specify at least one of them"),
+            ({"thingGroupName": gname}, "Both thingArn and thingName are empty. Need to specify at least one of them"),
+            ({"thingGroupArn": thing, "thingName": tname}, "Invalid ThingGroupArn"),
+            ({"thingGroupName": gname, "thingArn": group}, "Invalid ThingArn"),
+            ({"thingGroupArn": gname, "thingName": tname}, "Invalid arn in request"),
+            ({"thingGroupArn": foreign, "thingName": tname}, "ResourceArn doesn't belong in requester's account"),
+        )
+        for kwargs, message in refused:
+            for call in (iot_client.add_thing_to_thing_group, iot_client.remove_thing_from_thing_group):
+                with pytest.raises(ClientError) as ei:
+                    call(**kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 400
+                assert (error["Error"]["Code"], error["Error"]["Message"]) == ("InvalidRequestException", message)
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        unknown = f"{group.rsplit('/', 1)[0]}/{_unique('group')}"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.add_thing_to_thing_group(thingGroupArn=unknown, thingName=tname)
+    finally:
+        iot_client.delete_thing_group(thingGroupName=gname)
+        iot_client.delete_thing_group(thingGroupName=other)
+        iot_client.delete_thing(thingName=tname)
+
+
 def test_iot_remove_thing_from_an_unknown_thing_group_succeeds(iot_client):
-    """An unknown group name answers 200; an unknown thing, or no group name at all, is refused."""
+    """An unknown group, by name or by ARN, answers 200; an unknown thing is refused."""
     tname, gname = _unique("thing"), _unique("group")
     iot_client.create_thing(thingName=tname)
     resp = iot_client.remove_thing_from_thing_group(thingGroupName=_unique("group"), thingName=tname)
@@ -965,13 +1014,97 @@ def test_iot_remove_thing_from_an_unknown_thing_group_succeeds(iot_client):
     with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
         iot_client.remove_thing_from_thing_group(thingGroupName=_unique("group"), thingName=_unique("thing"))
     group_arn = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    unknown_arn = f"{group_arn.rsplit('/', 1)[0]}/{_unique('group')}"
+    resp = iot_client.remove_thing_from_thing_group(thingGroupArn=unknown_arn, thingName=tname)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
     iot_client.add_thing_to_thing_group(thingGroupName=gname, thingName=tname)
-    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
-        iot_client.remove_thing_from_thing_group(thingGroupArn=group_arn, thingName=tname)
-    assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
-    iot_client.remove_thing_from_thing_group(thingGroupName=gname, thingName=tname)
+    iot_client.remove_thing_from_thing_group(thingGroupArn=group_arn, thingName=tname)
+    assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
     iot_client.delete_thing_group(thingGroupName=gname)
     iot_client.delete_thing(thingName=tname)
+
+
+@pytest.mark.auth_contract
+def test_iot_thing_group_membership_authorizes_on_the_group_and_the_thing(auth_enabled, iam_user, iot_client):
+    gname, tname = _unique("group"), _unique("thing")
+    group = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    thing = iot_client.create_thing(thingName=tname)["thingArn"]
+    head = group.rsplit(":", 1)[0]
+    literals = [f"{head}:thinggroup/addThingToThingGroup", f"{head}:thinggroup/removeThingFromThingGroup"]
+
+    def client(*resources):
+        return iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["iot:AddThingToThingGroup", "iot:RemoveThingFromThingGroup"],
+            "Resource": list(resources),
+        }]}).client("iot")
+
+    try:
+        allowed = client(group, thing)
+        allowed.add_thing_to_thing_group(thingGroupName=gname, thingName=tname)
+        assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+        allowed.remove_thing_from_thing_group(thingGroupName=gname, thingName=tname)
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        # The group is checked first, then the thing; a denial names the resource that failed.
+        for resources, denied_on in (([thing], group), ([group], thing), (literals, group)):
+            user = client(*resources)
+            for action, call in (("AddThingToThingGroup", user.add_thing_to_thing_group),
+                                 ("RemoveThingFromThingGroup", user.remove_thing_from_thing_group)):
+                if auth_enabled:
+                    with pytest.raises(ClientError) as ei:
+                        call(thingGroupName=gname, thingName=tname)
+                    error = ei.value.response
+                    assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                    assert error["Error"]["Code"] == "AccessDeniedException"
+                    assert f" iot:{action} on resource: {denied_on} " in error["Error"]["Message"]
+                else:
+                    assert call(thingGroupName=gname, thingName=tname)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+    finally:
+        iot_client.delete_thing_group(thingGroupName=gname)
+        iot_client.delete_thing(thingName=tname)
+
+
+@pytest.mark.auth_contract
+def test_iot_thing_group_membership_by_arn_authorizes_the_resources_it_names(auth_enabled, iam_user, iot_client):
+    """A group ARN of another region is checked, and acted on, as the group of the request's region."""
+    gname, tname = _unique("group"), _unique("thing")
+    group = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    thing = iot_client.create_thing(thingName=tname)["thingArn"]
+    region = group.split(":")[3]
+    elsewhere = group.replace(f":{region}:", ":eu-west-3:" if region != "eu-west-3" else ":us-east-1:")
+
+    def client(*resources):
+        return iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["iot:AddThingToThingGroup", "iot:RemoveThingFromThingGroup"],
+            "Resource": list(resources),
+        }]}).client("iot")
+
+    try:
+        allowed = client(group, thing)
+        for body in ({"thingGroupArn": group, "thingArn": thing}, {"thingGroupArn": elsewhere, "thingArn": thing}):
+            allowed.add_thing_to_thing_group(**body)
+            assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+            allowed.remove_thing_from_thing_group(**body)
+            assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        # A grant on the other region's ARN does not cover the group the call acts on.
+        user = client(elsewhere, thing)
+        for action, call in (("AddThingToThingGroup", user.add_thing_to_thing_group),
+                             ("RemoveThingFromThingGroup", user.remove_thing_from_thing_group)):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(thingGroupArn=elsewhere, thingName=tname)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert f" iot:{action} on resource: {group} " in error["Error"]["Message"]
+            else:
+                assert call(thingGroupArn=elsewhere, thingName=tname)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+    finally:
+        iot_client.delete_thing_group(thingGroupName=gname)
+        iot_client.delete_thing(thingName=tname)
 
 
 def test_iot_list_thing_groups_for_thing(iot_client):
@@ -1181,6 +1314,105 @@ def test_iot_tagging_refuses_unknown_and_foreign_arns(iot_client):
         assert _iot_error(iot_client.tag_resource, resourceArn=target, tags=tags) == (400, message)
         assert _iot_error(iot_client.untag_resource, resourceArn=target, tagKeys=["k"]) == (400, message)
         assert _iot_error(iot_client.list_tags_for_resource, resourceArn=target) == (400, message)
+
+
+@pytest.mark.auth_contract
+def test_iot_tagging_authorizes_on_the_resource_arn(auth_enabled, iam_user, iot_client):
+    allowed, other = (iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+                      for _ in range(2))
+    iot_client.tag_resource(resourceArn=other, tags=[{"Key": "existing", "Value": "before"}])
+    thing_type = allowed.rsplit(":", 1)[0] + ":thingtype/" + _unique("type")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": ["iot:TagResource", "iot:UntagResource", "iot:ListTagsForResource"],
+        "Resource": allowed,
+    }]})
+    client = user.client("iot")
+    try:
+        client.tag_resource(resourceArn=allowed, tags=[{"Key": "k", "Value": "v"}])
+        assert client.list_tags_for_resource(resourceArn=allowed)["tags"] == [{"Key": "k", "Value": "v"}]
+        client.untag_resource(resourceArn=allowed, tagKeys=["k"])
+        assert client.list_tags_for_resource(resourceArn=allowed)["tags"] == []
+
+        for action, call, arn, kwargs in (
+            ("TagResource", client.tag_resource, other, {"tags": [{"Key": "k", "Value": "v"}]}),
+            ("UntagResource", client.untag_resource, other, {"tagKeys": ["existing"]}),
+            ("ListTagsForResource", client.list_tags_for_resource, other, {}),
+            ("ListTagsForResource", client.list_tags_for_resource, thing_type, {}),
+        ):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(resourceArn=arn, **kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert error["Error"]["Message"].startswith(
+                    f"User: {user.arn} is not authorized to perform: iot:{action} ")
+            else:
+                assert call(resourceArn=arn, **kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert _iot_tags(iot_client, other) == ({"existing": "before"} if auth_enabled else {"k": "v"})
+    finally:
+        for arn in (allowed, other):
+            iot_client.delete_thing_group(thingGroupName=arn.rsplit("/", 1)[1])
+
+
+@pytest.mark.auth_contract
+def test_iot_resource_tag_conditions_decide_on_the_named_resource(auth_enabled, iam_user, iot_client):
+    deletes = ["iot:DeleteThingGroup", "iot:DeletePolicy"]
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["iot:ListTagsForResource", "iot:DescribeThingGroup", "iot:GetPolicy"],
+         "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "dev"}}},
+        {"Effect": "Allow", "Action": deletes, "Resource": "*"},
+        {"Effect": "Deny", "Action": deletes, "Resource": "*",
+         "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}},
+    ]})
+    client = user.client("iot")
+    document = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]})
+    names = {env: _unique(f"rt-{env}") for env in ("dev", "prod", "untagged")}
+    groups, policies = {}, {}
+    for env, name in names.items():
+        tags = {} if env == "untagged" else {"tags": [{"Key": "env", "Value": env}]}
+        groups[env] = iot_client.create_thing_group(thingGroupName=name, **tags)["thingGroupArn"]
+        policies[env] = iot_client.create_policy(policyName=name, policyDocument=document, **tags)["policyArn"]
+    no_allow = "because no identity-based policy allows the {} action"
+    explicit_deny = "with an explicit deny in an identity-based policy"
+    try:
+        client.describe_thing_group(thingGroupName=names["dev"])
+        client.get_policy(policyName=names["dev"])
+        client.list_tags_for_resource(resourceArn=policies["dev"])
+
+        for call, action, resource, reason, kwargs in (
+            (client.describe_thing_group, "DescribeThingGroup", groups["prod"], no_allow,
+             {"thingGroupName": names["prod"]}),
+            (client.describe_thing_group, "DescribeThingGroup", groups["untagged"], no_allow,
+             {"thingGroupName": names["untagged"]}),
+            (client.get_policy, "GetPolicy", policies["prod"], no_allow, {"policyName": names["prod"]}),
+            (client.list_thing_groups, "ListThingGroups", "*", no_allow, {}),
+            (client.delete_thing_group, "DeleteThingGroup", groups["prod"], explicit_deny,
+             {"thingGroupName": names["prod"]}),
+            (client.delete_policy, "DeletePolicy", policies["prod"], explicit_deny, {"policyName": names["prod"]}),
+        ):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(**kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert error["Error"]["Message"] == (
+                    f"User: {user.arn} is not authorized to perform: iot:{action} on resource: {resource} "
+                    + reason.format(f"iot:{action}"))
+            else:
+                assert call(**kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        client.delete_thing_group(thingGroupName=names["untagged"])
+        client.delete_policy(policyName=names["untagged"])
+    finally:
+        for name in names.values():
+            for call, kwargs in ((iot_client.delete_thing_group, {"thingGroupName": name}),
+                                 (iot_client.delete_policy, {"policyName": name})):
+                try:
+                    call(**kwargs)
+                except ClientError:
+                    pass
 
 
 def test_iot_tag_limits_and_validation(iot_client):
@@ -2614,8 +2846,10 @@ async def _fleet_client(
     send, sent = _mock_send()
     session = _IoTWSSession(send, account, region, certificate_id)
     await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
-    filters = [f"{_FLEET_CREATE}/+"] + [
-        f"$aws/provisioning-templates/{t}/provision/json/+" for t in templates
+    filters = [
+        f"{topic}/{reply}"
+        for topic in [_FLEET_CREATE, *map(_fleet_provision_topic, templates)]
+        for reply in ("accepted", "rejected")
     ]
     await session.handle_packet(
         PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(f, 1) for f in filters])
@@ -3988,7 +4222,7 @@ def test_iot_topic_rule_lifecycle(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
     with pytest.raises(ClientError) as ei:
         iot_client.get_topic_rule(ruleName=name)
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
 
 
 def test_iot_topic_rule_duplicate_rejected(iot_client):
@@ -3999,6 +4233,62 @@ def test_iot_topic_rule_duplicate_rejected(iot_client):
         iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
     assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
     iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_topic_rule_name_refused_by_pattern_and_length():
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    long_name, long_dash = "r" * 129, "bad-" + "r" * 125
+    pattern = "Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    length = "Member must have length less than or equal to 128"
+    cases = (
+        ("bad-name", f"1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+                     f"constraint: {pattern}"),
+        (long_name, f"1 validation error detected: Value '{long_name}' at 'ruleName' failed to satisfy "
+                    f"constraint: {length}"),
+        (long_dash, f"2 validation errors detected: Value '{long_dash}' at 'ruleName' failed to satisfy "
+                    f"constraint: {pattern}; Value '{long_dash}' at 'ruleName' failed to satisfy "
+                    f"constraint: {length}"),
+    )
+    for name, message in cases:
+        calls = (
+            lambda: raw.create_topic_rule(
+                ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+            ),
+            lambda: raw.get_topic_rule(ruleName=name),
+            lambda: raw.disable_topic_rule(ruleName=name),
+        )
+        for call in calls:
+            with pytest.raises(ClientError) as ei:
+                call()
+            err = ei.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                400, "InvalidRequestException", message)
+    assert not [r for r in raw.list_topic_rules()["rules"] if r["ruleName"] in (long_name, long_dash)]
+
+
+def test_iot_topic_rule_name_with_trailing_newline_refused(iot_client):
+    name = _rule_name() + "\n"
+    message = (
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    )
+    calls = (
+        lambda: iot_client.create_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.get_topic_rule(ruleName=name),
+        lambda: iot_client.delete_topic_rule(ruleName=name),
+        lambda: iot_client.enable_topic_rule(ruleName=name),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException", message)
+    assert name not in [r["ruleName"] for r in iot_client.list_topic_rules()["rules"]]
 
 
 def test_iot_replace_topic_rule(iot_client):
@@ -4051,7 +4341,9 @@ def test_iot_enable_disable_topic_rule_refusals(iot_client):
     for call in (iot_client.enable_topic_rule, iot_client.disable_topic_rule):
         with pytest.raises(ClientError) as ei:
             call(ruleName=missing)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
         with pytest.raises(ClientError) as ei:
             call(ruleName="bad-name")
         assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
@@ -4279,7 +4571,7 @@ def test_iot_create_topic_rule_republish_inside_own_filter_rejected(
     )
     with pytest.raises(ClientError) as ei:
         iot_client.get_topic_rule(ruleName=name)
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
 
 
 @pytest.mark.parametrize(
@@ -4339,12 +4631,41 @@ def test_iot_replace_topic_rule_republish_inside_own_filter_rejected(iot_client,
     iot_client.delete_topic_rule(ruleName=name)
 
 
-def test_iot_replace_missing_topic_rule_404(iot_client):
-    with pytest.raises(ClientError) as ei:
-        iot_client.replace_topic_rule(
-            ruleName=_rule_name(), topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
-        )
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+def test_iot_missing_topic_rule_unauthorized(iot_client):
+    """Get, Replace and Delete of an unknown rule answer 401 as AWS does."""
+    missing = _rule_name()
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName=missing),
+        lambda: iot_client.replace_topic_rule(
+            ruleName=missing, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName=missing),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
+
+
+def test_iot_get_replace_delete_topic_rule_name_pattern_refused(iot_client):
+    """Get, Replace and Delete refuse a rule name outside the pattern with 400, as Enable does."""
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName="bad-name"),
+        lambda: iot_client.replace_topic_rule(
+            ruleName="bad-name", topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName="bad-name"),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException",
+            "1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
 
 
 def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
@@ -4434,7 +4755,7 @@ def test_iot_topic_rule_cfn_invalid_sql_fails_resource(cfn, iot_client):
         # Nothing was stored: the invalid rule never entered the rule store.
         with pytest.raises(ClientError) as ei:
             iot_client.get_topic_rule(ruleName=rule)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
     finally:
         try:
             cfn.delete_stack(StackName=stack)
@@ -4553,7 +4874,6 @@ import asyncio
 import struct
 
 from ministack.services.iot import (
-    _RETRANSMIT_INTERVAL_SECONDS,
     PKT_CONNACK,
     PKT_CONNECT,
     PKT_DISCONNECT,
@@ -4846,6 +5166,32 @@ def test_iot_broker_wildcard_region_does_not_widen_its_own_filters():
     reset()
 
 
+def test_iot_broker_trailing_hash_does_not_match_the_level_above():
+    """``a/c2/#`` gets ``a/c2/`` and ``a/c2/x`` but, as on AWS, not ``a/c2``; ``a/#`` and ``#`` get all three."""
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        received = {}
+        for topic_filter in ("a/c2", "a/c2/#", "+/c2/#", "a/#", "#"):
+            async def callback(topic, payload, qos, key=topic_filter):
+                received.setdefault(key, []).append(topic)
+
+            await broker_subscribe(account_id, _TEST_REGION, topic_filter, callback)
+        for topic in ("a/c2", "a/c2/", "a/c2/x"):
+            await broker_publish(account_id, _TEST_REGION, topic, b"x")
+        assert received == {
+            "a/c2": ["a/c2"],
+            "a/c2/#": ["a/c2/", "a/c2/x"],
+            "+/c2/#": ["a/c2/", "a/c2/x"],
+            "a/#": ["a/c2", "a/c2/", "a/c2/x"],
+            "#": ["a/c2", "a/c2/", "a/c2/x"],
+        }
+
+    asyncio.run(_run())
+    reset()
+
+
 def test_iot_broker_leading_wildcard_does_not_match_aws_events():
     """``#`` and ``+/...`` get ``$aws/things`` but not ``$aws/events``, live and queued."""
     reset()
@@ -4933,6 +5279,37 @@ def test_iot_topic_rule_leading_wildcard_does_not_match_aws_events(monkeypatch):
         ("r2", "$aws/events/presence/connected/dev"),
         ("r3", "$aws/things/dev/shadow/update/accepted"),
     ]
+
+
+def test_iot_topic_rule_trailing_hash_does_not_fire_on_the_level_above(monkeypatch):
+    """A rule ``FROM 'a/c2/#'`` fires on ``a/c2/`` and ``a/c2/x`` but, as on AWS, not on ``a/c2``."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(account_id, _TEST_REGION, "hash", {
+        "ruleName": "hash", "sql": "SELECT * FROM 'a/c2/#'", "ruleDisabled": False, "actions": [],
+    })
+    fired = []
+
+    async def _capture_rule_action(
+        dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
+    ):
+        fired.append(topic)
+
+    monkeypatch.setattr(iot_module, "_run_rule_actions", _capture_rule_action)
+
+    async def _run():
+        for topic in ("a/c2", "a/c2/", "a/c2/x"):
+            await broker_publish(account_id, _TEST_REGION, topic, b"{}")
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+    assert fired == ["a/c2/", "a/c2/x"]
 
 
 def test_iot_broker_persistent_sessions_are_region_isolated():
@@ -5719,6 +6096,98 @@ def test_offline_qos1_messages_queued_and_delivered_on_reconnect():
         assert len(ps.queued_messages) == 0
 
         await session2.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unacknowledged_qos1_message_is_resent_when_the_session_resumes(monkeypatch):
+    """A QoS 1 message without a PUBACK stays with the session and keeps its packet identifier."""
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(iot_module, "_RETRANSMIT_INTERVAL_SECONDS", 0.3)
+    reset()
+    connect = _build_connect_body(client_id="unacked", clean_session=False)
+
+    async def _run():
+        send1, sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("data/unacked", 1)]))
+        await publish("123456789012", "data/unacked", b"m1", qos=1)
+        assert _extract_publish_frames(sent1) == [("data/unacked", b"m1", 1, 1, False)]
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        await publish("123456789012", "data/unacked", b"m2", qos=1)
+        # The retransmit interval passes while the client is offline.
+        await asyncio.sleep(0.4)
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0)
+        assert _extract_publish_frames(sent2) == [
+            ("data/unacked", b"m1", 1, 1, False),
+            ("data/unacked", b"m2", 1, 2, False),
+        ]
+        for pid in (1, 2):
+            await session2.handle_packet(PKT_PUBACK, 0, struct.pack("!H", pid))
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent3) == (True, 0)
+        assert _extract_publish_frames(sent3) == []
+        await session3.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unacknowledged_qos1_message_waits_for_its_retransmit_interval_after_a_resume(monkeypatch):
+    """Resumed before the interval runs out, the message goes out when it does; a clean start drops it."""
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(iot_module, "_RETRANSMIT_INTERVAL_SECONDS", 0.3)
+    reset()
+    key = ("123456789012", _TEST_REGION, "unacked5")
+    connect = _build_mqtt5_connect_body("unacked5", clean_start=False, session_expiry=300)
+
+    async def _run():
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "data/unacked5", 0x01)
+        )
+        await publish("123456789012", "data/unacked5", b"m1", qos=1)
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0)
+        assert _extract_publish_frames(sent2) == []
+        await asyncio.sleep(0.5)
+        # The payload follows an empty property block.
+        assert _extract_publish_frames(sent2) == [("data/unacked5", b"\x00m1", 1, 1, False)]
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+        assert list(_persistent_sessions[key].in_flight) == [1]
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(
+            PKT_CONNECT, 0, _build_mqtt5_connect_body("unacked5", clean_start=True)
+        )
+        await asyncio.sleep(0.5)
+        assert _extract_publish_frames(sent3) == []
+        await session3.cleanup()
+        assert key not in _persistent_sessions
 
     asyncio.run(_run())
     reset()
@@ -6684,8 +7153,8 @@ def test_cleanup_clears_in_flight():
     reset()
 
 
-def test_retransmit_sends_dup_flag():
-    """Retransmission sends PUBLISH with DUP flag set."""
+def test_retransmit_resends_after_30_seconds_with_dup_clear():
+    """An unacknowledged QoS 1 message goes out again after 30 s with the same packet id and DUP 0."""
     reset()
 
     async def _run():
@@ -6706,35 +7175,18 @@ def test_retransmit_sends_dup_flag():
         assert len(publishes) == 1
         assert publishes[0][4] is False  # dup flag
 
-        # Manually trigger retransmission by manipulating sent_at
         pid = list(session._in_flight.keys())[0]
         msg = session._in_flight[pid]
-        # Set sent_at far in the past to trigger retransmit
-        msg.sent_at = 0
-
+        now = asyncio.get_event_loop().time()
         sent.clear()
+        msg.sent_at = now - 29
+        await session._retransmit_due()
+        assert _extract_publish_frames(sent) == []
 
-        # Run one iteration of retransmit logic manually
-        import asyncio as _asyncio
-        now = _asyncio.get_event_loop().time()
-        for p, m in list(session._in_flight.items()):
-            if now - m.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
-                m.retransmit_count += 1
-                m.sent_at = now
-                from ministack.services.iot import _make_publish
-                await session.send_bytes(
-                    _make_publish(m.topic, m.payload, qos=1, packet_id=p, dup=True)
-                )
-
-        # Verify retransmitted publish has DUP=True
-        publishes = _extract_publish_frames(sent)
-        assert len(publishes) == 1
-        topic, payload, qos, packet_id, dup = publishes[0]
-        assert topic == "test/dup"
-        assert payload == b"dup-payload"
-        assert qos == 1
-        assert packet_id == pid
-        assert dup is True
+        msg.sent_at = now - 30
+        await session._retransmit_due()
+        assert _extract_publish_frames(sent) == [("test/dup", b"dup-payload", 1, pid, False)]
+        assert msg.retransmit_count == 1
 
         await session.cleanup()
 
@@ -7900,6 +8352,42 @@ def test_iot_jobs_in_progress_timeout_reaches_timed_out():
         assert iot_module._jobs_apply_timeout(execution)["status"] == "TIMED_OUT"
         assert iot_module._jobs["j1"]["status"] == "COMPLETED"
         assert iot_module._jobs_seconds_before_timeout(execution) is None
+    reset()
+
+
+def test_iot_jobs_in_progress_timeout_reaches_control_plane_reads():
+    """DescribeJobExecution, both execution lists and DescribeJob each report the timed-out execution."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    def read_after_the_timeout(read):
+        reset()
+        with request_scope("123456789012", _TEST_REGION):
+            started = iot_module._jobs_now_ms() - 61_000
+            iot_module._jobs["j1"] = {
+                "jobId": "j1", "jobArn": iot_module._job_arn("j1"), "targets": [],
+                "targetSelection": "SNAPSHOT", "status": "IN_PROGRESS", "document": "{}",
+                "snapshotted": True, "createdAt": started, "lastUpdatedAt": started,
+                "timeoutConfig": {"inProgressTimeoutInMinutes": 1},
+            }
+            iot_module._job_executions[("t1", "j1")] = {
+                "jobId": "j1", "thingName": "t1", "status": "IN_PROGRESS",
+                "queuedAt": started, "startedAt": started, "lastUpdatedAt": started,
+                "executionNumber": 1, "versionNumber": 2,
+            }
+            status, _, body = read()
+        assert status == 200
+        return json.loads(body)
+
+    execution = read_after_the_timeout(
+        lambda: iot_module._describe_job_execution("t1", "j1", {}))["execution"]
+    assert (execution["status"], execution["versionNumber"]) == ("TIMED_OUT", 3)
+    for read in (lambda: iot_module._list_job_executions_for_job("j1", {}),
+                 lambda: iot_module._list_job_executions_for_thing("t1", {})):
+        (summary,) = read_after_the_timeout(read)["executionSummaries"]
+        assert summary["jobExecutionSummary"]["status"] == "TIMED_OUT"
+    details = read_after_the_timeout(lambda: iot_module._describe_job("j1"))["job"]["jobProcessDetails"]
+    assert (details["numberOfTimedOutThings"], details["numberOfInProgressThings"]) == (1, 0)
     reset()
 
 

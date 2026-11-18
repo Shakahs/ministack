@@ -10,16 +10,16 @@ supported-markers = [
 
 [[package]]
 name = "botocore"
-version = "1.43.106"
+version = "1.43.124"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jmespath" },
     { name = "python-dateutil" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/11/b9/10ca68d0092895d5ea60f485a61a9840d5aff9d732c66ed60da53a20b1d4/botocore-1.43.106.tar.gz", hash = "sha256:006870b3b4e40547232ad12c3bb4faec91bbbe0659aafaa3b7fa48a112c4ee97", size = 16271399, upload-time = "2026-09-30T19:36:35.836Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/1e/c0abe23b9495414dc79e3faeb6e96e2336053fd8cae7d80cc6bbe4bd02f3/botocore-1.43.124.tar.gz", hash = "sha256:6df80235995e2926e0768e7ad270e774adcd6ff0307da7ab87ffb8c384edb578", size = 16509340, upload-time = "2026-11-04T21:22:30.041Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/eb/c51d3b54dfaa9267a687359d946dc2a1ca6a27fb4d381773e59b7bd72bf4/botocore-1.43.106-py3-none-any.whl", hash = "sha256:c1fb8818f9957cb5037f73db34ac1a12ba43562e31d6e7f9cb7e5fc64e1dba78", size = 15965506, upload-time = "2026-09-30T19:36:32.625Z" },
+    { url = "https://files.pythonhosted.org/packages/84/a4/77409b07ba0b5520dbc591c33b305c5fe4c186036d881ca894a597c0dfba/botocore-1.43.124-py3-none-any.whl", hash = "sha256:4651bac68d1aef78d42c8aefb514a6cd86fda07971b8348652a9d24f21b07965", size = 16209102, upload-time = "2026-11-04T21:22:22.159Z" },
 ]
 
 [[package]]
@@ -184,7 +184,7 @@ wheels = [
 
 [[package]]
 name = "ministack-server"
-version = "1.5.29"
+version = "1.5.42"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -202,7 +202,7 @@ server = [
 
 [package.metadata.requires-dev]
 server = [
-    { name = "botocore", specifier = "==1.43.106" },
+    { name = "botocore", specifier = "==1.43.124" },
     { name = "cryptography", specifier = ">=41.0,<50.0.2" },
     { name = "defusedxml", specifier = ">=0.7" },
     { name = "graphql-core", specifier = "==3.2.12" },

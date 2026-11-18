@@ -21,6 +21,8 @@ Supports:
   Account:        DescribeAccountPreferences, PutAccountPreferences
 """
 
+import base64
+import binascii
 import copy
 import fnmatch
 import ipaddress
@@ -31,7 +33,6 @@ import random
 import re
 import string
 import time
-import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -88,10 +89,14 @@ def _create_file_system(body):
     provisioned_throughput = body.get("ProvisionedThroughputInMibps")
     creation_token = body.get("CreationToken", _fs_id())
 
-    # Idempotency — same CreationToken returns existing FS
     for fs in _file_systems.values():
         if fs.get("CreationToken") == creation_token:
-            return _json(200, _fs_response(fs))
+            payload = json.dumps({
+                "ErrorCode": "FileSystemAlreadyExists",
+                "Message": f"File system '{fs['FileSystemId']}' already exists with creation token '{creation_token}'",
+                "FileSystemId": fs["FileSystemId"],
+            }).encode("utf-8")
+            return 409, {"Content-Type": "application/json", "x-amzn-errortype": "FileSystemAlreadyExists"}, payload
 
     fs_id = _fs_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:file-system/{fs_id}"
@@ -108,12 +113,16 @@ def _create_file_system(body):
         "PerformanceMode": perf_mode,
         "ThroughputMode": throughput_mode,
         "Encrypted": encrypted,
-        "KmsKeyId": kms_key_id,
         "Tags": tags,
         "OwnerId": get_account_id(),
-        "Name": next((t["Value"] for t in tags if t["Key"] == "Name"), ""),
         "FileSystemProtection": {"ReplicationOverwriteProtection": _PROTECTION_DEFAULT},
     }
+    # KmsKeyId and Name are optional in FileSystemDescription: omitted when unset.
+    if kms_key_id:
+        record["KmsKeyId"] = kms_key_id
+    name = next((t["Value"] for t in tags if t["Key"] == "Name"), "")
+    if name:
+        record["Name"] = name
     if provisioned_throughput:
         record["ProvisionedThroughputInMibps"] = provisioned_throughput
     if body.get("AvailabilityZoneName"):
@@ -123,13 +132,32 @@ def _create_file_system(body):
         record["AvailabilityZoneId"] = ec2._az_id_for_zone_name(body["AvailabilityZoneName"])
 
     _file_systems[fs_id] = record
+    if body.get("Backup", bool(body.get("AvailabilityZoneName"))):
+        _backup_policies[fs_id] = {"Status": "ENABLED"}
     return _json(201, _fs_response(record))
+
+
+def _page(items, query, key, in_token, out_token, limit_key):
+    marker = query.get(in_token)
+    try:
+        start = int(base64.urlsafe_b64decode(marker).decode()) if marker else 0
+        limit = int(query.get(limit_key) or 100)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return _error(400, "BadRequest", f"Invalid {in_token}.")
+    if start < 0 or limit < 1:
+        return _error(400, "BadRequest", f"Invalid {in_token}.")
+    end = start + limit
+    out = {key: items[start:end]}
+    if marker and in_token == "Marker":
+        out["Marker"] = marker
+    if end < len(items):
+        out[out_token] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return _json(200, out)
 
 
 def _describe_file_systems(query):
     fs_id = query.get("FileSystemId")
     creation_token = query.get("CreationToken")
-    max_items = int(query.get("MaxItems", 100))
 
     if fs_id and fs_id not in _file_systems:
         return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
@@ -142,7 +170,7 @@ def _describe_file_systems(query):
             continue
         results.append(_fs_response(fs))
 
-    return _json(200, {"FileSystems": results[:max_items]})
+    return _page(results, query, "FileSystems", "Marker", "NextMarker", "MaxItems")
 
 
 def _delete_file_system(fs_id):
@@ -480,7 +508,6 @@ def _create_mount_target(body):
 def _describe_mount_targets(query):
     fs_id = query.get("FileSystemId")
     mt_id = query.get("MountTargetId")
-    max_items = int(query.get("MaxItems", 100))
 
     if mt_id and mt_id not in _mount_targets:
         return _error(404, "MountTargetNotFound", f"Mount target '{mt_id}' does not exist.")
@@ -493,7 +520,7 @@ def _describe_mount_targets(query):
             continue
         results.append(_mt_response(mt))
 
-    return _json(200, {"MountTargets": results[:max_items]})
+    return _page(results, query, "MountTargets", "Marker", "NextMarker", "MaxItems")
 
 
 def _delete_mount_target(mt_id):
@@ -526,7 +553,7 @@ def _modify_mount_target_security_groups(mt_id, body):
 
 
 def _mt_response(mt):
-    return {k: v for k, v in mt.items() if k not in ("SecurityGroups", "IpAddressType")}
+    return {k: v for k, v in mt.items() if k not in ("SecurityGroups", "IpAddressType", "MountTargetArn")}
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +568,6 @@ def _create_access_point(body):
 
     ap_id = _ap_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:access-point/{ap_id}"
-    now = _now_iso()
     tags = body.get("Tags", [])
 
     record = {
@@ -563,7 +589,6 @@ def _create_access_point(body):
 def _describe_access_points(query):
     fs_id = query.get("FileSystemId")
     ap_id = query.get("AccessPointId")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for ap in _access_points.values():
@@ -573,7 +598,7 @@ def _describe_access_points(query):
             continue
         results.append(ap)
 
-    return _json(200, {"AccessPoints": results[:max_results]})
+    return _page(results, query, "AccessPoints", "NextToken", "NextToken", "MaxResults")
 
 
 def _delete_access_point(ap_id):
@@ -660,11 +685,11 @@ def _untag_resource(resource_id, keys):
     return _json(200, {})
 
 
-def _list_tags_for_resource(resource_id):
+def _list_tags_for_resource(resource_id, query=None):
     resource, err = _resolve_tag_resource(resource_id)
     if err:
         return err
-    return _json(200, {"Tags": resource.get("Tags", [])})
+    return _page(list(resource.get("Tags", [])), query or {}, "Tags", "NextToken", "NextToken", "MaxResults")
 
 
 def _find_resource(resource_id, resource_type=None):
@@ -789,7 +814,7 @@ def _policy_locks_out_caller(statements):
             continue
         principal = statement.get("Principal")
         if isinstance(principal, dict):
-            values = [v for value in principal.values() for v in (value if isinstance(value, list) else [value])]
+            values = [v for _, value in _pairs(principal) for v in (value if isinstance(value, list) else [value])]
         else:
             values = [principal]
         if "*" not in values:
@@ -801,6 +826,129 @@ def _policy_locks_out_caller(statements):
     return False
 
 
+class _InvalidPolicyStructure(Exception):
+    pass
+
+
+class _JsonNumber(str):
+    """A number literal, kept as text the way AWS echoes it."""
+
+
+_POLICY_KEYS = ("Version", "Id", "Statement")
+_STATEMENT_KEYS = ("Sid", "Effect", "Principal", "NotPrincipal", "Action", "NotAction",
+                   "Resource", "NotResource", "Condition")
+_JSON_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r",
+                       "\t": "\\t"}
+
+
+class _PolicyObject(dict):
+    """A JSON object that remembers every key/value pair; AWS keeps repeated keys inside Principal."""
+
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.pairs = list(pairs)
+
+
+def _policy_object(pairs):
+    return _PolicyObject(pairs)
+
+
+def _pairs(value):
+    return value.pairs if isinstance(value, _PolicyObject) else list(value.items())
+
+
+def _repeats_key(value):
+    return isinstance(value, dict) and len(_pairs(value)) != len(value)
+
+
+def _policy_constant(text):
+    raise _InvalidPolicyStructure
+
+
+def _policy_number(text):
+    """AWS refuses a number with more than 1000 digits, counting exponent digits but not the sign."""
+    if sum(char.isdigit() for char in text) > 1000:
+        raise _InvalidPolicyStructure
+    return _JsonNumber("0" if text == "-0" else text)
+
+
+def _parse_policy(raw):
+    return json.loads(raw, object_pairs_hook=_policy_object, parse_int=_policy_number,
+                      parse_float=_policy_number, parse_constant=_policy_constant)
+
+
+def _is_text(value):
+    return isinstance(value, str) and not isinstance(value, _JsonNumber)
+
+
+def _canonical_value(value):
+    if value is None:
+        raise _InvalidPolicyStructure
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        if any(isinstance(item, bool) for item in value):
+            raise _InvalidPolicyStructure
+        items = [_canonical_value(item) for item in value]
+        return items[0] if len(items) == 1 else items
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _canonical_policy(policy, statements, file_system_arn):
+    """The policy as AWS stores it: known keys in a fixed order, scalars as strings,
+    one-element lists as their element, and a missing Resource set to the file system."""
+    if not all(_is_text(item.get(key, "")) for item, key in
+               [(policy, "Version"), (policy, "Id")] + [(statement, "Sid") for statement in statements]):
+        raise _InvalidPolicyStructure
+    canonical = {"Version": _canonical_value(policy.get("Version", "2008-10-17"))}
+    if "Id" in policy:
+        canonical["Id"] = policy["Id"]
+    canonical["Statement"] = []
+    for source in statements:
+        if "Resource" not in source and "NotResource" not in source:
+            source = dict(source, Resource=file_system_arn)
+        condition = source.get("Condition")
+        if _repeats_key(condition) or isinstance(condition, dict) and any(map(_repeats_key, condition.values())):
+            raise _InvalidPolicyStructure
+        statement = {key: _canonical_value(source[key]) for key in _STATEMENT_KEYS if key in source}
+        for key in ("Principal", "NotPrincipal"):
+            if isinstance(source.get(key), dict):
+                statement[key] = _PolicyObject([(k, _canonical_value(v)) for k, v in _pairs(source[key])])
+        if isinstance(statement.get("Condition"), dict):
+            statement["Condition"] = {op: values for op, values in statement["Condition"].items() if values != {}}
+        canonical["Statement"].append(statement)
+    return canonical
+
+
+def _policy_string(text):
+    text = re.sub("[\ud800-\udfff]", "?", text)  # AWS writes a lone surrogate as "?"
+    return '"' + re.sub(r'["\\\x00-\x1f]',
+                        lambda m: _JSON_SHORT_ESCAPES.get(m.group(), f"\\u{ord(m.group()):04X}"), text) + '"'
+
+
+def _policy_json(value, pretty=False, depth=0):
+    """Compact for PutFileSystemPolicy, indented for DescribeFileSystemPolicy, with AWS's spacing and escapes."""
+    if isinstance(value, str):
+        return _policy_string(value)
+    if isinstance(value, list):
+        if not value:
+            return "[ ]" if pretty else "[]"
+        items = (", " if pretty else ",").join(_policy_json(item, pretty, depth) for item in value)
+        return f"[ {items} ]" if pretty else f"[{items}]"
+    if isinstance(value, dict):
+        if not value:
+            return "{ }" if pretty else "{}"
+        if not pretty:
+            return "{" + ",".join(f"{_policy_string(k)}:{_policy_json(v)}" for k, v in _pairs(value)) + "}"
+        pad = "  " * (depth + 1)
+        fields = ",\n".join(f"{pad}{_policy_string(k)} : {_policy_json(v, True, depth + 1)}"
+                             for k, v in _pairs(value))
+        return "{\n" + fields + "\n" + "  " * depth + "}"
+    return json.dumps(value)  # policies stored before the canonical form can hold JSON numbers and booleans
+
+
 def _put_file_system_policy(fs_id, body):
     fs = _file_systems.get(fs_id)
     if not fs:
@@ -809,29 +957,37 @@ def _put_file_system_policy(fs_id, body):
     if not isinstance(raw, str) or not 1 <= len(raw) <= _POLICY_MAX_LENGTH:
         return _error(400, "BadRequest", f"Policy must be between 1 and {_POLICY_MAX_LENGTH} characters.")
     try:
-        policy = json.loads(raw)
+        policy = _parse_policy(raw)
+    except _InvalidPolicyStructure:
+        return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
     except ValueError:
         return _error(400, "InvalidPolicyException", "The file system policy is not valid JSON.")
     statements = policy.get("Statement") if isinstance(policy, dict) else None
     if isinstance(statements, dict):
         statements = [statements]
+    if isinstance(policy, dict) and (set(policy) - set(_POLICY_KEYS) or _repeats_key(policy) or isinstance(
+            statements, list) and any(isinstance(s, dict) and (set(s) - set(_STATEMENT_KEYS) or _repeats_key(s))
+                                      for s in statements)):
+        return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
+    # AWS checks value types before it looks for an Effect or an Action. The Effect/Action check below only
+    # passes for a dict policy whose statements are all dicts, so canonical is always set past it.
+    canonical = None
+    if isinstance(policy, dict) and isinstance(statements, list) and all(isinstance(s, dict) for s in statements):
+        try:
+            canonical = _canonical_policy(policy, statements, fs["FileSystemArn"])
+        except _InvalidPolicyStructure:
+            return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
     if not statements or not all(
             isinstance(s, dict) and s.get("Effect") in ("Allow", "Deny") and ("Action" in s or "NotAction" in s)
             for s in statements):
         return _error(400, "InvalidPolicyException",
                       "The file system policy needs a Statement list whose entries have an Effect and an Action.")
-    if not body.get("BypassPolicyLockoutSafetyCheck") and _policy_locks_out_caller(statements):
+    policy = canonical
+    if not body.get("BypassPolicyLockoutSafetyCheck") and _policy_locks_out_caller(policy["Statement"]):
         return _error(400, "InvalidPolicyException",
                       "The policy would lock out the caller from PutFileSystemPolicy; "
                       "set BypassPolicyLockoutSafetyCheck to override.")
-    # Id, Sid and Resource are filled in as the API reference examples show.
-    policy["Statement"] = statements
-    policy.setdefault("Id", "1")
-    for statement in statements:
-        statement.setdefault("Sid", f"efs-statement-{uuid.uuid4()}")
-        if "Resource" not in statement and "NotResource" not in statement:
-            statement["Resource"] = fs["FileSystemArn"]
-    stored = json.dumps(policy)
+    stored = _policy_json(policy)
     fs["FileSystemPolicy"] = stored
     return _json(200, {"FileSystemId": fs_id, "Policy": stored})
 
@@ -843,7 +999,7 @@ def _describe_file_system_policy(fs_id):
     policy = fs.get("FileSystemPolicy")
     if not policy:
         return _error(404, "PolicyNotFound", f"File system '{fs_id}' has no file system policy.")
-    return _json(200, {"FileSystemId": fs_id, "Policy": policy})
+    return _json(200, {"FileSystemId": fs_id, "Policy": _policy_json(json.loads(policy, object_pairs_hook=_PolicyObject), pretty=True)})
 
 
 def _delete_file_system_policy(fs_id):
@@ -932,7 +1088,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if m:
         resource_id = m.group(1)
         if method == "GET":
-            return await _a(_list_tags_for_resource(resource_id))
+            return await _a(_list_tags_for_resource(resource_id, query))
         if method == "POST":
             return await _a(_tag_resource(resource_id, body))
         if method == "DELETE":

@@ -26,8 +26,10 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("wafv2")
@@ -51,6 +53,19 @@ _WAF_RESOURCE_SCOPES = {
     "regexpatternset": {"regional", "global"},
     "rulegroup": {"regional", "global"},
 }
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def get_state():
@@ -218,6 +233,22 @@ def _resource_arn(resource_type, name, uid, scope, account_id=None, region=None)
     return f"arn:aws:wafv2:{region}:{account_id}:{segment}/{resource_type}/{name}/{uid}"
 
 
+_WEB_ACL_OPTIONAL = (
+    "DataProtectionConfig", "CustomResponseBodies", "CaptchaConfig", "ChallengeConfig", "TokenDomains",
+    "AssociationConfig", "OnSourceDDoSProtectionConfig", "ApplicationConfig", "MonetizationConfig",
+)
+_RULE_GROUP_OPTIONAL = ("CustomResponseBodies", "MonetizationConfig")
+
+
+def _apply_optional(record, props, keys):
+    """Store each optional member as sent; an update replaces them, so an omitted one is cleared."""
+    for key in keys:
+        if props.get(key) is not None:
+            record[key] = props[key]
+        else:
+            record.pop(key, None)
+
+
 def create_web_acl_record(name, scope, props):
     scope = _normalize_scope(scope)
     uid = new_uuid()
@@ -233,6 +264,7 @@ def create_web_acl_record(name, scope, props):
         "LockToken": lock_token,
         "Scope": scope,
     }
+    _apply_optional(record, props, _WEB_ACL_OPTIONAL)
     _web_acls.set_scoped(get_account_id(), _scope_home_region(scope), uid, record)
     _waf_tags[arn] = props.get("Tags", [])
     return uid, arn, record
@@ -252,6 +284,7 @@ def update_web_acl_record(acl, props):
     acl["DefaultAction"] = props.get("DefaultAction", {"Allow": {}})
     acl["Rules"] = props.get("Rules", [])
     acl["VisibilityConfig"] = props.get("VisibilityConfig", {})
+    _apply_optional(acl, props, _WEB_ACL_OPTIONAL)
     acl["LockToken"] = new_uuid()
     return acl
 
@@ -446,6 +479,10 @@ async def handle_request(method, path, headers, body, query_params):
 # WebACL
 # ---------------------------------------------------------------------------
 
+_DUPLICATE_ITEM_MESSAGE = ("AWS WAF couldn’t perform the operation because some resource in your "
+                          "request is a duplicate of an existing one.")
+
+
 def _create_web_acl(data):
     name = data.get("Name", "")
     if not name:
@@ -453,7 +490,7 @@ def _create_web_acl(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     for existing in _values_for_scope(_web_acls, scope):
         if existing["Name"] == name and existing.get("Scope") == scope:
-            return _waf_err("WAFDuplicateItemException", f"A WebACL with name '{name}' already exists.")
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid, arn, acl = create_web_acl_record(name, scope, data)
     logger.info("CreateWebACL: %s (%s)", name, uid)
     return json_response({"Summary": {
@@ -463,6 +500,17 @@ def _create_web_acl(data):
     }})
 
 
+
+def _shape_view(record, shape):
+    """The record's members that wafv2's output shape has; internal keys such as Scope stay out."""
+    import botocore.session
+
+    global _WAF_MODEL
+    if "_WAF_MODEL" not in globals():
+        _WAF_MODEL = botocore.session.get_session().get_service_model("wafv2")
+    members = _WAF_MODEL.shape_for(shape).members
+    return {k: v for k, v in record.items() if k in members}
+
 def _get_web_acl(data):
     uid = data.get("Id", "")
     if err := _validate_web_acl_id(uid):
@@ -470,7 +518,7 @@ def _get_web_acl(data):
     acl = _resource_from_scope(_web_acls, uid, data.get("Scope", "REGIONAL"))
     if not acl:
         return _waf_err("WAFNonexistentItemException", f"WebACL {uid} not found")
-    acl_body = {k: v for k, v in acl.items() if k != "LockToken"}
+    acl_body = _shape_view(acl, "WebACL")
     return json_response({"WebACL": acl_body, "LockToken": acl["LockToken"]})
 
 
@@ -482,10 +530,7 @@ def _update_web_acl(data):
     lock_token = data.get("LockToken", "")
     if lock_token != acl.get("LockToken", ""):
         return _waf_err("WAFOptimisticLockException", "The resource you are trying to update has been modified by another request.")
-    acl["Rules"] = data.get("Rules", acl["Rules"])
-    acl["DefaultAction"] = data.get("DefaultAction", acl["DefaultAction"])
-    acl["VisibilityConfig"] = data.get("VisibilityConfig", acl["VisibilityConfig"])
-    acl["LockToken"] = new_uuid()
+    update_web_acl_record(acl, data)
     return json_response({"NextLockToken": acl["LockToken"]})
 
 
@@ -503,6 +548,18 @@ def _delete_web_acl(data):
     return json_response({})
 
 
+def _marker_page(data, key, items):
+    try:
+        start = max(int(data.get("NextMarker") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    end = start + (data.get("Limit") or len(items))
+    resp = {key: items[start:end]}
+    if end < len(items):
+        resp["NextMarker"] = str(end)
+    return json_response(resp)
+
+
 def _list_web_acls(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     acls = [
@@ -510,7 +567,7 @@ def _list_web_acls(data):
          "Description": a.get("Description", ""), "LockToken": a["LockToken"]}
         for a in _values_for_scope(_web_acls, scope) if a.get("Scope", "REGIONAL") == scope
     ]
-    return json_response({"WebACLs": acls, "NextMarker": None})
+    return _marker_page(data, "WebACLs", acls)
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +598,7 @@ def _get_web_acl_for_resource(data):
     acl, err = _resolve_local_web_acl(web_acl_arn)
     if err:
         return err
-    acl_body = {k: v for k, v in acl.items() if k != "LockToken"}
+    acl_body = _shape_view(acl, "WebACL")
     return json_response({"WebACL": acl_body})
 
 
@@ -550,8 +607,28 @@ def _list_resources_for_web_acl(data):
     _, err = _resolve_local_web_acl(web_acl_arn)
     if err:
         return err
-    arns = [r for r, a in _associations.items() if a == web_acl_arn]
+    # "If you don't provide a resource type, the call uses ... APPLICATION_LOAD_BALANCER" (service-2.json).
+    resource_type = data.get("ResourceType") or "APPLICATION_LOAD_BALANCER"
+    arns = [r for r, a in _associations.items()
+            if a == web_acl_arn and _associated_resource_type(r) == resource_type]
     return json_response({"ResourceArns": arns})
+
+
+def _associated_resource_type(resource_arn):
+    parts = resource_arn.split(":", 5)
+    service, resource = (parts[2], parts[5]) if len(parts) == 6 else ("", "")
+    if service == "elasticloadbalancing":
+        return "APPLICATION_LOAD_BALANCER"
+    if service == "ec2" and resource.startswith("verified-access-instance/"):
+        return "VERIFIED_ACCESS_INSTANCE"
+    return {
+        "apigateway": "API_GATEWAY",
+        "appsync": "APPSYNC",
+        "cognito-idp": "COGNITO_USER_POOL",
+        "apprunner": "APP_RUNNER_SERVICE",
+        "amplify": "AMPLIFY",
+        "bedrock-agentcore": "AGENTCORE_GATEWAY",
+    }.get(service, "")
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +638,9 @@ def _list_resources_for_web_acl(data):
 def _create_ip_set(data):
     name = data.get("Name", "")
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    for existing in _values_for_scope(_ip_sets, scope):
+        if existing["Name"] == name and existing.get("Scope", scope) == scope:
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _ipset_arn(name, uid, scope)
@@ -581,7 +661,7 @@ def _get_ip_set(data):
     ipset = _resource_from_scope(_ip_sets, uid, data.get("Scope", "REGIONAL"))
     if not ipset:
         return _waf_err("WAFNonexistentItemException", f"IPSet {uid} not found")
-    ipset_body = {k: v for k, v in ipset.items() if k != "LockToken"}
+    ipset_body = _shape_view(ipset, "IPSet")
     return json_response({"IPSet": ipset_body, "LockToken": ipset["LockToken"]})
 
 
@@ -590,6 +670,7 @@ def _update_ip_set(data):
     ipset = _resource_from_scope(_ip_sets, uid, data.get("Scope", "REGIONAL"))
     if not ipset:
         return _waf_err("WAFNonexistentItemException", f"IPSet {uid} not found")
+    ipset["Description"] = data.get("Description", "")
     ipset["Addresses"] = data.get("Addresses", ipset["Addresses"])
     ipset["LockToken"] = new_uuid()
     return json_response({"NextLockToken": ipset["LockToken"]})
@@ -613,7 +694,7 @@ def _list_ip_sets(data):
          "Description": s.get("Description", ""), "LockToken": s["LockToken"]}
         for s in _values_for_scope(_ip_sets, scope) if s.get("Scope", "REGIONAL") == scope
     ]
-    return json_response({"IPSets": sets, "NextMarker": None})
+    return _marker_page(data, "IPSets", sets)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +716,7 @@ def _create_regex_pattern_set(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     for existing in _values_for_scope(_regex_pattern_sets, scope):
         if existing["Name"] == name and existing.get("Scope") == scope:
-            return _waf_err("WAFDuplicateItemException", f"A RegexPatternSet with name '{name}' already exists.")
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _regex_pattern_set_arn(name, uid, scope)
@@ -696,7 +777,7 @@ def _list_regex_pattern_sets(data):
          "Description": r.get("Description", ""), "LockToken": r["LockToken"]}
         for r in _values_for_scope(_regex_pattern_sets, scope) if r.get("Scope", "REGIONAL") == scope
     ]
-    return json_response({"RegexPatternSets": sets, "NextMarker": None})
+    return _marker_page(data, "RegexPatternSets", sets)
 
 
 # ---------------------------------------------------------------------------
@@ -706,10 +787,13 @@ def _list_regex_pattern_sets(data):
 def _create_rule_group(data):
     name = data.get("Name", "")
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    for existing in _values_for_scope(_rule_groups, scope):
+        if existing["Name"] == name and existing.get("Scope", scope) == scope:
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _rg_arn(name, uid, scope)
-    _rule_groups.set_scoped(get_account_id(), _scope_home_region(scope), uid, {
+    record = {
         "ARN": arn, "Id": uid, "Name": name,
         "Description": data.get("Description", ""),
         "Capacity": data.get("Capacity", 0),
@@ -717,7 +801,9 @@ def _create_rule_group(data):
         "VisibilityConfig": data.get("VisibilityConfig", {}),
         "LockToken": lock_token,
         "Scope": scope,
-    })
+    }
+    _apply_optional(record, data, _RULE_GROUP_OPTIONAL)
+    _rule_groups.set_scoped(get_account_id(), _scope_home_region(scope), uid, record)
     _waf_tags[arn] = data.get("Tags", [])
     return json_response({"Summary": {"ARN": arn, "Id": uid, "Name": name, "LockToken": lock_token}})
 
@@ -727,7 +813,7 @@ def _get_rule_group(data):
     rg = _resource_from_scope(_rule_groups, uid, data.get("Scope", "REGIONAL"))
     if not rg:
         return _waf_err("WAFNonexistentItemException", f"RuleGroup {uid} not found")
-    rg_body = {k: v for k, v in rg.items() if k != "LockToken"}
+    rg_body = _shape_view(rg, "RuleGroup")
     return json_response({"RuleGroup": rg_body, "LockToken": rg["LockToken"]})
 
 
@@ -736,8 +822,12 @@ def _update_rule_group(data):
     rg = _resource_from_scope(_rule_groups, uid, data.get("Scope", "REGIONAL"))
     if not rg:
         return _waf_err("WAFNonexistentItemException", f"RuleGroup {uid} not found")
-    rg["Rules"] = data.get("Rules", rg["Rules"])
-    rg["VisibilityConfig"] = data.get("VisibilityConfig", rg["VisibilityConfig"])
+    if data.get("LockToken", "") != rg["LockToken"]:
+        return _waf_err("WAFOptimisticLockException", "The resource you are trying to update has been modified by another request.")
+    rg["Description"] = data.get("Description", "")
+    rg["Rules"] = data.get("Rules", [])
+    rg["VisibilityConfig"] = data.get("VisibilityConfig", {})
+    _apply_optional(rg, data, _RULE_GROUP_OPTIONAL)
     rg["LockToken"] = new_uuid()
     return json_response({"NextLockToken": rg["LockToken"]})
 
@@ -760,7 +850,7 @@ def _list_rule_groups(data):
          "Description": r.get("Description", ""), "LockToken": r["LockToken"]}
         for r in _values_for_scope(_rule_groups, scope) if r.get("Scope", "REGIONAL") == scope
     ]
-    return json_response({"RuleGroups": groups, "NextMarker": None})
+    return _marker_page(data, "RuleGroups", groups)
 
 
 # ---------------------------------------------------------------------------

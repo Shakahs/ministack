@@ -124,8 +124,11 @@ def test_kms_describe_key_by_arn(kms_client):
 def test_kms_key_arn_resolution_rejects_wrong_scope(kms_client):
     created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
     arn = created["KeyMetadata"]["Arn"]
+    # Another account's key ARN is refused without saying whether the key exists (#2463, captured).
+    with pytest.raises(ClientError) as exc:
+        kms_client.describe_key(KeyId=arn.replace(":000000000000:", ":111111111111:"))
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
     invalid_cases = [
-        arn.replace(":000000000000:", ":111111111111:"),
         arn.replace(":us-east-1:", ":us-west-2:"),
         arn.replace(":kms:", ":sqs:"),
         arn.replace(":key/", ":alias/"),
@@ -1072,7 +1075,8 @@ def _kms_call(access_key, operation, key_id, field="__type"):
 
 
 _ALLOW_KMS = {"Statement": [{"Effect": "Allow", "Action": "kms:*", "Resource": "*"}]}
-_DENIED = (403, "AccessDeniedException")
+_DENIED = (400, "AccessDeniedException")  # recorded on AWS: no policy allows the call
+_EXPLICITLY_DENIED = (403, "AccessDeniedException")
 
 
 def test_key_policy_naming_the_user_allows_without_identity_policy(auth_key):
@@ -1096,10 +1100,11 @@ def test_default_key_policy_hands_the_decision_to_identity_policies(auth_key):
     assert _kms_call(access_key, "GenerateDataKey", key_id) == (200, None)
 
 
+
 def test_key_policy_deny_beats_an_identity_allow(auth_key):
     access_key, user = inprocess_iam_user(_ALLOW_KMS)
     key_id = auth_key(("Allow", "arn:aws:iam::000000000000:root", "kms:*"), ("Deny", user, "kms:GenerateDataKey"))
-    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _EXPLICITLY_DENIED
     assert _kms_call(access_key, "GenerateDataKey", key_id, "message") == (403, (
         f"User: {user} is not authorized to perform: kms:GenerateDataKey on resource: "
         f"arn:aws:kms:us-east-1:000000000000:key/{key_id} with an explicit deny in a resource-based policy"))
@@ -2155,17 +2160,17 @@ def test_kms_generate_random_validation(kms_client):
     CustomKeyStoreId a CustomKeyStoreNotFoundException — botocore validates the
     range client-side, so the raw-request path is exercised via the wire."""
     import requests as _requests
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
 
     def _raw(payload):
-        return _requests.post(
-            ENDPOINT,
-            json=payload,
-            headers={
-                "x-amz-target": "TrentService.GenerateRandom",
-                "content-type": "application/x-amz-json-1.1",
-            },
-            timeout=10,
-        )
+        # Signed with the client's credentials, so it also passes authentication under AUTH=true.
+        request = AWSRequest("POST", ENDPOINT, data=json.dumps(payload), headers={
+            "x-amz-target": "TrentService.GenerateRandom",
+            "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(kms_client._get_credentials(), "kms", kms_client.meta.region_name).add_auth(request)
+        return _requests.post(ENDPOINT, data=request.body, headers=dict(request.headers), timeout=10)
 
     resp = _raw({})
     assert resp.status_code == 400
@@ -2614,10 +2619,11 @@ def test_kms_list_grants(kms_client):
     for key_ref in (meta["KeyId"], meta["Arn"]):
         resp = kms_client.list_grants(KeyId=key_ref)
         assert resp["Grants"] == [] and resp["Truncated"] is False
-    for missing in ("00000000-0000-0000-0000-000000000000", "alias/does-not-matter"):
+    for missing, code in (("00000000-0000-0000-0000-000000000000", "NotFoundException"),
+                          ("alias/does-not-matter", "InvalidArnException")):
         with pytest.raises(ClientError) as exc:
             kms_client.list_grants(KeyId=missing)
-        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+        assert exc.value.response["Error"]["Code"] == code
 
 
 def _new_grant_key(kms_client, **kwargs):
@@ -2772,13 +2778,15 @@ def test_kms_grant_operations_reject_unknown_key_and_alias(kms_client):
     alias = f"alias/grant-{_uuid_mod.uuid4().hex[:8]}"
     kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
     try:
-        for key_ref in ("00000000-0000-0000-0000-000000000000", alias):
+        # Recorded on AWS (us-east-1): grant operations refuse an alias even when it exists.
+        for key_ref, code in (("00000000-0000-0000-0000-000000000000", "NotFoundException"),
+                              (alias, "InvalidArnException")):
             with pytest.raises(ClientError) as exc:
                 kms_client.create_grant(KeyId=key_ref, GranteePrincipal="arn:aws:iam::000000000000:role/x", Operations=["Encrypt"])
-            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+            assert exc.value.response["Error"]["Code"] == code
             with pytest.raises(ClientError) as exc:
                 kms_client.revoke_grant(KeyId=key_ref, GrantId="0" * 64)
-            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+            assert exc.value.response["Error"]["Code"] == code
     finally:
         kms_client.delete_alias(AliasName=alias)
 
@@ -2951,3 +2959,140 @@ def test_kms_rsa_decrypt_without_algorithm_is_invalid_ciphertext(kms_client):
         kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
     assert exc.value.response["Error"] == {
         "Code": "InvalidKeyUsageException", "Message": "Algorithm SYMMETRIC_DEFAULT is incompatible with key spec RSA_2048."}
+
+
+
+def test_kms_missing_key_errors_match_aws(kms_client):
+    """Recorded on AWS (us-east-1): admin operations refuse an alias outright, Decrypt reads the
+    ciphertext before it looks up KeyId, and RetireGrant wants a key ARN and hides an unknown grant."""
+    missing, alias = "00000000-0000-0000-0000-000000000000", f"alias/nope-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        kms_client.get_key_policy(KeyId=alias, PolicyName="default")
+    assert exc.value.response["Error"] == {
+        "Code": "InvalidArnException", "Message": "Key Aliases are not supported for this operation."}
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=missing, CiphertextBlob=b"x" * 100)
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(KeyId=missing, GrantId="a" * 64)
+    assert exc.value.response["Error"] == {"Code": "NotFoundException", "Message": f"Invalid arn {missing}"}
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=alias, Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    key = kms_client.create_key()["KeyMetadata"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(KeyId=key["Arn"], GrantId="a" * 64)
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    assert "because the resource does not exist in this Region" in exc.value.response["Error"]["Message"]
+    kms_client.create_alias(AliasName=alias, TargetKeyId=key["KeyId"])
+    try:
+        with pytest.raises(ClientError) as exc:
+            kms_client.disable_key(KeyId=alias)
+        assert exc.value.response["Error"]["Code"] == "InvalidArnException"
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+
+def test_kms_shapes_match_aws(kms_client):
+    """Recorded on AWS (us-east-1): not-found wording, rotation status, DescribeKey and the default policy."""
+    meta = kms_client.create_key()["KeyMetadata"]
+    account = meta["Arn"].split(":")[4]
+    assert kms_client.describe_key(KeyId=meta["KeyId"])["KeyMetadata"]["AWSAccountId"] == account
+    status = kms_client.get_key_rotation_status(KeyId=meta["KeyId"])
+    assert (status["KeyId"], status["KeyRotationEnabled"], "RotationPeriodInDays" in status) == (meta["Arn"], False, False)
+    kms_client.enable_key_rotation(KeyId=meta["KeyId"])
+    assert kms_client.get_key_rotation_status(KeyId=meta["KeyId"])["RotationPeriodInDays"] == 365
+    policy = kms_client.get_key_policy(KeyId=meta["KeyId"], PolicyName="default")["Policy"]
+    assert policy.startswith('{\n  "Version" : "2012-10-17",\n  "Id" : "key-default-1",\n  "Statement" : [ {\n')
+    missing = "00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=missing, Plaintext=b"x")
+    assert exc.value.response["Error"]["Message"] == f"Key 'arn:aws:kms:us-east-1:{account}:key/{missing}' does not exist"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId="alias/never-made", Plaintext=b"x")
+    assert exc.value.response["Error"]["Message"] == f"Alias arn:aws:kms:us-east-1:{account}:alias/never-made is not found."
+
+
+@pytest.mark.auth_contract
+def test_kms_identity_denial_names_the_key(auth_enabled, iam_user, kms_client):
+    """Recorded on AWS (us-east-1): a user without an identity policy is refused with HTTP 400, naming the key."""
+    key = kms_client.create_key()["KeyMetadata"]
+    user = iam_user()
+    client = user.client("kms")
+    if not auth_enabled:
+        assert "CiphertextBlob" in client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+        return
+    with pytest.raises(ClientError) as exc:
+        client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == {"Code": "AccessDeniedException", "Message": (
+        f"User: {user.arn} is not authorized to perform: kms:GenerateDataKey on resource: {key['Arn']} "
+        "because no identity-based policy allows the kms:GenerateDataKey action")}
+
+@pytest.mark.auth_contract
+def test_kms_key_arn_from_another_account(auth_enabled):
+    """#2463, recorded on AWS with two accounts (us-east-1): a key ARN or alias ARN of another account
+    resolves in the owner's account and its key policy decides, in both auth modes. A key that exists is
+    named in the refusal; one that does not is not."""
+    def kms(account):
+        return boto3.client("kms", endpoint_url=ENDPOINT, region_name="us-east-1",
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    owner, other = kms("111122223333"), kms("444455556666")
+    closed = owner.create_key()["KeyMetadata"]
+    shared = owner.create_key(Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"}, "Action": "kms:*", "Resource": "*"},
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::444455556666:root"},
+         "Action": ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:DisableKey"], "Resource": "*"}]}))["KeyMetadata"]
+    alias = f"alias/xacct-{_uuid_mod.uuid4().hex[:8]}"
+    owner.create_alias(AliasName=alias, TargetKeyId=shared["KeyId"])
+    caller = "arn:aws:iam::444455556666:root"
+
+    def refused(call, message):
+        with pytest.raises(ClientError) as exc:
+            call()
+        err = exc.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "AccessDeniedException", message)
+
+    def named(action, key):
+        return (f"User: {caller} is not authorized to perform: kms:{action} on resource: {key['Arn']} "
+                f"because no resource-based policy allows the kms:{action} action")
+
+    blob = other.encrypt(KeyId=shared["Arn"], Plaintext=b"x")["CiphertextBlob"]
+    assert other.decrypt(CiphertextBlob=blob)["Plaintext"] == b"x"
+    assert other.encrypt(KeyId=f"arn:aws:kms:us-east-1:111122223333:{alias}", Plaintext=b"x")["KeyId"] == shared["Arn"]
+    assert other.describe_key(KeyId=shared["Arn"])["KeyMetadata"]["AWSAccountId"] == "111122223333"
+    refused(lambda: other.encrypt(KeyId=closed["Arn"], Plaintext=b"x"), named("Encrypt", closed))
+    refused(lambda: other.generate_data_key(KeyId=shared["Arn"], KeySpec="AES_256"), named("GenerateDataKey", shared))
+    refused(lambda: other.disable_key(KeyId=shared["Arn"]), "This operation cannot be called cross account")
+    refused(lambda: other.encrypt(KeyId=closed["Arn"][:-4] + "0000", Plaintext=b"x"), (
+        f"User: {caller} is not authorized to perform: kms:Encrypt on this resource because the resource does not "
+        "exist in this Region, no resource-based policies allow access, or a resource-based policy explicitly "
+        "denies access"))
+    with pytest.raises(ClientError) as exc:
+        other.encrypt(KeyId=closed["KeyId"], Plaintext=b"x")
+    assert exc.value.response["Error"] == {
+        "Code": "NotFoundException",
+        "Message": f"Key 'arn:aws:kms:us-east-1:444455556666:key/{closed['KeyId']}' does not exist"}
+    with pytest.raises(ClientError) as exc:
+        other.encrypt(KeyId=closed["Arn"].replace(":us-east-1:", ":us-west-2:"), Plaintext=b"x")
+    assert exc.value.response["Error"] == {"Code": "NotFoundException", "Message": "Invalid arn us-west-2"}
+
+
+def test_kms_aws_s3_alias_is_listed_before_its_key_and_describe_key_creates_it():
+    """Recorded on AWS (sa-east-1, us-west-1, us-west-2): ListAliases names alias/aws/s3 without a target
+    before the key exists; DescribeKey of alias/aws/s3 creates the AWS managed key and the alias then targets it."""
+    import random
+    account = "".join(random.choices("123456789", k=12))
+    kms = boto3.client("kms", endpoint_url=ENDPOINT, region_name="sa-east-1", aws_access_key_id=account,
+                       aws_secret_access_key="test")
+    listed = [a for a in kms.list_aliases()["Aliases"] if a["AliasName"] == "alias/aws/s3"]
+    assert listed == [{"AliasName": "alias/aws/s3", "AliasArn": f"arn:aws:kms:sa-east-1:{account}:alias/aws/s3"}]
+    meta = kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]
+    assert meta["KeyManager"] == "AWS"
+    assert meta["Description"] == "Default key that protects my S3 objects when no other key is defined"
+    listed = [a for a in kms.list_aliases()["Aliases"] if a["AliasName"] == "alias/aws/s3"]
+    assert [a["TargetKeyId"] for a in listed] == [meta["KeyId"]]
+    assert kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]["KeyId"] == meta["KeyId"]

@@ -231,7 +231,7 @@ def test_sns_subscribe_rejects_invalid_sqs_and_lambda_endpoint_arns(sns, protoco
 
     with pytest.raises(ClientError) as exc:
         sns.subscribe(TopicArn=topic_arn, Protocol=protocol, Endpoint=endpoint)
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_sqs_fanout_does_not_tail_match_foreign_account_endpoint(sns, sqs):
@@ -331,12 +331,12 @@ def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
 def test_sns_topic_tag_apis_reject_invalid_arns(sns):
     arn = sns.create_topic(Name=f"intg-sns-invalid-tags-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
     invalid_cases = [
-        ("not-an-arn", "InvalidParameterException"),
-        ("arn:aws:sns:us-east-1", "InvalidParameterException"),
-        (arn.replace(":sns:", ":sqs:"), "InvalidParameterException"),
-        (arn.replace(":000000000000:", ":111111111111:"), "ResourceNotFoundException"),
-        (arn.replace(":us-east-1:", ":us-west-2:"), "ResourceNotFoundException"),
-        ("arn:aws:sns:us-east-1:000000000000:app/APNS/example", "InvalidParameterException"),
+        ("not-an-arn", "InvalidParameter"),
+        ("arn:aws:sns:us-east-1", "InvalidParameter"),
+        (arn.replace(":sns:", ":sqs:"), "InvalidParameter"),
+        (arn.replace(":000000000000:", ":111111111111:"), "ResourceNotFound"),
+        (arn.replace(":us-east-1:", ":us-west-2:"), "ResourceNotFound"),
+        ("arn:aws:sns:us-east-1:000000000000:app/APNS/example", "InvalidParameter"),
     ]
 
     for bad_arn, expected_code in invalid_cases:
@@ -355,7 +355,7 @@ def test_sns_topic_list_and_untag_reject_invalid_arns(sns):
     ]:
         with pytest.raises(ClientError) as exc:
             operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:not-a-topic", **kwargs)
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_subscription_attributes(sns):
@@ -791,7 +791,7 @@ def test_sns_fifo_create_topic_without_fifo_suffix_returns_error(sns):
             Name="intg-fifo-no-suffix",
             Attributes={"FifoTopic": "true"},
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_fifo_auto_detect_from_suffix(sns):
@@ -858,7 +858,7 @@ def test_sns_fifo_publish_without_message_group_id_returns_error(sns):
 
     with pytest.raises(ClientError) as exc:
         sns.publish(TopicArn=arn, Message="missing group id")
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_fifo_publish_without_dedup_id_cbd_false_returns_error(sns):
@@ -874,7 +874,7 @@ def test_sns_fifo_publish_without_dedup_id_cbd_false_returns_error(sns):
             Message="missing dedup id",
             MessageGroupId="grp-1",
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_standard_topic_publish_without_message_group_id_succeeds(sns):
@@ -1377,7 +1377,7 @@ def test_sns_fifo_publish_fails_without_dedup_id_after_disabling_cbd(sns):
             Message="should fail with cbd off",
             MessageGroupId="grp-1",
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 # ---------------------------------------------------------------------------
@@ -2143,7 +2143,7 @@ def test_sns_publish_internal_rejections(sns_internal):
     )
     with pytest.raises(sns_internal.SnsPublishError) as ei:
         sns_internal.publish_internal(fifo, "hi", message_deduplication_id="d1")
-    assert ei.value.code == "InvalidParameterException"
+    assert ei.value.code == "InvalidParameter"
     assert "MessageGroupId" in str(ei.value)
 
     # ...and with a group id but no way to derive a dedup id.
@@ -2385,3 +2385,110 @@ def test_sns_filter_wildcard_and_cidr(sns, sqs):
         for v in (match, other):
             sns.publish(TopicArn=topic, Message=v, MessageAttributes={"f": {"DataType": "String", "StringValue": v}})
         assert _bodies(sqs, url) == [match]
+
+
+def test_sns_to_lambda_event_sns_record_matches_aws(lam, sns, logs):
+    """The `Sns` record a Lambda receives has AWS's members, not the SQS/HTTP envelope's.
+
+    Observed on AWS (us-east-1, 2026-11-12, python3.12 function printing its event):
+    the record carries Type, MessageId, TopicArn, Subject, Message, Timestamp,
+    SignatureVersion, Signature, SigningCertUrl, UnsubscribeUrl and MessageAttributes.
+    Subject is null and MessageAttributes {} when the message has none. UnsubscribeUrl
+    names the subscription. Each attribute is {Type, Value}: Binary with the value in
+    base64, and String for String, Number and String.Array.
+    """
+    fn = f"sns-record-{_uuid_mod.uuid4().hex[:8]}"
+    code = "import json\ndef handler(event, context):\n    print('EVENT ' + json.dumps(event))\n"
+    fn_arn = lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                                 Handler="index.handler", Code={"ZipFile": _make_zip(code)})["FunctionArn"]
+    topic_arn = sns.create_topic(Name=f"sns-record-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="lambda", Endpoint=fn_arn)["SubscriptionArn"]
+
+    sns.publish(TopicArn=topic_arn, Message="plain")
+    sns.publish(TopicArn=topic_arn, Message="full", Subject="Hello", MessageAttributes={
+        "color": {"DataType": "String", "StringValue": "blue"},
+        "count": {"DataType": "Number", "StringValue": "3"},
+        "blob": {"DataType": "Binary", "BinaryValue": b"\x00\x01\xff"},
+        "tags": {"DataType": "String.Array", "StringValue": '["a","b"]'},
+    })
+
+    records, deadline = {}, time.time() + 30
+    while time.time() < deadline and len(records) < 2:
+        time.sleep(0.5)
+        try:
+            events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}", filterPattern='"EVENT "')["events"]
+        except logs.exceptions.ResourceNotFoundException:
+            continue
+        for e in events:
+            record = json.loads(e["message"].split("EVENT ", 1)[1])["Records"][0]["Sns"]
+            records[record["Message"]] = record
+    assert set(records) == {"plain", "full"}
+
+    expected_members = {"Type", "MessageId", "TopicArn", "Subject", "Message", "Timestamp", "SignatureVersion",
+                        "Signature", "SigningCertUrl", "UnsubscribeUrl", "MessageAttributes"}
+    for record in records.values():
+        assert set(record) == expected_members
+        assert record["UnsubscribeUrl"].endswith(f"SubscriptionArn={sub_arn}")
+    assert records["plain"]["Subject"] is None
+    assert records["plain"]["MessageAttributes"] == {}
+    assert records["full"]["Subject"] == "Hello"
+    assert records["full"]["MessageAttributes"] == {
+        "color": {"Type": "String", "Value": "blue"},
+        "count": {"Type": "String", "Value": "3"},
+        "blob": {"Type": "Binary", "Value": "AAH/"},
+        "tags": {"Type": "String", "Value": '["a","b"]'},
+    }
+
+
+@pytest.mark.auth_contract
+def test_sns_tag_and_subscription_actions_check_the_topic_contract(auth_enabled):
+    """Tag actions are checked on ResourceArn, subscription actions on the subscription's topic (AWS capture, #2696)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    import os as _os
+    import uuid as _uuid
+
+    import boto3
+    from botocore.exceptions import ClientError
+    endpoint = _os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key="test", secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    suffix = _uuid.uuid4().hex[:8]
+    sns, sqs, iam = client("sns"), client("sqs"), client("iam")
+    topic = sns.create_topic(Name=f"sub-topic-{suffix}")["TopicArn"]
+    for i, resources in enumerate(([topic], [f"{topic}:*"])):
+        q = sqs.create_queue(QueueName=f"sub-q{i}-{suffix}")["QueueUrl"]
+        qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        sub = sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=qarn, ReturnSubscriptionArn=True)["SubscriptionArn"]
+        name = f"sub-user{i}-{suffix}"
+        iam.create_user(UserName=name)
+        iam.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=_json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["sns:TagResource", "sns:UntagResource", "sns:ListTagsForResource"],
+             "Resource": topic},
+            {"Effect": "Allow", "Action": ["sns:GetSubscriptionAttributes", "sns:SetSubscriptionAttributes",
+                                           "sns:Unsubscribe"], "Resource": resources}]}))
+        key = iam.create_access_key(UserName=name)["AccessKey"]
+        c = client("sns", key["AccessKeyId"], key["SecretAccessKey"])
+        calls = (("GetSubscriptionAttributes", lambda: c.get_subscription_attributes(SubscriptionArn=sub)),
+                 ("SetSubscriptionAttributes", lambda: c.set_subscription_attributes(
+                     SubscriptionArn=sub, AttributeName="RawMessageDelivery", AttributeValue="true")),
+                 ("Unsubscribe", lambda: c.unsubscribe(SubscriptionArn=sub)))
+        if i == 0:
+            c.tag_resource(ResourceArn=topic, Tags=[{"Key": "k", "Value": "v"}])
+            c.list_tags_for_resource(ResourceArn=topic)
+            c.untag_resource(ResourceArn=topic, TagKeys=["k"])
+            for _action, call in calls:
+                call()
+            continue
+        for action, call in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            error = exc.value.response
+            assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
+                403, "AuthorizationError",
+                f"User: arn:aws:iam::000000000000:user/{name} is not authorized to perform: SNS:{action} on resource: "
+                f"{topic} because no identity-based policy allows the SNS:{action} action")

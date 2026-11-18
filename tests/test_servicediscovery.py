@@ -592,12 +592,8 @@ def test_servicediscovery_state_is_isolated_by_region():
     )[0] == 200
     west_operation_ids = set(sd_svc._operations.keys())
 
-    assert _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"] == [
-        sd_svc._namespaces[west_namespace_id]
-    ]
-    assert _json_result(sd_svc._list_services({}))[2]["Services"] == [
-        sd_svc._services[west_service_id]
-    ]
+    assert [n["Id"] for n in _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"]] == [west_namespace_id]
+    assert [s["Id"] for s in _json_result(sd_svc._list_services({}))[2]["Services"]] == [west_service_id]
     listed_west_operation_ids = {
         operation["Id"]
         for operation in _json_result(sd_svc._list_operations({}))[2]["Operations"]
@@ -613,9 +609,7 @@ def test_servicediscovery_state_is_isolated_by_region():
     )[0] == 404
 
     set_request_region("us-east-1")
-    assert _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"] == [
-        sd_svc._namespaces[east_namespace_id]
-    ]
+    assert [n["Id"] for n in _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"]] == [east_namespace_id]
     assert _json_result(
         asyncio.run(sd_svc._create_namespace({"Name": namespace_name}))
     )[0] == 409
@@ -718,3 +712,39 @@ def test_servicediscovery_reset_clears_all_regions():
 
     assert all(not store.has_any() for store in regional_stores)
     assert sd_svc._resource_tags._data == {}
+
+
+def test_servicediscovery_discover_instances_filters(sd):
+    import uuid
+    ns_name = f"disc-{uuid.uuid4().hex[:8]}"
+    op = sd.create_http_namespace(Name=ns_name)
+    ns_id = sd.get_operation(OperationId=op["OperationId"])["Operation"]["Targets"]["NAMESPACE"]
+    checked = sd.create_service(Name="checked", NamespaceId=ns_id,
+                                HealthCheckCustomConfig={"FailureThreshold": 1})["Service"]["Id"]
+    plain = sd.create_service(Name="plain", NamespaceId=ns_id)["Service"]["Id"]
+    for svc in (checked, plain):
+        sd.register_instance(ServiceId=svc, InstanceId="a", Attributes={"version": "v1", "az": "1a"})
+        sd.register_instance(ServiceId=svc, InstanceId="b", Attributes={"version": "v2", "az": "1a"})
+        sd.update_instance_custom_health_status(ServiceId=svc, InstanceId="b", Status="UNHEALTHY")
+    try:
+        def ids(service, **kw):
+            resp = sd.discover_instances(NamespaceName=ns_name, ServiceName=service, **kw)
+            assert isinstance(resp["InstancesRevision"], int)
+            return sorted(i["InstanceId"] for i in resp["Instances"])
+
+        assert ids("checked", HealthStatus="HEALTHY") == ["a"]
+        assert ids("checked", HealthStatus="UNHEALTHY") == ["b"]
+        # No health check: HealthStatus is ignored and all instances return.
+        assert ids("plain", HealthStatus="HEALTHY") == ["a", "b"]
+        sd.update_instance_custom_health_status(ServiceId=checked, InstanceId="a", Status="UNHEALTHY")
+        assert ids("checked", HealthStatus="HEALTHY_OR_ELSE_ALL") == ["a", "b"]
+        assert ids("plain", QueryParameters={"version": "v2", "az": "1a"}) == ["b"]
+        assert ids("plain", QueryParameters={"az": "1a"}, OptionalParameters={"version": "v1"}) == ["a"]
+        assert ids("plain", QueryParameters={"az": "1a"}, OptionalParameters={"version": "v9"}) == ["a", "b"]
+        assert len(ids("plain", MaxResults=1)) == 1
+    finally:
+        for svc in (checked, plain):
+            for inst in ("a", "b"):
+                sd.deregister_instance(ServiceId=svc, InstanceId=inst)
+            sd.delete_service(Id=svc)
+        sd.delete_namespace(Id=ns_id)

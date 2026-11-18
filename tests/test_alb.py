@@ -1,12 +1,14 @@
+import base64
 import io
 import json
 import os
+import re
 import time
 import urllib.request as _req
 import uuid as _uuid_mod
 import zipfile
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
 import pytest
 from botocore.exceptions import ClientError
@@ -563,15 +565,20 @@ def test_elbv2_dataplane_event_shape(elbv2, lam):
     )
     lb_arn, tg_arn, l_arn, fn_arn = _alb_setup(elbv2, lam, "dp-alb-evt", "dp-alb-evt-fn", fn_code)
     try:
-        url = f"{_endpoint}/_alb/dp-alb-evt/check?foo=bar"
+        url = f"{_endpoint}/_alb/dp-alb-evt/check?foo=bar&a=1&a=3&q=x%20y&flag"
         resp = _req.urlopen(_req.Request(url, method="GET"))
         body = json.loads(resp.read())
         assert "requestContext" in body
         assert "elb" in body["requestContext"]
         assert body["httpMethod"] == "GET"
         assert body["path"] == "/check"
-        assert body["queryStringParameters"].get("foo") == "bar"
-        assert "headers" in body
+        # Single-value by default: the last value of a repeated key, not URL-decoded, and no multi-value keys.
+        assert body["queryStringParameters"] == {"foo": "bar", "a": "3", "q": "x%20y", "flag": ""}
+        assert "multiValueQueryStringParameters" not in body and "multiValueHeaders" not in body
+        assert body["body"] == ""
+        assert body["headers"]["x-forwarded-for"] == "127.0.0.1"
+        assert (body["headers"]["x-forwarded-proto"], body["headers"]["x-forwarded-port"]) == ("http", "80")
+        assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", body["headers"]["x-amzn-trace-id"])
         assert body["isBase64Encoded"] is False
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-evt-fn")
@@ -609,6 +616,10 @@ def test_elbv2_dataplane_fixed_response(elbv2, lam):
         resp = _req.urlopen(_req.Request(url, method="GET"))
         assert resp.status == 200
         assert resp.read() == b"maintenance"
+        assert resp.headers["Server"] == "awselb/2.0"
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": "routing.http.response.server.enabled", "Value": "false"}])
+        assert _req.urlopen(_req.Request(url, method="GET")).headers.get("Server") is None
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
@@ -661,6 +672,35 @@ def test_elbv2_dataplane_redirect(elbv2):
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+def test_elbv2_dataplane_redirect_location_keeps_the_listener_port_and_query(elbv2):
+    import http.client as _http
+    from urllib.parse import urlparse as _urlparse
+
+    lb_arn = elbv2.create_load_balancer(Name="dp-alb-redir-q")["LoadBalancers"][0]["LoadBalancerArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "redirect", "RedirectConfig": {"Path": "/elsewhere", "StatusCode": "HTTP_302"}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        parsed = _urlparse(_endpoint)
+        conn = _http.HTTPConnection(parsed.hostname, parsed.port or 4566)
+        conn.request("GET", "/_alb/dp-alb-redir-q/x?y=1", headers={"Host": "app.example.test:9000"})
+        resp = conn.getresponse()
+        assert (resp.status, resp.getheader("Location")) == (302, "http://app.example.test:80/elsewhere?y=1")
+        conn.close()
+        elbv2.modify_listener(ListenerArn=l_arn, DefaultActions=[{"Type": "redirect", "RedirectConfig": {
+            "Path": "/elsewhere", "Query": "z=1&#{query}", "StatusCode": "HTTP_302"}}])
+        listener = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+        assert listener["DefaultActions"][0]["RedirectConfig"]["Query"] == "z=1&#{query}"
+        conn = _http.HTTPConnection(parsed.hostname, parsed.port or 4566)
+        conn.request("GET", "/_alb/dp-alb-redir-q/x?y=1", headers={"Host": "app.example.test:9000"})
+        assert conn.getresponse().getheader("Location") == "http://app.example.test:80/elsewhere?z=1&y=1"
+        conn.close()
+    finally:
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
 
 def test_elbv2_dataplane_path_pattern_rule(elbv2, lam):
     """Path-pattern rule routes /api/* to one Lambda; default routes to another."""
@@ -869,6 +909,128 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
+@pytest.mark.serial
+def test_elbv2_dataplane_http2_connection_answers_past_a_thousand_requests(elbv2):
+    """One HTTP/2 connection keeps answering past Hypercorn's default keep_alive_max_requests (1000): AWS closes a client
+    connection by keepalive duration, not by request count."""
+    import socket
+
+    import h2.connection
+    import h2.events
+
+    lb_name = "dp-alb-h2"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", _SERVER_GATEWAY_PORT)
+    parsed = urlparse(_endpoint)
+    sock = socket.create_connection((parsed.hostname, parsed.port or 4566), timeout=10)
+    try:
+        client = h2.connection.H2Connection()
+        client.initiate_connection()
+        sock.sendall(client.data_to_send())
+        for _ in range(1100):
+            stream_id = client.get_next_available_stream_id()
+            client.send_headers(stream_id, [(":method", "GET"), (":path", f"/_alb/{lb_name}/_ministack/health"),
+                                            (":authority", parsed.netloc), (":scheme", "http")], end_stream=True)
+            sock.sendall(client.data_to_send())
+            ended = False
+            while not ended:
+                data = sock.recv(65535)
+                assert data, f"connection closed at stream {stream_id}"
+                for event in client.receive_data(data):
+                    assert not isinstance(event, h2.events.ConnectionTerminated), f"GOAWAY at stream {stream_id}"
+                    if isinstance(event, h2.events.DataReceived):
+                        client.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                    elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
+                        ended = True
+                sock.sendall(client.data_to_send())
+    finally:
+        sock.close()
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
+def _start_echo_server():
+    """Answer every GET with the request target and headers the target received, as JSON."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            headers = {}
+            for name, value in self.headers.items():
+                headers.setdefault(name.lower(), []).append(value)
+            body = json.dumps({"path": self.path, "headers": headers}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _stop_server(server):
+    server.shutdown()
+    server.server_close()
+
+
+def test_elbv2_dataplane_forwards_the_client_host_header(elbv2):
+    """The target sees the client's Host, not its own address. On a default listener port (80)
+    AWS removes a port the client sent."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-host"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        for sent, received in (("app.example.test", "app.example.test"), ("app.example.test:8443", "app.example.test")):
+            req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": sent})
+            assert json.loads(_req.urlopen(req).read())["headers"]["host"] == [received]
+        elbv2.modify_load_balancer_attributes(LoadBalancerArn=lb_arn, Attributes=[
+            {"Key": "routing.http.preserve_host_header.enabled", "Value": "true"}])
+        req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": "app.example.test:8443"})
+        assert json.loads(_req.urlopen(req).read())["headers"]["host"] == ["app.example.test:8443"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_lambda_target_gets_the_host_as_sent(elbv2, lam):
+    fn_code = ("import json\n"
+               "def handler(event, context):\n"
+               "    return {'statusCode': 200, 'body': json.dumps(event['headers'])}\n")
+    lb_arn, tg_arn, l_arn, _fn_arn = _alb_setup(elbv2, lam, "dp-alb-lhost", "dp-alb-lhost-fn", fn_code)
+    try:
+        req = _req.Request(f"{_endpoint}/_alb/dp-alb-lhost/", headers={"Host": "app.example.test:9000"})
+        assert json.loads(_req.urlopen(req).read())["host"] == "app.example.test:9000"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-lhost-fn")
+
+
+def test_oidc_redirect_uri_on_a_443_listener_drops_the_clients_port(elbv2, lam):
+    name = "oidc-dp-443"
+    lb_arn, tg_arn, l_arn = _alb_with_oidc(elbv2, lam, name)
+    elbv2.modify_listener(ListenerArn=l_arn, Port=443, Protocol="HTTPS",
+                          Certificates=[{"CertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/x"}])
+    try:
+        status, headers, _ = _oidc_get("/private/thing", name)
+        assert status == 302
+        assert parse_qs(urlparse(headers["Location"]).query)["redirect_uri"] == [
+            f"https://{name}.alb.localhost/oauth2/idpresponse"]
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+
+
+def test_elbv2_target_host_follows_the_listener_port():
+    from ministack.services import alb
+
+    assert alb._target_host_header("app.example.test:8443", 443) == "app.example.test"
+    assert alb._target_host_header("app.example.test", 8080) == "app.example.test:8080"
+    assert alb._target_host_header("app.example.test:9000", 8080) == "app.example.test:8080"
+    assert alb._target_host_header("[::1]:8080", 80) == "[::1]"
+    assert alb._target_host_header("[::1]", 8080) == "[::1]:8080"
+
+
 def _start_chunked_server(chunks, delay):
     """Serve `chunks` with `delay` seconds between them and no Content-Length."""
     import threading
@@ -1059,6 +1221,108 @@ def test_elbv2_dataplane_preserves_repeated_target_headers(elbv2, chunked, cooki
         thread.join(timeout=5)
 
 
+def _start_request_capture_server():
+    """Serve one connection: keep its raw request-header lines, answer 200 "ok"."""
+    import socket as _socket
+    import threading
+
+    sock = _socket.socket()
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    header_lines = []
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                header_lines.extend(data.partition(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")[1:])
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread, header_lines
+
+
+def test_elbv2_dataplane_sends_forwarded_headers_once(elbv2):
+    """A request that already carries X-Forwarded-* reaches the target with one field per name."""
+    sock, thread, header_lines = _start_request_capture_server()
+    lb_name = f"dp-alb-xff-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(
+        elbv2, lb_name, "127.0.0.1", sock.getsockname()[1]
+    )
+    try:
+        request = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={
+            "X-Forwarded-For": "203.0.113.5", "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443",
+        })
+        with _req.urlopen(request, timeout=10) as resp:
+            assert resp.read() == b"ok"
+        thread.join(timeout=5)
+        fields = [(n.lower(), v.strip()) for n, _, v in (line.partition(":") for line in header_lines)]
+        names = [n for n, _ in fields]
+        for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-port"):
+            assert names.count(name) == 1, header_lines
+        values = dict(fields)
+        # The load balancer appends its client's address and states the listener's protocol and port.
+        assert values["x-forwarded-for"] == "203.0.113.5, 127.0.0.1"
+        assert (values["x-forwarded-proto"], values["x-forwarded-port"]) == ("http", "80")
+        assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", values["x-amzn-trace-id"])
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+def test_elbv2_target_connection_closed_when_the_caller_stops_waiting():
+    """A caller that gives up before the target answers closes the target connection
+    instead of leaving it open for the idle timeout."""
+    import asyncio
+    import socket as _socket
+    import threading
+
+    from ministack.services import alb
+
+    sock = _socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+    closed = threading.Event()
+
+    def _serve():
+        conn, _ = sock.accept()
+        with conn:
+            conn.settimeout(30)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            if conn.recv(4096) == b"":
+                closed.set()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    async def _give_up():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(alb._proxy_http_target(
+                {"Id": "127.0.0.1", "Port": port}, {"Port": port}, "GET", "/", {}, b"", {},
+            ), 0.5)
+        return await asyncio.to_thread(closed.wait, 5)
+
+    try:
+        assert asyncio.run(_give_up())
+    finally:
+        sock.close()
+        thread.join(timeout=35)
+
+
 @pytest.mark.serial
 def test_elbv2_dataplane_connection_close_target_gets_the_idle_timeout(elbv2):
     """A `Connection: close` target must be bounded by the idle timeout too.
@@ -1157,6 +1421,42 @@ def test_elbv2_dataplane_streams_target_response(elbv2):
         assert first_byte_at < total_at - (delay * 3) / 2, (
             f"first byte at {first_byte_at:.3f}s, complete at {total_at:.3f}s — response was buffered"
         )
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_response_carries_the_load_balancers_date_once(elbv2):
+    """A load balancer writes its own Date in place of the target's; the response carries one."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _StaleDate(BaseHTTPRequestHandler):
+        def date_time_string(self, timestamp=None):
+            return "Mon, 01 Jan 2001 00:00:00 GMT"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StaleDate)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    lb_name = "dp-alb-date"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        resp.read()
+        dates = resp.headers.get_all("Date")
+        assert len(dates) == 1 and "2001" not in dates[0]
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         server.shutdown()
@@ -1582,7 +1882,7 @@ def test_unauthenticated_request_redirects_to_the_identity_provider(elbv2, lam):
         assert q["client_id"] == ["client-abc"]
         assert q["response_type"] == ["code"]
         assert q["scope"] == ["openid email"]
-        assert q["redirect_uri"][0].endswith("/oauth2/idpresponse")
+        assert q["redirect_uri"] == [f"http://{name}.alb.localhost:{_EXECUTE_PORT}/oauth2/idpresponse"]
         assert q["state"], "the provider must be given a state to return"
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
@@ -1686,25 +1986,190 @@ def test_a_custom_session_cookie_name_is_honoured(elbv2, lam):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
 
 
-def test_authenticate_cognito_is_reported_as_unimplemented(elbv2, lam):
-    """Better a loud 501 than forwarding a request nobody authenticated."""
-    name = "oidc-dp-cognito"
-    fn_code = ("def handler(event, context):\n"
-               "    return {'statusCode': 200, 'body': 'reached'}\n")
+def _oidc_get_url(url, host):
+    req = _req.Request(url, method="GET")
+    req.add_header("Host", host)
+    try:
+        resp = _oidc_opener.open(req)
+        return resp.status, dict(resp.headers), resp.read()
+    except HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def _cognito_pool_for_alb(idp, name, callback):
+    pool = idp.create_user_pool(PoolName=name)["UserPool"]
+    domain = f"{name}-{_uuid_mod.uuid4().hex[:8]}"
+    idp.create_user_pool_domain(Domain=domain, UserPoolId=pool["Id"])
+    client = idp.create_user_pool_client(
+        UserPoolId=pool["Id"], ClientName=name, GenerateSecret=True,
+        AllowedOAuthFlows=["code"], AllowedOAuthFlowsUserPoolClient=True,
+        AllowedOAuthScopes=["openid", "email"], CallbackURLs=[callback],
+        SupportedIdentityProviders=["COGNITO"],
+    )["UserPoolClient"]
+    return pool, domain, client
+
+
+def _cognito_action(pool, client, domain, order=1, **extra):
+    return {"Type": "authenticate-cognito", "Order": order, "AuthenticateCognitoConfig": {
+        "UserPoolArn": pool["Arn"], "UserPoolClientId": client["ClientId"], "UserPoolDomain": domain, **extra}}
+
+
+def test_authenticate_cognito_control_plane_errors(elbv2, cognito_idp):
+    """Captured from AWS: HTTPS only, and the client and domain must belong to the pool."""
+    pool, domain, client = _cognito_pool_for_alb(cognito_idp, "albcog-cp", "https://example.com/cb")
+    lb = elbv2.create_load_balancer(Name="albcog-cp")["LoadBalancers"][0]
+    tg = elbv2.create_target_group(Name="albcog-cp-tg", TargetType="lambda")["TargetGroups"][0]
+    forward = {"Type": "forward", "Order": 2, "TargetGroupArn": tg["TargetGroupArn"]}
+    try:
+        with pytest.raises(ClientError) as exc:
+            elbv2.create_listener(LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+                                  DefaultActions=[_cognito_action(pool, client, domain), forward])
+        assert exc.value.response["Error"]["Code"] == "InvalidLoadBalancerAction"
+        assert exc.value.response["Error"]["Message"] == (
+            "Actions of type 'authenticate-cognito' are supported only on HTTPS listeners")
+        assert elbv2.describe_listeners(LoadBalancerArn=lb["LoadBalancerArn"])["Listeners"] == []
+
+        l_arn = elbv2.create_listener(LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTPS", Port=443,
+                                      DefaultActions=[_cognito_action(pool, client, domain), forward],
+                                      )["Listeners"][0]["ListenerArn"]
+        cond = [{"Field": "path-pattern", "Values": ["/x"]}]
+        bad_client = {**client, "ClientId": "1example23456789example2345"}
+        bad_pool = {**pool, "Arn": pool["Arn"].rsplit("/", 1)[0] + "/us-east-1_NoSuchPool"}
+        cases = [
+            (_cognito_action(pool, bad_client, domain),
+             "The user pool client '1example23456789example2345' does not exist in the provided user pool"),
+            (_cognito_action(bad_pool, client, domain),
+             f"The user pool client '{client['ClientId']}' does not exist in the provided user pool"),
+            (_cognito_action(pool, client, "albcog-no-such-domain"),
+             "The user pool domain 'albcog-no-such-domain' is not associated with the provided user pool"),
+        ]
+        for priority, (action, message) in enumerate(cases, start=1):
+            with pytest.raises(ClientError) as exc:
+                elbv2.create_rule(ListenerArn=l_arn, Priority=priority, Conditions=cond, Actions=[action, forward])
+            assert exc.value.response["Error"]["Code"] == "InvalidLoadBalancerAction"
+            assert exc.value.response["Error"]["Message"] == message
+        full_host = f"{domain}.auth.us-east-1.amazoncognito.com"
+        rule = elbv2.create_rule(ListenerArn=l_arn, Priority=10, Conditions=cond,
+                                 Actions=[_cognito_action(pool, client, full_host), forward])["Rules"][0]
+        assert rule["Actions"][0]["AuthenticateCognitoConfig"]["UserPoolDomain"] == full_host
+
+        with pytest.raises(ClientError) as exc:
+            elbv2.modify_listener(ListenerArn=l_arn, Protocol="HTTP", Port=80)
+        assert exc.value.response["Error"]["Code"] == "InvalidLoadBalancerAction"
+        assert elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]["Protocol"] == "HTTPS"
+    finally:
+        elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+        elbv2.delete_target_group(TargetGroupArn=tg["TargetGroupArn"])
+        cognito_idp.delete_user_pool_domain(Domain=domain, UserPoolId=pool["Id"])
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
+
+
+def _b64json(segment):
+    return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+
+
+def test_authenticate_cognito_signs_in_through_the_user_pool(elbv2, lam, cognito_idp):
+    """The flow and headers captured from AWS: redirect to the pool domain, sign in, claims to the target."""
+    name = "albcog-dp"
+    host = f"{name}.alb.localhost"
+    callback = f"https://{host}/oauth2/idpresponse"
+    pool, domain, client = _cognito_pool_for_alb(cognito_idp, name, callback)
+    cognito_idp.admin_create_user(UserPoolId=pool["Id"], Username="albuser", MessageAction="SUPPRESS",
+                                  UserAttributes=[{"Name": "email", "Value": "albuser@example.com"},
+                                                  {"Name": "email_verified", "Value": "true"}])
+    cognito_idp.admin_set_user_password(UserPoolId=pool["Id"], Username="albuser",
+                                        Password="Passw0rd!Passw0rd", Permanent=True)
+    fn_code = ("import json\n"
+               "def handler(event, context):\n"
+               "    h = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+               "    return {'statusCode': 200, 'body': json.dumps({k: v for k, v in h.items()\n"
+               "                                                    if k.startswith('x-amzn-oidc')})}\n")
     lb_arn, tg_arn, l_arn, _ = _alb_setup(elbv2, lam, name, f"{name}-fn", fn_code)
     try:
-        elbv2.modify_listener(
-            ListenerArn=l_arn,
-            DefaultActions=[
-                {"Type": "authenticate-cognito", "Order": 1},
-                {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
-            ],
-        )
-        status, _, body = _oidc_get("/private", name)
-        assert status == 501
-        assert b"not implemented" in body
+        elbv2.delete_listener(ListenerArn=l_arn)
+        l_arn = elbv2.create_listener(
+            LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+            DefaultActions=[_cognito_action(pool, client, domain),
+                            {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn}])["Listeners"][0]["ListenerArn"]
+        rule_cond = [{"Field": "path-pattern", "Values": ["/deny"]}]
+        elbv2.create_rule(ListenerArn=l_arn, Priority=1, Conditions=rule_cond, Actions=[
+            _cognito_action(pool, client, domain, OnUnauthenticatedRequest="deny"),
+            {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn}])
+        elbv2.create_rule(ListenerArn=l_arn, Priority=2, Conditions=[{"Field": "path-pattern", "Values": ["/extra"]}],
+                          Actions=[_cognito_action(pool, client, domain, Scope="openid email",
+                                                   AuthenticationRequestExtraParams={"prompt": "login"}),
+                                   {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn}])
+
+        status, headers, body = _oidc_get("/deny", name)
+        assert status == 401
+        assert body == (b"<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n"
+                        b"<center><h1>401 Authorization Required</h1></center>\r\n</body>\r\n</html>\r\n")
+
+        status, headers, _ = _oidc_get("/extra", name)
+        query = urlparse(headers["Location"]).query
+        assert [k for k, _ in parse_qsl(query)] == [
+            "client_id", "redirect_uri", "response_type", "scope", "state", "prompt"]
+        assert parse_qs(query)["scope"] == ["openid email"]
+
+        status, headers, _ = _oidc_get("/hello?x=1", name)
+        assert status == 302
+        location = urlparse(headers["Location"])
+        assert f"{location.scheme}://{location.netloc}{location.path}" == (
+            f"https://{domain}.auth.us-east-1.amazoncognito.com/oauth2/authorize")
+        query = parse_qs(location.query)
+        assert query["client_id"] == [client["ClientId"]]
+        assert query["redirect_uri"] == [callback]
+        assert query["response_type"] == ["code"] and query["scope"] == ["openid"]
+
+        form = urlencode({"client_id": client["ClientId"], "redirect_uri": callback, "response_type": "code",
+                          "scope": "openid", "state": query["state"][0],
+                          "username": "albuser", "password": "Passw0rd!Passw0rd"}).encode()
+        # With the pool domain routed to MiniStack, as for iss: the gateway serves its authorize endpoint.
+        status, _, page = _oidc_get_url(f"{_endpoint}/oauth2/authorize?{location.query}", location.netloc)
+        assert status == 200 and b"<form" in page
+        try:
+            _oidc_opener.open(_req.Request(f"{_endpoint}/login", data=form, method="POST"))
+            raise AssertionError("login did not redirect")
+        except HTTPError as e:
+            assert e.code == 302
+            back = urlparse(e.headers["Location"])
+        assert f"{back.scheme}://{back.netloc}{back.path}" == callback
+
+        req = _req.Request(f"{_endpoint}/oauth2/idpresponse?{back.query}", method="GET")
+        req.add_header("Host", f"{host}:{_EXECUTE_PORT}")
+        try:
+            _oidc_opener.open(req)
+            raise AssertionError("idpresponse did not redirect")
+        except HTTPError as e:
+            assert e.code == 302
+            assert e.headers["Location"] == f"https://{host}:{_EXECUTE_PORT}/hello?x=1"
+            jar = "; ".join(c.split(";", 1)[0] for c in e.headers.get_all("Set-Cookie"))
+        assert jar.startswith("AWSELBAuthSessionCookie-0=")
+
+        before = int(time.time())
+        status, _, body = _oidc_get("/hello?x=1", name, {"Cookie": jar})
+        assert status == 200
+        seen = json.loads(body)
+        user = cognito_idp.admin_get_user(UserPoolId=pool["Id"], Username="albuser")
+        sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
+        issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool['Id']}"
+        assert seen["x-amzn-oidc-identity"] == sub
+        access = _b64json(seen["x-amzn-oidc-accesstoken"].split(".")[1])
+        assert access["token_use"] == "access" and access["client_id"] == client["ClientId"]
+        header_seg, payload_seg, _ = seen["x-amzn-oidc-data"].split(".")
+        assert header_seg.endswith("=") or len(header_seg) % 4 == 0
+        header, payload = _b64json(header_seg), _b64json(payload_seg)
+        assert list(header) == ["typ", "kid", "alg", "iss", "client", "signer", "exp"]
+        assert (header["alg"], header["iss"], header["client"], header["signer"]) == (
+            "ES256", issuer, client["ClientId"], lb_arn)
+        assert before + 120 <= header["exp"] <= int(time.time()) + 120
+        assert list(payload)[-2:] == ["exp", "iss"]
+        assert (payload["sub"], payload["email"], payload["exp"], payload["iss"]) == (
+            sub, "albuser@example.com", header["exp"], issuer)
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+        cognito_idp.delete_user_pool_domain(Domain=domain, UserPoolId=pool["Id"])
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
 
 
 def test_modify_listener_updates_the_serving_default_rule(elbv2, lam):
@@ -1802,6 +2267,76 @@ def test_oidc_data_is_an_alb_format_claims_jwt(elbv2, lam):
         assert header["iss"] == "https://idp.example.com"
         assert header["client"] == "client-abc"
         assert claims == {"sub": "user-77", "email": "x@example.com"}
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+
+
+def test_oidc_data_verifies_against_served_public_key(elbv2, lam):
+    """The kid in x-amzn-oidc-data resolves to a PEM key on the AWS key host and
+    /_ministack/elb/public-keys/; the raw r||s ES256 signature verifies. An
+    unknown kid gets AWS's 403 AccessDenied XML."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+    def fetch(kid, aws_host):
+        if aws_host:
+            req = _req.Request(f"{_endpoint}/{kid}", method="GET")
+            req.add_header("Host", "public-keys.auth.elb.us-east-1.amazonaws.com")
+        else:
+            req = _req.Request(f"{_endpoint}/_ministack/elb/public-keys/{kid}", method="GET")
+        try:
+            with _req.urlopen(req) as resp:
+                return resp.status, resp.headers.get("Content-Type"), resp.read()
+        except HTTPError as e:
+            return e.code, e.headers.get("Content-Type"), e.read()
+
+    name = "oidc-dp-key"
+    fn_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    h = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+        "    return {'statusCode': 200, 'headers': {'Content-Type': 'application/json'},\n"
+        "            'body': json.dumps({'data': h.get('x-amzn-oidc-data')})}\n"
+    )
+    lb_arn, tg_arn, l_arn, _ = _alb_setup(elbv2, lam, name, f"{name}-fn", fn_code)
+    try:
+        elbv2.modify_listener(
+            ListenerArn=l_arn,
+            DefaultActions=[
+                _oidc_action(order=1),
+                {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
+            ],
+        )
+        from ministack.services import alb
+
+        session = {"claims": {"sub": "user-78"}, "access_token": "at", "exp": int(time.time()) + 600}
+        cookies = alb._oidc_session_cookies("AWSELBAuthSessionCookie", session, 600, False)
+        jar = "; ".join(c.split(";", 1)[0] for c in cookies)
+        status, _, body = _oidc_get("/private", name, {"Cookie": jar})
+        assert status == 200
+        head, payload, sig = json.loads(body)["data"].split(".")
+        kid = json.loads(base64.urlsafe_b64decode(head))["kid"]
+
+        status, _, pem = fetch(kid, aws_host=True)
+        assert status == 200
+        assert pem.startswith(b"-----BEGIN PUBLIC KEY-----")
+        assert fetch(kid, aws_host=False)[2] == pem
+
+        raw = base64.urlsafe_b64decode(sig)
+        assert len(raw) == 64
+        der = utils.encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big"))
+        serialization.load_pem_public_key(pem).verify(der, f"{head}.{payload}".encode(), ec.ECDSA(hashes.SHA256()))
+
+        unknown = str(_uuid_mod.uuid4())
+        for aws_host in (True, False):
+            assert fetch(unknown, aws_host) == (
+                403,
+                "application/xml",
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            )
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
 
@@ -1927,6 +2462,1239 @@ def test_alb_http_header_condition_round_trips_and_matches(elbv2):
         assert body({"X-Example-Origin-Token": "token-123"}) == b"matched"
         assert body({"X-Example-Origin-Token": "wrong"}) == b"default"
         assert body({}) == b"default"
+    finally:
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+
+_TLS_CERT = "arn:aws:acm:us-east-1:000000000000:certificate/tls-default"
+_TLS_CERT_2 = "arn:aws:acm:us-east-1:000000000000:certificate/tls-second"
+_TLS_ACTION = [{"Type": "fixed-response",
+                "FixedResponseConfig": {"StatusCode": "404", "ContentType": "text/plain"}}]
+
+
+@pytest.fixture
+def tls_lb(elbv2):
+    """A load balancer whose listeners and itself are removed after the test."""
+    created = []
+
+    def make(lb_type="application"):
+        name = f"tls-{_uuid_mod.uuid4().hex[:12]}"
+        lb = elbv2.create_load_balancer(Name=name, Type=lb_type)["LoadBalancers"][0]
+        created.append(lb["LoadBalancerArn"])
+        return lb["LoadBalancerArn"]
+
+    yield make
+    for lb_arn in created:
+        for listener in elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]:
+            elbv2.delete_listener(ListenerArn=listener["ListenerArn"])
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+def test_elbv2_https_listener_returns_ssl_policy_and_certificate(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    assert created["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert created["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+
+def test_elbv2_https_listener_defaults_ssl_policy(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    assert created["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+
+
+def test_elbv2_tls_listener_on_network_lb_keeps_tls_settings(elbv2, tls_lb):
+    lb_arn = tls_lb("network")
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="TLS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+
+def test_elbv2_modify_listener_updates_ssl_policy_and_certificate(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]["ListenerArn"]
+
+    modified = elbv2.modify_listener(
+        ListenerArn=l_arn, SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT_2}],
+    )["Listeners"][0]
+    assert modified["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert modified["Certificates"] == [{"CertificateArn": _TLS_CERT_2}]
+
+    # A modify that names neither keeps both.
+    elbv2.modify_listener(ListenerArn=l_arn, Port=8443)
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT_2}]
+
+
+def test_elbv2_modify_listener_to_http_drops_tls_settings(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]["ListenerArn"]
+
+    elbv2.modify_listener(ListenerArn=l_arn, Protocol="HTTP", Port=80)
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["Protocol"] == "HTTP"
+    assert "SslPolicy" not in described
+    assert "Certificates" not in described
+
+    # Back to HTTPS: nothing stale returns, the policy is the default again.
+    elbv2.modify_listener(ListenerArn=l_arn, Protocol="HTTPS", Port=443,
+                          Certificates=[{"CertificateArn": _TLS_CERT_2}])
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["SslPolicy"] == "ELBSecurityPolicy-2016-08"
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT_2}]
+
+
+def test_elbv2_http_listener_keeps_no_tls_settings(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    created = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        SslPolicy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]
+    assert "SslPolicy" not in created
+    assert "Certificates" not in created
+    described = elbv2.describe_listeners(ListenerArns=[created["ListenerArn"]])["Listeners"][0]
+    assert "SslPolicy" not in described
+    assert "Certificates" not in described
+
+
+def test_elbv2_listener_rejects_more_than_one_default_certificate(elbv2, tls_lb):
+    lb_arn = tls_lb()
+    two = [{"CertificateArn": _TLS_CERT}, {"CertificateArn": _TLS_CERT_2}]
+    with pytest.raises(ClientError) as exc:
+        elbv2.create_listener(LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+                              Certificates=two, DefaultActions=_TLS_ACTION)
+    assert exc.value.response["Error"]["Code"] == "TooManyCertificates"
+    assert exc.value.response["Error"]["Message"] == (
+        "Up to '1' certificate ARNs can be specified, but '2' were specified")
+    assert elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"] == []
+
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": _TLS_CERT}], DefaultActions=_TLS_ACTION,
+    )["Listeners"][0]["ListenerArn"]
+    with pytest.raises(ClientError) as exc:
+        elbv2.modify_listener(ListenerArn=l_arn, Port=8443, Certificates=two)
+    assert exc.value.response["Error"]["Code"] == "TooManyCertificates"
+    described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+    assert described["Port"] == 443
+    assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+
+def _url_rewrite(regex="^/app/(.*)$", replace="/$1"):
+    return {"Type": "url-rewrite",
+            "UrlRewriteConfig": {"Rewrites": [{"Regex": regex, "Replace": replace}]}}
+
+
+def _host_rewrite(regex="^www\\.example\\.com$", replace="internal.example.com"):
+    return {"Type": "host-header-rewrite",
+            "HostHeaderRewriteConfig": {"Rewrites": [{"Regex": regex, "Replace": replace}]}}
+
+
+def _rewrite(regex="^/a$", replace="/b"):
+    return {"Regex": regex, "Replace": replace}
+
+
+@pytest.fixture
+def raw_elbv2():
+    """A client without boto3's client-side parameter validation, so invalid
+    transforms reach the server, as in the AWS captures."""
+    from conftest import make_client
+
+    return make_client("elbv2", {"parameter_validation": False})
+
+
+@pytest.fixture
+def transform_listener(elbv2):
+    """A load balancer and listener for rule-transform tests, torn down afterwards."""
+    name = f"tx-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn = elbv2.create_load_balancer(Name=name)["LoadBalancers"][0]["LoadBalancerArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404"}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        yield l_arn
+    finally:
+        for rule in elbv2.describe_rules(ListenerArn=l_arn)["Rules"]:
+            if not rule["IsDefault"]:
+                elbv2.delete_rule(RuleArn=rule["RuleArn"])
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+_TX_PRIORITY = iter(range(1, 50000))
+
+
+def _transform_rule(client, l_arn, **kwargs):
+    return client.create_rule(
+        ListenerArn=l_arn, Priority=next(_TX_PRIORITY),
+        Conditions=[{"Field": "path-pattern", "Values": ["/app/*"]}],
+        Actions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200"}}],
+        **kwargs,
+    )["Rules"][0]
+
+
+def _described_rule(elbv2, rule_arn):
+    return elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]
+
+
+def _default_rule(elbv2, l_arn):
+    return next(r for r in elbv2.describe_rules(ListenerArn=l_arn)["Rules"] if r["IsDefault"])
+
+
+def _non_default_rules(elbv2, l_arn):
+    return [r for r in elbv2.describe_rules(ListenerArn=l_arn)["Rules"] if not r["IsDefault"]]
+
+
+def _refused(exc_info, message, code="ValidationError"):
+    error = exc_info.value.response["Error"]
+    assert (exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"], error["Type"], error["Code"]) == (
+        400, "Sender", code)
+    if message is not None:
+        assert error["Message"] == message
+
+
+def _by_type(transforms):
+    """AWS returns a rule's transforms from DescribeRules and ModifyRule in an
+    order of its own, so comparisons outside CreateRule sort them."""
+    return sorted(transforms, key=lambda t: t["Type"])
+
+
+def test_elbv2_rule_transforms_are_stored_returned_replaced_and_reset(elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C1-C6, C37, C40;
+    2310-uncertainties U1:order)."""
+    both = [_url_rewrite(), _host_rewrite()]
+    rule = _transform_rule(elbv2, transform_listener, Transforms=both)
+    assert rule["Transforms"] == both
+    assert _by_type(_described_rule(elbv2, rule["RuleArn"])["Transforms"]) == _by_type(both)
+    # CreateRule echoes the request order, whichever type comes first.
+    reverse = _transform_rule(elbv2, transform_listener, Transforms=both[::-1])
+    assert reverse["Transforms"] == both[::-1]
+
+    replacement = [_url_rewrite(regex="^/app/legacy$", replace="")]
+    modified = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=replacement)["Rules"][0]
+    assert modified["Transforms"] == replacement
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == replacement
+
+    elbv2.modify_rule(RuleArn=rule["RuleArn"], Conditions=[{"Field": "path-pattern", "Values": ["/v2/*"]}])
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == replacement
+
+    reset = elbv2.modify_rule(RuleArn=rule["RuleArn"], ResetTransforms=True)["Rules"][0]
+    assert reset["Transforms"] == []
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == []
+    # Resetting a rule without transforms is accepted too.
+    assert elbv2.modify_rule(RuleArn=rule["RuleArn"], ResetTransforms=True)["Rules"][0]["Transforms"] == []
+
+    # ResetTransforms=False with Transforms is a plain replace.
+    replaced = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[_host_rewrite()],
+                                 ResetTransforms=False)["Rules"][0]
+    assert replaced["Transforms"] == [_host_rewrite()]
+
+
+def test_elbv2_rules_without_transforms_return_an_empty_list(elbv2, transform_listener):
+    """AWS: captured 2026-10-20 (elbv2-rule-transforms C7, C8, C39). The XML carries
+    an empty <Transforms/> element."""
+    assert _transform_rule(elbv2, transform_listener)["Transforms"] == []
+    assert _transform_rule(elbv2, transform_listener, Transforms=[])["Transforms"] == []
+    assert _default_rule(elbv2, transform_listener)["Transforms"] == []
+
+
+def test_elbv2_rule_transform_rewrite_bounds_are_accepted(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C4, C29;
+    2310-uncertainties U7:host empty-replace and max-lengths)."""
+    for transform in (_url_rewrite(regex="a" * 1024, replace="b" * 1024),
+                      _host_rewrite(regex="a" * 1024, replace="b" * 1024),
+                      _host_rewrite(replace="")):
+        rule = _transform_rule(raw_elbv2, transform_listener, Transforms=[transform])
+        assert rule["Transforms"] == [transform]
+        assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [transform]
+
+
+_INVALID_TRANSFORMS = [
+    ("unknown-type",
+     [{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value 'path-rewrite' at 'transforms.1.member.type' failed to satisfy "
+     "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    ("duplicate-type", [_url_rewrite(), _url_rewrite(regex="^/b$")],
+     "A rule can only have one transform of each type"),
+    ("duplicate-host", [_host_rewrite(), _host_rewrite(regex="^b$")],
+     "A rule can only have one transform of each type"),
+    ("missing-config", [{"Type": "url-rewrite"}],
+     "For transforms of type 'url-rewrite', you must specify the following field(s): 'UrlRewriteConfig'"),
+    ("host-missing-config", [{"Type": "host-header-rewrite"}],
+     "For transforms of type 'host-header-rewrite', you must specify the following field(s): "
+     "'HostHeaderRewriteConfig'"),
+    ("other-config-only",
+     [{"Type": "url-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "For transforms of type 'url-rewrite', you must specify the following field(s): 'UrlRewriteConfig'"),
+    ("wrong-config",
+     [{**_url_rewrite(), "HostHeaderRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "A transform of type 'url-rewrite' does not support the following field(s): 'HostHeaderRewriteConfig'"),
+    ("host-wrong-config",
+     [{**_host_rewrite(), "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "A transform of type 'host-header-rewrite' does not support the following field(s): 'UrlRewriteConfig'"),
+    ("two-rewrites",
+     [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite(), _rewrite("^/c$", "/d")]}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("no-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("empty-regex", [_url_rewrite(regex="")],
+     "A transform rewrite Regex value must be between 1 and 1024 characters in length"),
+    ("long-regex", [_url_rewrite(regex="a" * 1025)],
+     "A transform rewrite Regex value must be between 1 and 1024 characters in length"),
+    ("long-replace", [_url_rewrite(replace="a" * 1025)],
+     "A transform rewrite Replace value must be between 0 and 1024 characters in length"),
+    ("invalid-regex", [_url_rewrite(regex="([")],
+     "One or more provided transform rewrite Regex values are invalid"),
+    ("null-type", [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.type' failed to satisfy constraint: "
+     "Member must not be null"),
+    ("null-regex", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Replace": "/b"}]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null"),
+    ("null-replace", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null"),
+    ("host-null-regex",
+     [{"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [{"Replace": "b"}]}}],
+     "1 validation error detected: Value null at "
+     "'transforms.1.member.hostHeaderRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null"),
+]
+
+
+@pytest.mark.parametrize("transforms, message", [c[1:] for c in _INVALID_TRANSFORMS],
+                         ids=[c[0] for c in _INVALID_TRANSFORMS])
+def test_elbv2_invalid_rule_transforms_are_rejected(elbv2, raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C9-C26, C30-C34,
+    C45; 2310-uncertainties U7:host). CreateRule creates nothing and ModifyRule
+    leaves the rule as it was."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=transforms)
+    _refused(exc, message)
+    assert _non_default_rules(elbv2, transform_listener) == []
+
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    with pytest.raises(ClientError) as exc:
+        raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=transforms,
+                              Conditions=[{"Field": "path-pattern", "Values": ["/changed/*"]}])
+    _refused(exc, message)
+    after = _described_rule(elbv2, rule["RuleArn"])
+    assert after["Transforms"] == [_url_rewrite()]
+    assert after["Conditions"][0]["Values"] == ["/app/*"]
+
+
+_NULL_TYPE = "Value null at 'transforms.{}.member.type' failed to satisfy constraint: Member must not be null"
+
+
+@pytest.mark.parametrize("transforms, message", [
+    ([{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}] * 2,
+     f"2 validation errors detected: {_NULL_TYPE.format(1)}; {_NULL_TYPE.format(2)}"),
+    ([{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}] * 11,
+     "10 validation errors detected: " + "; ".join(_NULL_TYPE.format(i) for i in range(1, 11))),
+    ([{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "2 validation errors detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null; Value 'path-rewrite' at 'transforms.1.member.type' "
+     "failed to satisfy constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    ([{"Type": "url-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [{"Replace": "b"}]},
+       "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "2 validation errors detected: Value null at 'transforms.1.member.hostHeaderRewriteConfig.rewrites.1.member."
+     "regex' failed to satisfy constraint: Member must not be null; Value null at 'transforms.1.member."
+     "urlRewriteConfig.rewrites.1.member.replace' failed to satisfy constraint: Member must not be null"),
+    ([{"HostHeaderRewriteConfig": {"Rewrites": [{"Replace": "b"}]},
+       "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "3 validation errors detected: Value null at 'transforms.1.member.hostHeaderRewriteConfig.rewrites.1.member."
+     "regex' failed to satisfy constraint: Member must not be null; Value null at 'transforms.1.member."
+     "urlRewriteConfig.rewrites.1.member.replace' failed to satisfy constraint: Member must not be null; "
+     f"{_NULL_TYPE.format(1)}"),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Replace": "/b"}, {"Replace": "/c"}]}}],
+     "2 validation errors detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null; Value null at "
+     "'transforms.1.member.urlRewriteConfig.rewrites.2.member.regex' failed to satisfy constraint: "
+     "Member must not be null"),
+    ([{"Type": "", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value '' at 'transforms.1.member.type' failed to satisfy constraint: "
+     "Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    # The model check runs before any other: the unknown type wins over the duplicate.
+    ([_url_rewrite(), _url_rewrite(regex="^/b$"),
+      {"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value 'path-rewrite' at 'transforms.3.member.type' failed to satisfy "
+     "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+], ids=["two-null-types", "eleven-null-types", "replace-before-type", "host-before-url",
+        "type-last", "rewrite-order", "blank-type", "model-before-duplicate"])
+def test_elbv2_rule_transform_model_errors_are_listed_together(raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties U6:create, 2310-uncertainties-2
+    V3:order). Every missing or unknown member is listed, at most ten."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=transforms)
+    _refused(exc, message)
+
+
+_DUPLICATE = "A rule can only have one transform of each type"
+_REGEX_LENGTH = "A transform rewrite Regex value must be between 1 and 1024 characters in length"
+_REPLACE_LENGTH = "A transform rewrite Replace value must be between 0 and 1024 characters in length"
+_REGEX_INVALID = "One or more provided transform rewrite Regex values are invalid"
+_REGEX_ASCII = ("Transform rewrite regex values can not be empty, and can only contain "
+                "non-whitespace ASCII 128 characters")
+_REPLACE_CHARS = "A transform rewrite Replace value may only consist of non-whitespace printable ASCII characters"
+
+
+@pytest.mark.parametrize("transforms, message", [
+    ([_url_rewrite(regex=""), _url_rewrite()], _DUPLICATE),
+    ([_url_rewrite(regex="(["), _url_rewrite()], _DUPLICATE),
+    ([{"Type": "url-rewrite"}, _url_rewrite()], _DUPLICATE),
+    ([_url_rewrite(), host_rw := _host_rewrite(), _url_rewrite(regex="^/c$")], _DUPLICATE),
+    ([_url_rewrite(regex=""), {"Type": "host-header-rewrite"}], _REGEX_LENGTH),
+    ([_url_rewrite(replace="a" * 1025), {**host_rw, "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     _REPLACE_LENGTH),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite(), _rewrite()]}},
+      {"Type": "host-header-rewrite"}], "Rule transforms must have exactly one Rewrite"),
+    ([_url_rewrite(regex="(["), _host_rewrite(regex="")], _REGEX_INVALID),
+    ([_host_rewrite(regex=""), _url_rewrite(regex="([")], _REGEX_LENGTH),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []},
+       "HostHeaderRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "A transform of type 'url-rewrite' does not support the following field(s): 'HostHeaderRewriteConfig'"),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite(regex=""), _rewrite()]}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ([_url_rewrite(regex="", replace="a" * 1025)], _REPLACE_LENGTH),
+    ([_url_rewrite(regex="([", replace="a" * 1025)], _REPLACE_LENGTH),
+    ([_url_rewrite(regex="([" + "a" * 1023)], _REGEX_LENGTH),
+    ([_url_rewrite(regex="\u20ac" * 1025)], _REGEX_LENGTH),
+    ([_url_rewrite(regex="\u00e9", replace="a" * 1025)], _REPLACE_LENGTH),
+    ([_url_rewrite(regex="\u00e9(")], _REGEX_ASCII),
+    ([_url_rewrite(regex="(\u00e9")], _REGEX_ASCII),
+    ([_url_rewrite(regex="\u00e9"), _host_rewrite(regex="")], _REGEX_ASCII),
+    ([_url_rewrite(regex="(["), _host_rewrite(regex="\u00e9")], _REGEX_INVALID),
+    ([_url_rewrite(regex="([", replace="a b")], _REPLACE_CHARS),
+    ([_url_rewrite(regex="", replace="a b")], _REPLACE_CHARS),
+    ([_url_rewrite(regex="\u00e9", replace="a b")], _REPLACE_CHARS),
+    ([_url_rewrite(replace="a b"), _url_rewrite()], _DUPLICATE),
+    ([_url_rewrite(replace="a b"), _host_rewrite(regex="")], _REPLACE_CHARS),
+    ([_url_rewrite(replace=" " * 1025)], _REPLACE_LENGTH),
+], ids=["duplicate-before-length", "duplicate-before-syntax", "duplicate-before-config", "duplicate-of-three",
+        "first-transform-first", "replace-length-first", "rewrite-count-first", "syntax-in-first",
+        "length-in-first", "unsupported-before-count", "count-before-length", "replace-before-regex",
+        "replace-before-syntax", "length-before-syntax", "length-before-ascii", "replace-before-ascii",
+        "ascii-before-syntax", "ascii-before-syntax-2", "ascii-in-first", "syntax-before-ascii-in-second",
+        "replace-chars-before-syntax", "replace-chars-before-length", "replace-chars-before-ascii",
+        "duplicate-before-replace-chars", "replace-chars-in-first", "replace-length-before-chars"])
+def test_elbv2_rule_transform_checks_run_in_aws_order(raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex and U6:create, 2310-uncertainties-2
+    V1:ascii and V3:order, 2310-uncertainties-3 W2:replace-order). The duplicate-type check
+    covers every transform first; the rest run transform by transform."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=transforms)
+    _refused(exc, message)
+
+
+# Regex values AWS accepted and refused, captured 2026-10-21.
+_REGEX_ACCEPTED = [
+    "\\d+", "\\w+", "\\s", "[[:alpha:]]", "(?<n>x)", "(?P<n>x)", "a+?", "a++", "a*+", "\\b", "(?i)a", "a{2,3}",
+    "a**", "a|", "|", "(?:a)", "\\x41", "\\u0041", "\\A", "\\z", "$", "^", ".*", "(?s).", "(?m)^a", "(?R)",
+    "a{1001}", "]", "}", "a\x7fb", "(?R)a", "a**b", "a{2}{3}", "(?i:a)", "(?-i)a", "(?U)a", "[a-z&&b]", "[\\w-]",
+    "x{1000}", "x{1001,}", "\\x{41}", "\\(?=a", "[(?=a]", "a{1,2}{3}", "(?i)(?x)a", "(?ix)a", "(?xi)a", "\\z\\A",
+    "\\B", "\\v", "\\f", "\\a", "\\t", "\\n", "\\r", "\\$", "\\/", "\\-", "(?u)a", "(?:)a",
+    "a*{2}", "a+*", "a?*", "a{2}*", "a**b(c)", "[[:foo:]]", "[[:ALPHA:]]", "[[:digit:][:space:]]", "[[:^alpha:]]",
+    "[[=a=]]", "[[.a.]]",
+]
+_REGEX_REFUSED = [
+    "(?=a)", "(?!a)", "(?<=a)b", "(?<!a)b", "(a)\\1", "(?>a)", "\\p{L}", "\\pL", "\\X", "\\Q.\\E", "a{,3}", "a{3,2}",
+    "\\", "*a", "[a-", "[z-a]", ")", "(", "(?<n>x)\\k<n>", "\\1", "\\cA", "\\Z", "(?#c)a", "(?x) a", "\\G", "\\R",
+    "\\h", "\\K", "(?|a)", "\\N", "[", "{", "a{", "a{1", "\\e", "\\o{101}", "\\101", "(?P=n)", "(?P<n>x)(?P=n)",
+    "\\Z\\z", "[\\d-z]", "[^]", "([" + "a" * 1022, "(?<n>x)(?P=n)", "\\Qa", "(?P<n>x)|(?P<n>y)", "(a)(?(1)b|c)",
+    "\\0", "\\08", "\\p{Greek}", "\\d{,3}", "(?=", "a b", "a\tb", " ", "a\nb", "( ",
+    "(?Q)a", "(?z)a", "(?q:a)", "(?a)a", "(?L)a", "(?n)a", "(?J)a", "(?)a",
+    "a**(", "a**[", "a**)", "a{2}{3}(", "[[:alpha:]",
+]
+
+
+def test_elbv2_rule_transform_regex_syntax_follows_aws(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex, 2310-uncertainties-2
+    V1:ascii and V2:regex-more, 2310-uncertainties-4 X1:api, 2310-uncertainties-5
+    Y1:regex). Each Regex is sent on its own url-rewrite."""
+    wrong = []
+    for regex in _REGEX_ACCEPTED + _REGEX_REFUSED:
+        try:
+            rule = _transform_rule(raw_elbv2, transform_listener, Transforms=[_url_rewrite(regex=regex)])
+            elbv2.delete_rule(RuleArn=rule["RuleArn"])
+            got = None
+        except ClientError as exc:
+            got = exc.response["Error"]["Message"]
+        if got != (None if regex in _REGEX_ACCEPTED else _REGEX_INVALID):
+            wrong.append((regex, got))
+    assert wrong == []
+
+
+@pytest.mark.parametrize("transform, message", [
+    (_url_rewrite(regex="\u00e9"), _REGEX_ASCII),
+    (_url_rewrite(regex="\u20ac" * 1024), _REGEX_ASCII),
+    (_url_rewrite(replace="/\u00e9"), _REPLACE_CHARS),
+    (_url_rewrite(replace="/a b"), _REPLACE_CHARS),
+    (_url_rewrite(replace=" "), _REPLACE_CHARS),
+    (_url_rewrite(replace="\t"), _REPLACE_CHARS),
+    (_url_rewrite(replace="a\x7fb"), _REPLACE_CHARS),
+    (_host_rewrite(regex="a b"), _REGEX_INVALID),
+    (_host_rewrite(replace="\u00e9"), _REPLACE_CHARS),
+    (_host_rewrite(regex="(["), _REGEX_INVALID),
+], ids=["regex-non-ascii", "regex-1024-non-ascii", "replace-non-ascii", "replace-space", "replace-only-space",
+        "replace-tab", "replace-del", "host-regex-space", "host-replace-non-ascii", "host-invalid-regex"])
+def test_elbv2_rule_transform_characters_are_checked(raw_elbv2, transform_listener, transform, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex, 2310-uncertainties-2 V1:ascii,
+    2310-uncertainties-3 W2:replace-order)."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=[transform])
+    _refused(exc, message)
+
+
+def test_elbv2_rule_transform_replace_takes_any_printable_ascii(raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex replace_with_regex_^/a$,
+    2310-uncertainties-3 W2:replace-order replace-tilde-bang)."""
+    for replace in ("$1", "$10", "${1}", "${name}", "$", "\\1", "\\", "$$", "{host}", "#{host}", "~!"):
+        rule = _transform_rule(raw_elbv2, transform_listener, Transforms=[_url_rewrite(regex="^/a$", replace=replace)])
+        assert rule["Transforms"][0]["UrlRewriteConfig"]["Rewrites"][0]["Replace"] == replace
+
+
+def test_elbv2_modify_rule_transforms_and_reset_transforms_conflict(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C27;
+    2310-uncertainties U4:nothing-to-modify, U6:modify). The conflict comes after
+    the model check and before the other transform checks, and an empty
+    Transforms list counts."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    conflict = "Transforms cannot be provided when resetting transforms"
+    for transforms, message in (
+            ([_host_rewrite()], conflict),
+            ([], conflict),
+            ([_url_rewrite(), _url_rewrite(regex="")], conflict),
+            ([_url_rewrite(regex="([")], conflict),
+            ([{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+             "1 validation error detected: Value 'path-rewrite' at 'transforms.1.member.type' failed to satisfy "
+             "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]")):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=transforms, ResetTransforms=True)
+        _refused(exc, message)
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+
+def test_elbv2_modify_rule_needs_something_to_change(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C38;
+    2310-uncertainties U4:nothing-to-modify). An empty Transforms list changes
+    nothing, alone or next to Conditions or Actions."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    nothing = "You must provide either conditions, actions, or transforms"
+    for params in ({}, {"ResetTransforms": False}, {"Transforms": []},
+                   {"Transforms": [], "ResetTransforms": False}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], **params)
+        _refused(exc, nothing)
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+    changed = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[],
+                                Conditions=[{"Field": "path-pattern", "Values": ["/u4/*"]}])["Rules"][0]
+    assert changed["Transforms"] == [_url_rewrite()]
+    assert changed["Conditions"][0]["Values"] == ["/u4/*"]
+    elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[],
+                      Actions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "201"}}])
+    after = _described_rule(elbv2, rule["RuleArn"])
+    assert after["Transforms"] == [_url_rewrite()]
+    assert after["Actions"][0]["FixedResponseConfig"]["StatusCode"] == "201"
+
+
+def test_elbv2_default_rule_cannot_be_modified(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C28, C35, C36;
+    2310-uncertainties U3:default-rule). The transform checks, the conflict and
+    "You must provide ..." come first."""
+    default = _default_rule(elbv2, transform_listener)
+    arn = default["RuleArn"]
+    not_permitted = f"Default rule '{arn}' cannot be modified"
+    for params, code, message in (
+            ({"Transforms": [_url_rewrite()]}, "OperationNotPermitted", not_permitted),
+            ({"ResetTransforms": True}, "OperationNotPermitted", not_permitted),
+            ({"Conditions": [{"Field": "path-pattern", "Values": ["/d/*"]}]}, "OperationNotPermitted",
+             not_permitted),
+            ({"Actions": [{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404"}}]},
+             "OperationNotPermitted", not_permitted),
+            ({"Conditions": [{"Field": "path-pattern", "Values": ["/d/*"]}], "Transforms": [_url_rewrite()]},
+             "OperationNotPermitted", not_permitted),
+            ({"Transforms": [_url_rewrite()], "ResetTransforms": True}, "ValidationError",
+             "Transforms cannot be provided when resetting transforms"),
+            ({"Transforms": [], "ResetTransforms": True}, "ValidationError",
+             "Transforms cannot be provided when resetting transforms"),
+            ({"Transforms": [_url_rewrite(), _url_rewrite(regex="^/b$")]}, "ValidationError", _DUPLICATE),
+            ({"Transforms": [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}]}, "ValidationError",
+             f"1 validation error detected: {_NULL_TYPE.format(1)}"),
+            ({}, "ValidationError", "You must provide either conditions, actions, or transforms"),
+            ({"ResetTransforms": False}, "ValidationError",
+             "You must provide either conditions, actions, or transforms"),
+            ({"Transforms": []}, "ValidationError", "You must provide either conditions, actions, or transforms")):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=arn, **params)
+        _refused(exc, message, code)
+    assert _default_rule(elbv2, transform_listener) == default
+
+
+_LOOKUP_INPUTS = [
+    ("missing-config", [{"Type": "url-rewrite"}],
+     "For transforms of type 'url-rewrite', you must specify the following field(s): 'UrlRewriteConfig'"),
+    ("no-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("empty-regex", [_url_rewrite(regex="")], _REGEX_LENGTH),
+    ("long-replace", [_url_rewrite(replace="a" * 1025)], _REPLACE_LENGTH),
+    ("invalid-regex", [_url_rewrite(regex="([")], _REGEX_INVALID),
+    ("duplicate-type", [_url_rewrite(), _url_rewrite(regex="^/b$")], _DUPLICATE),
+    ("null-type", [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     f"1 validation error detected: {_NULL_TYPE.format(1)}"),
+    ("null-replace", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null"),
+]
+
+
+@pytest.mark.parametrize("transforms, message", [c[1:] for c in _LOOKUP_INPUTS], ids=[c[0] for c in _LOOKUP_INPUTS])
+def test_elbv2_rule_transforms_are_checked_before_the_lookup(raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C41, C42;
+    2310-uncertainties U5:missing-listener, U5:missing-rule). On a load balancer
+    that exists, a missing listener or rule is reported after the transforms."""
+    missing_listener = transform_listener.rsplit("/", 1)[0] + "/0123456789abcdef"
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, missing_listener, Transforms=transforms)
+    _refused(exc, message)
+    default = _default_rule(raw_elbv2, transform_listener)["RuleArn"]
+    with pytest.raises(ClientError) as exc:
+        raw_elbv2.modify_rule(RuleArn=default.rsplit("/", 1)[0] + "/0123456789abcdef", Transforms=transforms)
+    _refused(exc, message)
+
+
+def test_elbv2_missing_listener_or_rule_after_the_transform_checks(raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U5:missing-listener, U5:missing-rule,
+    2310-uncertainties-3 W1:unknown-lb). The not-found messages are MiniStack's
+    own, shared with other calls, so only the codes are checked. A load balancer
+    that doesn't exist is reported right after the model check."""
+    missing_listener = transform_listener.rsplit("/", 1)[0] + "/0123456789abcdef"
+    for transforms in ([_url_rewrite()], [], None):
+        with pytest.raises(ClientError) as exc:
+            _transform_rule(raw_elbv2, missing_listener, **({} if transforms is None else {"Transforms": transforms}))
+        _refused(exc, None, "ListenerNotFound")
+    parts = transform_listener.split("/")
+    parts[3] = "0000000000000000"
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, "/".join(parts), Transforms=[_url_rewrite(), _url_rewrite(regex="^/b$")])
+    _refused(exc, None, "ListenerNotFound")
+
+    missing_rule = _default_rule(raw_elbv2, transform_listener)["RuleArn"].rsplit("/", 1)[0] + "/0123456789abcdef"
+    for params in ({"Transforms": [_url_rewrite()]}, {"ResetTransforms": True},
+                   {"Conditions": [{"Field": "path-pattern", "Values": ["/x/*"]}]}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=missing_rule, **params)
+        _refused(exc, None, "RuleNotFound")
+    for params, message in (({"Transforms": [_url_rewrite()], "ResetTransforms": True},
+                             "Transforms cannot be provided when resetting transforms"),
+                            ({}, "You must provide either conditions, actions, or transforms"),
+                            ({"Transforms": []}, "You must provide either conditions, actions, or transforms")):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=missing_rule, **params)
+        _refused(exc, message)
+    parts = missing_rule.split("/")
+    parts[3] = "0000000000000000"
+    unknown_lb_rule = "/".join(parts)
+    for params in ({"Transforms": [_url_rewrite(), _url_rewrite(regex="^/b$")]},
+                   {"Transforms": [{"Type": "url-rewrite"}]},
+                   {"Transforms": [_url_rewrite()], "ResetTransforms": True}, {}, {"Transforms": []},
+                   {"ResetTransforms": True}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=unknown_lb_rule, **params)
+        _refused(exc, None, "RuleNotFound")
+    null_type = [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}]
+    with pytest.raises(ClientError) as exc:
+        raw_elbv2.modify_rule(RuleArn=unknown_lb_rule, Transforms=null_type)
+    _refused(exc, f"1 validation error detected: {_NULL_TYPE.format(1)}")
+    parts = transform_listener.split("/")
+    parts[3] = "0000000000000000"
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, "/".join(parts), Transforms=null_type)
+    _refused(exc, f"1 validation error detected: {_NULL_TYPE.format(1)}")
+    for transforms in ([{"Type": "url-rewrite"}], [_url_rewrite(regex="([")]):
+        with pytest.raises(ClientError) as exc:
+            _transform_rule(raw_elbv2, "/".join(parts), Transforms=transforms)
+        _refused(exc, None, "ListenerNotFound")
+
+
+def test_elbv2_set_rule_priorities_returns_rules_without_transforms(elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U8:set-rule-priorities). The
+    response's rules carry no Transforms element, with or without transforms."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite(), _host_rewrite()])
+    moved = elbv2.set_rule_priorities(RulePriorities=[{"RuleArn": rule["RuleArn"], "Priority": 40000}])["Rules"][0]
+    assert moved["Priority"] == "40000"
+    assert "Transforms" not in moved
+    assert _by_type(_described_rule(elbv2, rule["RuleArn"])["Transforms"]) == _by_type(
+        [_url_rewrite(), _host_rewrite()])
+
+
+def test_elbv2_rule_transforms_survive_a_state_round_trip(monkeypatch, tmp_path):
+    """Rules persist as dicts, so their Transforms come back after a save and restore."""
+    from ministack.core import persistence
+    from ministack.services import alb
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    alb.reset()
+    try:
+        lb_arn = re.search(rb"<LoadBalancerArn>([^<]+)", alb._create_lb(
+            {"Name": ["persist-tx"]})[2]).group(1).decode()
+        l_arn = re.search(rb"<ListenerArn>([^<]+)", alb._create_listener(
+            {"LoadBalancerArn": [lb_arn], "Port": ["80"]})[2]).group(1).decode()
+        prefix = "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1"
+        status, _, body = alb._create_rule({
+            "ListenerArn": [l_arn], "Priority": ["5"],
+            "Transforms.member.1.Type": ["url-rewrite"],
+            f"{prefix}.Regex": ["^/app/(.*)$"], f"{prefix}.Replace": ["/$1"],
+        })
+        assert status == 200, body
+        rule_arn = re.search(rb"<RuleArn>([^<]+)", body).group(1).decode()
+
+        persistence.save_state("alb", alb.get_state())
+        alb.reset()
+        alb.load_persisted_state(persistence.load_state("alb"))
+
+        assert alb._rules[rule_arn]["Transforms"] == [
+            {"Type": "url-rewrite",
+             "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/app/(.*)$", "Replace": "/$1"}]}},
+        ]
+    finally:
+        alb.reset()
+
+
+def _elbv2_query(params):
+    """POST a raw ELBv2 Query request, for wire forms boto3 never sends."""
+    from urllib.parse import urlencode as _urlencode
+
+    req = _req.Request(_endpoint + "/", data=_urlencode({"Version": "2015-12-01", **params}).encode(), headers={
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/elasticloadbalancing/aws4_request, "
+                         "SignedHeaders=host, Signature=0"})
+    try:
+        with _req.urlopen(req) as resp:
+            return resp.status, resp.read().decode()
+    except HTTPError as exc:
+        return exc.code, exc.read().decode()
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({"Type": "url-rewrite", "UrlRewriteConfig.Rewrites.member.1.Foo": "x"},
+     "2 validation errors detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null; Value null at "
+     "'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' failed to satisfy constraint: "
+     "Member must not be null"),
+    ({"Type": "url-rewrite", "UrlRewriteConfig.Rewrites.member.1.Regex": "^/a$",
+      "UrlRewriteConfig.Rewrites.member.1.Foo": "x"},
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null"),
+    ({"Type": "url-rewrite", "UrlRewriteConfig.Foo": "x"}, "Rule transforms must have exactly one Rewrite"),
+    ({"Foo": "x"}, f"1 validation error detected: {_NULL_TYPE.format(1)}"),
+], ids=["rewrite-only-unknown", "rewrite-regex-and-unknown", "config-only-unknown", "transform-only-unknown"])
+def test_elbv2_rule_transform_members_with_unknown_fields(transform_listener, fields, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties-2 V3:order raw-regex-and-replace-null,
+    2310-uncertainties-4 X1:api raw-*). A member counts as sent when any of its
+    keys is, and the unknown keys are ignored."""
+    status, body = _elbv2_query({
+        "Action": "CreateRule", "ListenerArn": transform_listener, "Priority": str(next(_TX_PRIORITY)),
+        "Conditions.member.1.Field": "path-pattern", "Conditions.member.1.Values.member.1": "/raw/*",
+        "Actions.member.1.Type": "fixed-response", "Actions.member.1.FixedResponseConfig.StatusCode": "200",
+        **{f"Transforms.member.1.{k}": v for k, v in fields.items()}})
+    assert status == 400, body
+    assert re.search(r"<Code>(.*?)</Code><Message>(.*?)</Message>", body).groups() == (
+        "ValidationError", message.replace("'", "'"))
+
+
+def test_elbv2_rule_transform_message_echoes_the_type_escaped(raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties-4 X1:api type-xml-chars)."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener,
+                        Transforms=[{"Type": "a&b<c>'\"", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}])
+    _refused(exc, "1 validation error detected: Value 'a&b<c>'\"' at 'transforms.1.member.type' failed to satisfy "
+                  "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]")
+
+
+def test_elbv2_modify_rule_with_empty_conditions_or_actions_changes_nothing(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties-4 X1:api modify-conditions-empty,
+    modify-actions-empty, modify-conditions-and-actions-empty)."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    for params in ({"Conditions": []}, {"Actions": []}, {"Conditions": [], "Actions": []}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], **params)
+        _refused(exc, "You must provide either conditions, actions, or transforms")
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+
+def test_elbv2_target_headers_follow_xff_mode_and_trace_id_rules():
+    from ministack.services import alb
+
+    lb_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/xff-unit/1"
+    listener = {"Protocol": "HTTPS", "Port": 443}
+    try:
+        h = alb._target_headers(lb_arn, listener, {"X-Forwarded-For": "127.0.0.4, 127.0.0.8"}, "127.0.0.1")
+        assert h["x-forwarded-for"] == "127.0.0.4, 127.0.0.8, 127.0.0.1"
+        assert (h["x-forwarded-proto"], h["x-forwarded-port"]) == ("https", "443")
+        assert alb._target_headers(lb_arn, listener, {}, "127.0.0.1")["x-forwarded-for"] == "127.0.0.1"
+        assert alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"},
+                                   "2001:db8::1")["x-forwarded-for"] == "127.0.0.4, [2001:db8::1]"
+
+        trace = alb._target_headers(lb_arn, listener, {"x-amzn-trace-id": "Root=1-67891233-abcdef012345678912345678;CalledFrom=app"},
+                                    "127.0.0.1")["x-amzn-trace-id"].split(";")
+        assert re.fullmatch(r"Self=1-[0-9a-f]{8}-[0-9a-f]{24}", trace[0])
+        assert trace[1:] == ["Root=1-67891233-abcdef012345678912345678", "CalledFrom=app"]
+        trace = alb._target_headers(lb_arn, listener, {"x-amzn-trace-id": "Self=1-00000000-000000000000000000000000;Root=1-67891233-abcdef012345678912345678"},
+                                    "127.0.0.1")["x-amzn-trace-id"].split(";")
+        assert trace[0] != "Self=1-00000000-000000000000000000000000" and len(trace) == 2
+
+        alb._lb_attrs[lb_arn] = [{"Key": "routing.http.xff_header_processing.mode", "Value": "preserve"}]
+        assert alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"}, "127.0.0.1")["x-forwarded-for"] == "127.0.0.4"
+        assert "x-forwarded-for" not in alb._target_headers(lb_arn, listener, {}, "127.0.0.1")
+        alb._lb_attrs[lb_arn] = [{"Key": "routing.http.xff_header_processing.mode", "Value": "remove"}]
+        assert "x-forwarded-for" not in alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"}, "127.0.0.1")
+    finally:
+        alb._lb_attrs.pop(lb_arn, None)
+
+
+def test_elbv2_dataplane_forwards_the_path_as_sent(elbv2):
+    """The target receives the path with its percent-encoding, as the client sent it."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-rawpath"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/reason/Custom%20Thing/a%2Fb")
+        assert json.loads(resp.read())["path"] == "/reason/Custom%20Thing/a%2Fb"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_forwards_repeated_query_keys(elbv2):
+    """The target receives the query string as the client sent it."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-query"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/search?a=1&b=2&a=3&q=x%20y&flag")
+        assert json.loads(resp.read())["path"] == "/search?a=1&b=2&a=3&q=x%20y&flag"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_forwards_options_to_the_target(elbv2):
+    """An OPTIONS request reaches the target, and the client sees the target's status and headers;
+    the gateway answers no preflight of its own for a load balancer."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Allow", "GET, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-options"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", method="OPTIONS",
+                           headers={"Origin": "https://app.example.test", "Access-Control-Request-Method": "GET"})
+        resp = _req.urlopen(req)
+        assert resp.status == 204
+        assert resp.headers.get("Allow") == "GET, OPTIONS"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_passes_accept_encoding_and_a_gzip_response_through(elbv2):
+    """The target receives the client's Accept-Encoding, and its gzip response reaches the client
+    still encoded."""
+    import gzip
+    import http.client
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            gzipped = "gzip" in (self.headers.get("Accept-Encoding") or "")
+            body = gzip.compress(b"compressed hello") if gzipped else b"plain hello"
+            self.send_response(200)
+            if gzipped:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-gzip"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    parsed = urlparse(_endpoint)
+    try:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
+        conn.request("GET", f"/_alb/{lb_name}/", headers={"Accept-Encoding": "gzip"})
+        resp = conn.getresponse()
+        assert resp.getheader("Content-Encoding") == "gzip"
+        assert gzip.decompress(resp.read()) == b"compressed hello"
+        conn.close()
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_adds_no_cors_or_request_id_headers(elbv2):
+    """An ALB passes the target's response headers through; CORS and request ids are the application's."""
+    server, thread = _start_fixed_body_server(b"ok")
+    lb_name = "dp-alb-plain"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/")
+        assert resp.read() == b"ok"
+        names = {name.lower() for name, _ in resp.getheaders()}
+        assert not names & {"access-control-allow-origin", "x-amzn-requestid", "x-amz-request-id"}
+        assert resp.headers["Server"].startswith("BaseHTTP")  # the target's own, not the load balancer's
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_elbv2_dataplane_applies_the_listeners_cors_response_headers(elbv2):
+    """A non-empty routing.http.response.access_control_*.header_value is added to the listener's
+    responses (replacing the target's own), and an empty one reverts to the default."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "https://target.example.test")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-cors"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    prefix = "routing.http.response."
+
+    def fetch():
+        return _req.urlopen(f"{_endpoint}/_alb/{lb_name}/").headers
+
+    try:
+        assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+        assert fetch().get("Access-Control-Allow-Methods") is None
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "access_control_allow_origin.header_value", "Value": "https://app.example.test"},
+            {"Key": prefix + "access_control_allow_methods.header_value", "Value": "GET,POST"},
+        ])
+        headers = fetch()
+        assert headers.get_all("Access-Control-Allow-Origin") == ["https://app.example.test"]
+        assert headers.get("Access-Control-Allow-Methods") == "GET,POST"
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "access_control_allow_origin.header_value", "Value": ""},
+        ])
+        assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+        # The other insert headers on the same page behave the same way.
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "strict_transport_security.header_value", "Value": "max-age=31536000"},
+            {"Key": prefix + "content_security_policy.header_value", "Value": "default-src 'self'"},
+            {"Key": prefix + "x_content_type_options.header_value", "Value": "nosniff"},
+            {"Key": prefix + "x_frame_options.header_value", "Value": "DENY"},
+        ])
+        headers = fetch()
+        assert (headers.get("Strict-Transport-Security"), headers.get("Content-Security-Policy"),
+                headers.get("X-Content-Type-Options"), headers.get("X-Frame-Options")) == (
+            "max-age=31536000", "default-src 'self'", "nosniff", "DENY")
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_listener_certificates_follow_aws(elbv2, tls_lb):
+    """#2459, captured on AWS: extra listener certificates are added one per call, listed before the default one,
+    and the default is never added twice or removed."""
+    from conftest import make_client
+
+    acm = make_client("acm")
+    c0, c1, c2 = (acm.request_certificate(DomainName=f"c{i}-{_uuid_mod.uuid4().hex[:6]}.example.com")["CertificateArn"]
+                  for i in range(3))
+    listener = elbv2.create_listener(
+        LoadBalancerArn=tls_lb(), Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": c0}], DefaultActions=_TLS_ACTION)["Listeners"][0]["ListenerArn"]
+
+    def listed():
+        return elbv2.describe_listener_certificates(ListenerArn=listener)["Certificates"]
+
+    assert listed() == [{"CertificateArn": c0, "IsDefault": True}]
+    with pytest.raises(ClientError) as exc:
+        elbv2.add_listener_certificates(ListenerArn=listener,
+                                        Certificates=[{"CertificateArn": c1}, {"CertificateArn": c2}])
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "ValidationError", "Up to '1' certificate ARNs can be specified, but '2' were specified")
+    missing = c1.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ClientError) as exc:
+        elbv2.add_listener_certificates(ListenerArn=listener, Certificates=[{"CertificateArn": missing}])
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "CertificateNotFound", f"Certificate '{missing}' not found")
+
+    for cert in (c1, c1, c0, c2):
+        added = elbv2.add_listener_certificates(ListenerArn=listener, Certificates=[{"CertificateArn": cert}])
+        assert added["Certificates"] == [{"CertificateArn": cert, "IsDefault": False}]
+    assert listed() == [{"CertificateArn": c1, "IsDefault": False}, {"CertificateArn": c2, "IsDefault": False},
+                        {"CertificateArn": c0, "IsDefault": True}]
+
+    for cert in (c0, missing, c2):
+        elbv2.remove_listener_certificates(ListenerArn=listener, Certificates=[{"CertificateArn": cert}])
+    assert listed() == [{"CertificateArn": c1, "IsDefault": False}, {"CertificateArn": c0, "IsDefault": True}]
+    assert elbv2.describe_listeners(ListenerArns=[listener])["Listeners"][0]["Certificates"] == [
+        {"CertificateArn": c0}]
+
+
+def test_alb_host_resolves_through_route53_alias_records(elbv2, r53):
+    """A host with a public Route 53 alias record (exact or wildcard) reaches the ALB it targets, as AWS DNS
+    resolves it; the most specific name wins, a wildcard skips its apex, a private zone is ignored."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    domain = f"r53alb{suffix}.alb.localhost"
+    lbs = {}
+    for name in ("one", "two"):
+        lb = elbv2.create_load_balancer(Name=f"r53-{name}-{suffix}", Subnets=["subnet-aaa"])["LoadBalancers"][0]
+        elbv2.create_listener(LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80, DefaultActions=[
+            {"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200", "ContentType": "text/plain",
+                                                               "MessageBody": name}}])
+        lbs[name] = lb
+    zone = r53.create_hosted_zone(Name=domain, CallerReference=suffix)["HostedZone"]["Id"]
+    private = r53.create_hosted_zone(Name=f"p.{domain}", CallerReference=f"p{suffix}",
+                                     VPC={"VPCRegion": "us-east-1", "VPCId": "vpc-12345678"},
+                                     HostedZoneConfig={"PrivateZone": True})["HostedZone"]["Id"]
+
+    def alias(zone_id, name, lb, prefix=""):
+        r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch={"Changes": [{
+            "Action": "CREATE", "ResourceRecordSet": {"Name": name, "Type": "A", "AliasTarget": {
+                "HostedZoneId": lb["CanonicalHostedZoneId"], "DNSName": f"{prefix}{lb['DNSName']}.",
+                "EvaluateTargetHealth": False}}}]})
+
+    alias(zone, f"*.{domain}", lbs["one"], "dualstack.")
+    alias(zone, f"exact.{domain}", lbs["two"])
+    alias(zone, f"*.deep.{domain}", lbs["two"])
+    alias(private, f"*.p.{domain}", lbs["two"])
+    r53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={"Changes": [{"Action": "CREATE", "ResourceRecordSet": {
+        "Name": f"plain.{domain}", "Type": "A", "TTL": 60, "ResourceRecords": [{"Value": "10.0.0.1"}]}}]})
+
+    def body(host):
+        req = _req.Request(f"{_endpoint}/", method="GET")
+        req.add_header("Host", f"{host}:{_EXECUTE_PORT}")
+        try:
+            return _req.urlopen(req).read().decode()
+        except HTTPError as e:
+            return e.code
+
+    try:
+        assert body(f"svc.{domain}") == "one"
+        assert body(f"a.b.{domain}") == "one"
+        assert body(f"exact.{domain}") == "two"
+        assert body(f"x.deep.{domain}") == "two"
+        assert body(f"x.p.{domain}") == "one"  # the private zone's record is not used
+        assert body(domain) != "one"  # a wildcard does not answer for its apex
+        assert body(f"plain.{domain}") not in ("one", "two")  # its own non-alias record wins over the wildcard
+    finally:
+        for zone_id in (zone, private):
+            records = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+            changes = [{"Action": "DELETE", "ResourceRecordSet": rs} for rs in records if rs["Type"] == "A"]
+            if changes:
+                r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch={"Changes": changes})
+            r53.delete_hosted_zone(Id=zone_id)
+        for lb in lbs.values():
+            elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+
+
+# ---------------------------------------------------------------------------
+# Data plane across accounts and regions (#2581)
+# ---------------------------------------------------------------------------
+
+def _tenant_client(service, account, region):
+    import boto3
+
+    return boto3.client(service, endpoint_url=_endpoint, region_name=region,
+                        aws_access_key_id=account, aws_secret_access_key="test")
+
+
+def _dataplane_get(path, host=None):
+    req = _req.Request(f"{_endpoint}{path}", method="GET")
+    if host:
+        req.add_header("Host", host)
+    try:
+        resp = _req.urlopen(req)
+    except HTTPError as e:
+        return e.code, e.read()
+    return resp.status, resp.read()
+
+
+def _create_tenant_alb(account, region, name, body):
+    """A load balancer whose listener answers ``body``, a rule to an empty target group
+    and a rule to a Lambda target, all in ``account``/``region``. Returns a teardown."""
+    elbv2 = _tenant_client("elbv2", account, region)
+    lam = _tenant_client("lambda", account, region)
+    created = []
+    try:
+        lb = elbv2.create_load_balancer(Name=name, Type="application")["LoadBalancers"][0]
+        created.append(lambda: elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"]))
+        empty_tg = elbv2.create_target_group(Name=f"{name}-e", TargetType="lambda")["TargetGroups"][0]
+        created.append(lambda: elbv2.delete_target_group(TargetGroupArn=empty_tg["TargetGroupArn"]))
+        lam.create_function(
+            FunctionName=f"{name}-fn", Runtime="python3.12", Handler="index.handler",
+            Role=f"arn:aws:iam::{account}:role/test-role",
+            Code={"ZipFile": _alb_zip(
+                "def handler(event, context):\n"
+                f"    return {{'statusCode': 200, 'body': 'lambda-{body}'}}\n")},
+        )
+        created.append(lambda: lam.delete_function(FunctionName=f"{name}-fn"))
+        fn_arn = lam.get_function(FunctionName=f"{name}-fn")["Configuration"]["FunctionArn"]
+        fn_tg = elbv2.create_target_group(Name=f"{name}-f", TargetType="lambda")["TargetGroups"][0]
+        created.append(lambda: elbv2.delete_target_group(TargetGroupArn=fn_tg["TargetGroupArn"]))
+        elbv2.register_targets(TargetGroupArn=fn_tg["TargetGroupArn"], Targets=[{"Id": fn_arn}])
+        listener = elbv2.create_listener(
+            LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+            DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+                "StatusCode": "200", "ContentType": "text/plain", "MessageBody": body}}],
+        )["Listeners"][0]
+        created.append(lambda: elbv2.delete_listener(ListenerArn=listener["ListenerArn"]))
+        for priority, pattern, tg in ((10, "/tg/*", empty_tg), (20, "/fn/*", fn_tg)):
+            elbv2.create_rule(
+                ListenerArn=listener["ListenerArn"], Priority=priority,
+                Conditions=[{"Field": "path-pattern", "PathPatternConfig": {"Values": [pattern]}}],
+                Actions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+            )
+    except Exception:
+        _run_teardown(created)
+        raise
+    return lb, lambda: _run_teardown(created)
+
+
+def _run_teardown(created):
+    for undo in reversed(created):
+        try:
+            undo()
+        except Exception:
+            pass
+
+
+@pytest.mark.parametrize("account,region", [
+    ("111122223333", "us-east-1"),
+    ("000000000000", "us-east-2"),
+    ("000000000000", "us-east-1"),
+], ids=["other-account", "other-region", "default-tenant"])
+def test_elbv2_dataplane_reaches_load_balancer_in_any_tenant(account, region):
+    """An unsigned request reaches a load balancer in any account and region by DNSName,
+    {name}.alb.localhost or /_alb/{name}/, and its listener, rules, target groups and
+    Lambda targets resolve in the load balancer's own tenant (#2581)."""
+    name = f"dpt-{_uuid_mod.uuid4().hex[:8]}"
+    lb, teardown = _create_tenant_alb(account, region, name, f"hello-{name}")
+    try:
+        assert f".{region}.elb.amazonaws.com" in lb["DNSName"]
+        for prefix, host in (("", lb["DNSName"]), ("", f"{name}.alb.localhost"), (f"/_alb/{name}", None)):
+            assert _dataplane_get(f"{prefix}/x", host) == (200, f"hello-{name}".encode())
+            assert _dataplane_get(f"{prefix}/tg/x", host)[0] == 503
+            assert _dataplane_get(f"{prefix}/fn/x", host) == (200, f"lambda-hello-{name}".encode())
+    finally:
+        teardown()
+
+
+def test_elbv2_dataplane_name_in_two_tenants_resolves_in_the_default_tenant_first():
+    """An unsigned request runs as the default account and region. A name used there and in
+    another account reaches the default tenant's load balancer by name; the other stays
+    reachable by its DNSName, and by name once the default tenant's is gone (#2581)."""
+    name = f"dpd-{_uuid_mod.uuid4().hex[:8]}"
+    other_lb, other_teardown = _create_tenant_alb("111122223333", "us-east-1", name, "other")
+    try:
+        own_lb, own_teardown = _create_tenant_alb("000000000000", "us-east-1", name, "own")
+        try:
+            assert _dataplane_get("/x", f"{name}.alb.localhost") == (200, b"own")
+            assert _dataplane_get(f"/_alb/{name}/x") == (200, b"own")
+            assert _dataplane_get("/x", own_lb["DNSName"]) == (200, b"own")
+            assert _dataplane_get("/x", other_lb["DNSName"]) == (200, b"other")
+            assert _dataplane_get("/fn/x", other_lb["DNSName"]) == (200, b"lambda-other")
+        finally:
+            own_teardown()
+        assert _dataplane_get(f"/_alb/{name}/x") == (200, b"other")
+    finally:
+        other_teardown()
+
+
+def test_elbv2_xml_special_characters_are_escaped(elbv2):
+    lb_arn = elbv2.create_load_balancer(Name=f"qa-alb-esc-{_uuid_mod.uuid4().hex[:6]}")["LoadBalancers"][0][
+        "LoadBalancerArn"]
+    body = "<h1>R&D</h1>"
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=8081,
+        DefaultActions=[{"Type": "fixed-response",
+                         "FixedResponseConfig": {"StatusCode": "200", "ContentType": "text/html",
+                                                 "MessageBody": body}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        listener = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+        assert listener["DefaultActions"][0]["FixedResponseConfig"]["MessageBody"] == body
+        rule = elbv2.create_rule(
+            ListenerArn=l_arn, Priority=5,
+            Conditions=[{"Field": "path-pattern", "Values": ["/r&d/<x>"]}],
+            Actions=[{"Type": "authenticate-oidc", "Order": 1,
+                      "AuthenticateOidcConfig": {"Issuer": "https://idp.example.com",
+                                                 "AuthorizationEndpoint": "https://idp.example.com/auth?a=1&b=2",
+                                                 "TokenEndpoint": "https://idp.example.com/token?a=1&b=2",
+                                                 "UserInfoEndpoint": "https://idp.example.com/me?a=1&b=2",
+                                                 "ClientId": "client", "ClientSecret": "secret"}},
+                     {"Type": "fixed-response", "Order": 2,
+                      "FixedResponseConfig": {"StatusCode": "200", "MessageBody": body}}],
+        )["Rules"][0]
+        assert rule["Conditions"][0]["Values"] == ["/r&d/<x>"]
+        oidc = rule["Actions"][0]["AuthenticateOidcConfig"]
+        assert oidc["AuthorizationEndpoint"] == "https://idp.example.com/auth?a=1&b=2"
+        assert oidc["UserInfoEndpoint"] == "https://idp.example.com/me?a=1&b=2"
+        elbv2.add_tags(ResourceArns=[lb_arn], Tags=[{"Key": "team", "Value": "R&D <ops>"}])
+        tags = elbv2.describe_tags(ResourceArns=[lb_arn])["TagDescriptions"][0]["Tags"]
+        assert {"Key": "team", "Value": "R&D <ops>"} in tags
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)

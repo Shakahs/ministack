@@ -46,7 +46,8 @@ from ministack.core.responses import (
     now_iso,
     request_scope,
 )
-from ministack.services._dynamodb_keywords import AWS_KEYWORDS
+from ministack.services._dynamodb_keywords import AWS_KEYWORDS, PartiqlError
+from ministack.services._dynamodb_keywords import parse_statement as parse_partiql_statement
 
 logger = logging.getLogger("dynamodb")
 
@@ -276,17 +277,12 @@ _DDB_MAX_NESTING_DEPTH = 32
 
 
 def _ddb_canonicalize_number(s: str) -> str | None:
-    """Validate a DynamoDB Number string and return its canonical form, or None
-    if invalid. Mirrors AWS behavior: numbers are stored as variable-precision
-    decimals (up to 38 significant digits, magnitude between 1E-130 and
-    9.9999E+125 inclusive). AWS canonicalizes: strips leading zeros, strips
-    trailing zeros after the decimal point, normalizes negative zero to "0".
-    Returns the canonical string the caller should persist, or None if the
-    value is out of range / malformed.
-    """
+    """The canonical form of a Number string, or None when DynamoDB refuses it."""
     if s is None:
         return None
     if not isinstance(s, str) or not s:
+        return None
+    if _number_error(s):
         return None
     # AWS rejects numbers with whitespace or underscores even though Python's
     # Decimal() accepts them (e.g. " 5", "5 ", "1_000").
@@ -323,7 +319,6 @@ def _ddb_canonicalize_number(s: str) -> str | None:
         return None
     # Canonical string: use Decimal's normalize but format without trailing zeros
     # and without unnecessary leading zeros.
-    norm = d.normalize()
     # Decimal's normalize() returns scientific notation for very large/small;
     # we want the human-readable form when reasonable. Format manually.
     sign_str = "-" if sign else ""
@@ -347,6 +342,36 @@ _NESTING_MSG = ("Nesting Levels have exceeded supported limits: "
                 "Attributes in the item have nested levels beyond supported limit")
 
 
+# Past this leaf level the single-item operations refuse a value by a second check.
+_DDB_SECOND_NESTING_LEVEL = 62
+
+
+def _nesting_level(value, depth: int = 1) -> int:
+    """Level of the deepest leaf, counting the attribute itself as level 1."""
+    if not isinstance(value, dict) or len(value) != 1:
+        return depth
+    (vtype, vval), = value.items()
+    children = vval.values() if vtype == "M" and isinstance(vval, dict) else (
+        vval if vtype == "L" and isinstance(vval, list) else ())
+    return max((_nesting_level(v, depth + 1) for v in children), default=depth)
+
+
+def _value_nesting_error(values: dict, first_level: int) -> tuple | None:
+    """ExpressionAttributeValues nested past ``first_level`` are refused in the envelope, and past
+    the second limit naming the key."""
+    deepest = None
+    for key, value in values.items():
+        level = _nesting_level(value)
+        if level > _DDB_SECOND_NESTING_LEVEL:
+            return error_response_json("ValidationException",
+                f"ExpressionAttributeValues contains invalid value: {_NESTING_MSG} for key {key}", 400)
+        if level > first_level and deepest is None:
+            deepest = key
+    if deepest is not None:
+        return error_response_json("ValidationException", f"1 validation error detected: {_NESTING_MSG}", 400)
+    return None
+
+
 def _nesting_exceeded(value, depth: int = 1) -> bool:
     if depth > _DDB_MAX_NESTING_DEPTH:
         return True
@@ -358,6 +383,122 @@ def _nesting_exceeded(value, depth: int = 1) -> bool:
     if vtype == "L" and isinstance(vval, list):
         return any(_nesting_exceeded(v, depth + 1) for v in vval)
     return False
+
+
+_NOT_NUMERIC = "The parameter cannot be converted to a numeric value"
+_NUM_OVERFLOW = "Number overflow. Attempting to store a number with magnitude larger than supported range"
+_NUM_UNDERFLOW = "Number underflow. Attempting to store a number with magnitude smaller than supported range"
+_NUM_DIGITS = "Attempting to store more than 38 significant digits in a Number"
+_NUMBER_TEXT_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)(?:[eE]([+-]?\d+))?$")
+
+
+def _number_error(text) -> str | None:
+    """Why DynamoDB refuses a number: the exponent is read as a 64-bit integer before the
+    magnitude (1E-130 to 9.99E+125, zero by the exponent it is written with) and the 38 digits."""
+    if not isinstance(text, str):
+        return f"{_NOT_NUMERIC}: {text}"
+    match = _NUMBER_TEXT_RE.match(text)
+    if not match:
+        return f"{_NOT_NUMERIC}: {text}"
+    exponent = int(match.group(2) or 0)
+    if not -(2 ** 63) <= exponent < 2 ** 63:
+        return f"{_NOT_NUMERIC}: {text}"
+    integer, _, fraction = match.group(1).partition(".")
+    digits = (integer + fraction).lstrip("0")
+    # BigDecimal's precision - scale - 1; zero has a precision of 1.
+    adjusted = max(len(digits), 1) - (len(fraction) - exponent) - 1
+    if adjusted > _DDB_NUM_POS_MAX_EXP - 1:
+        return _NUM_OVERFLOW
+    if adjusted < _DDB_NUM_NEG_MIN_EXP:
+        return _NUM_UNDERFLOW
+    if len(digits.rstrip("0")) > _DDB_NUM_MAX_DIGITS:
+        return _NUM_DIGITS
+    return None
+
+
+def _duplicate_set_message(vtype: str, members: list) -> str | None:
+    """A set is read into a sorted set: the message lists what was read, in byte order, then the
+    repeat, then the members not yet read."""
+    if vtype == "NS":
+        canon = [_ddb_canonicalize_number(m) if isinstance(m, str) else m for m in members]
+        if len(set(canon)) == len(canon):
+            return None
+        return "One or more parameter values were invalid: Input collection contains duplicates."
+    def order(m):
+        if vtype == "BS":
+            try:
+                return base64.b64decode(m) if isinstance(m, str) else bytes(m)
+            except (ValueError, TypeError):
+                return str(m).encode()
+        return str(m).encode("utf-8")
+    seen = {}
+    for i, member in enumerate(members):
+        k = order(member)
+        if k in seen:
+            shown = [seen[x] for x in sorted(seen)] + [member] + list(members[i + 1:])
+            if vtype == "BS":
+                return ("One or more parameter values were invalid: Input collection "
+                        f"{json.dumps(shown, separators=(',', ':'))}of type BS contains duplicates.")
+            return ("One or more parameter values were invalid: Input collection "
+                    f"{json.dumps(shown, ensure_ascii=False)} contains duplicates.")
+        seen[k] = member
+    return None
+
+
+def _attribute_value_error(value) -> str | None:
+    """The first bad number or duplicate set member in a value, in document order."""
+    if not isinstance(value, dict) or len(value) != 1:
+        return None
+    (vtype, vval), = value.items()
+    if vtype == "N":
+        return _number_error(vval)
+    if vtype in ("SS", "NS", "BS") and isinstance(vval, list):
+        if vtype == "NS":
+            for member in vval:
+                err = _number_error(member)
+                if err:
+                    return err
+        return _duplicate_set_message(vtype, vval)
+    if vtype == "M" and isinstance(vval, dict):
+        children = vval.values()
+    elif vtype == "L" and isinstance(vval, list):
+        children = vval
+    else:
+        return None
+    for child in children:
+        err = _attribute_value_error(child)
+        if err:
+            return err
+    return None
+
+
+def _request_values(data) -> list:
+    """Every attribute value a single-table request carries."""
+    values = []
+    for field in ("Item", "Key", "ExclusiveStartKey", "ExpressionAttributeValues"):
+        container = data.get(field)
+        if isinstance(container, dict):
+            values.extend(container.values())
+    for field in ("AttributeUpdates", "Expected"):
+        for spec in (data.get(field) or {}).values() if isinstance(data.get(field), dict) else ():
+            if isinstance(spec, dict):
+                if "Value" in spec:
+                    values.append(spec["Value"])
+                values.extend(spec.get("AttributeValueList") or [])
+    for field in ("KeyConditions", "QueryFilter"):
+        for spec in (data.get(field) or {}).values() if isinstance(data.get(field), dict) else ():
+            if isinstance(spec, dict):
+                values.extend(spec.get("AttributeValueList") or [])
+    return values
+
+
+def _values_error_response(values, envelope: bool) -> tuple | None:
+    for value in values:
+        err = _attribute_value_error(value)
+        if err:
+            return error_response_json("ValidationException",
+                                       f"1 validation error detected: {err}" if envelope else err, 400)
+    return None
 
 
 def _validate_attribute_value(attr_name: str, value: dict, _depth: int = 1) -> tuple | None:
@@ -580,9 +721,40 @@ _ITEM_SIZE_MSG = "Item size has exceeded the maximum allowed size"
 _UPDATE_SIZE_MSG = "Item size to update has exceeded the maximum allowed size"
 
 
-def _update_statement_size(item: dict, expr: str, attr_names: dict) -> int:
-    """UpdateItem's size: the top-level attributes it writes plus 3, 19 per SET/ADD
-    action (20 through a list index) and 2 per REMOVE/DELETE action."""
+def _update_request_charge(expr: str, attr_values: dict, attr_names: dict, item_before: dict) -> int:
+    """UpdateItem's charge for the request: 3, plus 19 and the target and operands per SET or ADD,
+    1 and the target per REMOVE or DELETE. A target costs its first name and 4 plus each later
+    element; a path operand 1 and 14 plus each element; a value its size at every use; + and -
+    34 and 37, if_not_exists 39 and list_append 37 plus their operands."""
+    names = attr_names or {}
+    values = attr_values or {}
+
+    def element(part):
+        return len(str(part)) if isinstance(part, int) else len(part.encode("utf-8"))
+
+    def target_cost(path):
+        return element(path[0]) + sum(4 + element(p) for p in path[1:]) if path else 0
+
+    def operand(tokens):
+        if not tokens:
+            return 0
+        if tokens[0][0] == "VALUE_REF" and len(tokens) == 1:
+            return _attribute_value_size(values.get(tokens[0][1]))
+        if tokens[0][0] == "IDENT" and len(tokens) > 1 and tokens[1][0] == "LPAREN":
+            close = _find_matching_paren(tokens, 1)
+            args = sum(expression(arg) for arg in _split_by_comma(tokens[2:close]))
+            return {"if_not_exists": 39, "list_append": 37}.get(tokens[0][1], 0) + args
+        return 1 + sum(14 + element(p) for p in _parse_path_from_tokens(tokens, names))
+
+    def expression(tokens):
+        depth = 0
+        for i, tok in enumerate(tokens):
+            depth += tok[0] == "LPAREN"
+            depth -= tok[0] == "RPAREN"
+            if depth == 0 and tok[0] in ("PLUS", "MINUS") and i > 0:
+                return (34 if tok[0] == "PLUS" else 37) + operand(tokens[:i]) + operand(tokens[i + 1:])
+        return operand(tokens)
+
     clauses = []
     for tok in _tokenize(expr):
         if tok[0] == "IDENT" and tok[1].upper() in ("SET", "REMOVE", "ADD", "DELETE"):
@@ -590,18 +762,24 @@ def _update_statement_size(item: dict, expr: str, attr_names: dict) -> int:
         elif tok[0] != "EOF" and clauses:
             clauses[-1][1].append(tok)
     size = 3
-    written = set()
     for clause, tokens in clauses:
         for action in _split_by_comma(tokens):
-            path = _parse_path_from_tokens(action, attr_names or {})
-            if not path:
-                continue
-            size += 19 if clause in ("SET", "ADD") else 2
-            if clause == "SET" and any(isinstance(p, int) for p in path):
-                size += 1
-            written.add(path[0])
-    return size + sum(len(n.encode("utf-8")) + _attribute_value_size(item[n]) for n in written if n in item)
-
+            if clause == "SET":
+                eq = next((i for i, t in enumerate(action) if t[0] == "EQ"), len(action))
+                size += 19 + target_cost(_parse_path_from_tokens(action[:eq], names)) + expression(action[eq + 1:])
+            elif clause == "ADD":
+                path = _parse_path_from_tokens(action[:-1], names)
+                added = values.get(action[-1][1]) if action[-1][0] == "VALUE_REF" else None
+                current = _get_at_path(item_before, path) if path else None
+                if isinstance(added, dict) and isinstance(current, dict):
+                    (atype, members), = added.items()
+                    if atype in ("SS", "NS", "BS") and atype in current:
+                        added = {atype: [m for m in members if m not in current[atype]]}
+                size += 19 + target_cost(path) + _attribute_value_size(added)
+            else:
+                path_tokens = action[:-1] if clause == "DELETE" and action[-1][0] == "VALUE_REF" else action
+                size += 1 + target_cost(_parse_path_from_tokens(path_tokens, names))
+    return size
 
 def _key_length_error(item: dict, pk_name: str | None, sk_name: str | None) -> tuple | None:
     # Key attribute value length limits: partition key max 2048 bytes, sort key max 1024 bytes.
@@ -783,6 +961,10 @@ def closed_stream(stream_arn: str) -> dict | None:
         del records[:expired]
         closed["trimmed"] += expired
     return closed
+
+
+def _stream_enabled(table_or_request):
+    return bool((table_or_request.get("StreamSpecification") or {}).get("StreamEnabled"))
 
 
 def drop_stream_records(table_name: str, table: dict | None = None) -> None:
@@ -1017,7 +1199,12 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     handler = handlers.get(action)
     if not handler:
         return error_response_json("UnknownOperationException", f"Unknown operation: {action}", 400)
-    status, resp_headers, resp_body = handler(data)
+    owner = _foreign_item_owner(action, data)
+    if owner:
+        with request_scope(owner, get_region()):
+            status, resp_headers, resp_body = handler(data)
+    else:
+        status, resp_headers, resp_body = handler(data)
     # Add CRC32 checksum — Go SDK v2 DynamoDB client validates this on Close()
     import zlib
     body_bytes = resp_body if isinstance(resp_body, bytes) else resp_body.encode("utf-8")
@@ -1066,7 +1253,41 @@ def _sse_description_from_spec(spec: dict | None) -> dict | None:
     return desc
 
 
-def _validate_data_plane_table_name(name) -> tuple | None:
+_EXPR_IDENT = re.compile(r"[A-Za-z0-9_#:]")
+
+
+def _leading_underscore_error(data, fields, envelope):
+    """A bare name starting with "_" is a syntax error in every expression; `near` is the token
+    before it, the underscore and the name after it, as written."""
+    for field in fields:
+        expr = data.get(field)
+        if not isinstance(expr, str):
+            continue
+        for i, ch in enumerate(expr):
+            if ch != "_" or (i and _EXPR_IDENT.match(expr[i - 1])) or (i and expr[i - 1] == "."):
+                continue
+            end = i + 1
+            while end < len(expr) and re.match(r"[A-Za-z0-9]", expr[end]):
+                end += 1
+            start = i
+            j = i
+            while j and expr[j - 1].isspace():
+                j -= 1
+            if j:
+                k = j - 1
+                if _EXPR_IDENT.match(expr[k]):
+                    while k and _EXPR_IDENT.match(expr[k - 1]):
+                        k -= 1
+                elif k and expr[k - 1:j] in ("<=", ">=", "<>"):
+                    k -= 1
+                start = k
+            message = f'Invalid {field}: Syntax error; token: "_", near: "{expr[start:end]}"'
+            return error_response_json("ValidationException",
+                ("1 validation error detected: " if envelope else "") + message, 400)
+    return None
+
+
+def _validate_data_plane_table_name(name, both: bool = False) -> tuple | None:
     """Used by PutItem/GetItem/DeleteItem/UpdateItem/Query/Scan: returns a
     ValidationException for null, empty, too-long, or pattern-violating
     table names — BEFORE any other validators fire so the conformance
@@ -1083,12 +1304,159 @@ def _validate_data_plane_table_name(name) -> tuple | None:
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     if name.startswith("arn:"):
         return None  # A table ARN not in this account and region answers ResourceNotFoundException.
-    if len(name) > 255:
+    # Measured in characters; the first broken constraint alone, except UpdateItem lists the pattern then the length.
+    prefix = f"Value '{name}' at 'tableName' failed to satisfy constraint: Member must "
+    length = ("have length greater than or equal to 3" if len(name) < 3
+              else "have length less than or equal to 255" if len(name) > 255 else None)
+    pattern = None if re.fullmatch(r"[A-Za-z0-9_.\-]+", name) else "satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+    broken = [r for r in ((pattern, length) if both else (length, pattern)) if r]
+    if not both:
+        broken = broken[:1]
+    if broken:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
-    if not re.match(r"^[A-Za-z0-9_.\-]+$", name):
+            f"{len(broken)} validation error{'s' if len(broken) > 1 else ''} detected: "
+            + "; ".join(prefix + r for r in broken), 400)
+    return None
+
+
+# Regions that answer differently from the rest, per the paritysuite.org split registry.
+_OLDER_VALIDATION_REGIONS = frozenset(("eu-south-2", "me-central-1"))
+_OLDER_BATCH_GET_REGIONS = frozenset(("me-central-1",))
+_ECHOING_SCAN_REGIONS = frozenset(("me-central-1",))  # paritysuite.org split registry, 2026-11-14
+# Regions where UpdateItem accepts a 32-level ExpressionAttributeValue (same registry, 2026-11-14).
+_DEEP_EAV_REGIONS = frozenset((
+    "af-south-1", "ap-east-2", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-south-2",
+    "ap-southeast-1", "ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+    "ca-central-1", "eu-central-1", "eu-central-2", "eu-north-1", "eu-south-1", "eu-west-1", "eu-west-2",
+    "il-central-1", "sa-east-1", "us-east-2"))
+
+
+def _older_validation_region() -> bool:
+    return get_region() in _OLDER_VALIDATION_REGIONS
+
+
+def _older_member_errors(data, op: str) -> tuple | None:
+    """Where PutItem (empty table name and bad ReturnValues) and UpdateItem (bad ReturnValues and
+    ReturnConsumedCapacity) still join their member errors in the older per-value form."""
+    rv, rcc = data.get("ReturnValues"), data.get("ReturnConsumedCapacity")
+    bad_rv = rv is not None and rv not in _UPDATE_RV_VALUES
+    bad_rcc = rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES
+    if op == "put" and not (data.get("TableName") == "" and bad_rv and not bad_rcc
+                            and data.get("ReturnItemCollectionMetrics") is None):
+        return None
+    if op == "update" and not (bad_rv and bad_rcc and data.get("TableName") and "Key" in data
+                               and data.get("ReturnItemCollectionMetrics") is None):
+        return None
+    pieces = []
+    rcc = data.get("ReturnConsumedCapacity")
+    if rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES:
+        pieces.append(f"Value '{rcc}' at 'returnConsumedCapacity' failed to satisfy constraint: "
+                      "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]")
+    rv = data.get("ReturnValues")
+    if rv is not None and rv not in _UPDATE_RV_VALUES:
+        pieces.append(f"Value '{rv}' at 'returnValues' failed to satisfy constraint: {_OLDER_RV_ENUM}")
+    if data.get("TableName") == "":
+        pieces.append("Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1")
+    if not pieces:
+        return None
+    return error_response_json("ValidationException",
+        f"{len(pieces)} validation error{'s' if len(pieces) > 1 else ''} detected: " + "; ".join(pieces), 400)
+
+
+def _older_layer_error(data, op: str) -> tuple | None:
+    """PutItem, UpdateItem and DeleteItem read a request without a Key, or with a value nested past
+    the second limit, in an older form: member errors joined in member order, before any table."""
+    key_missing = op != "put" and "Key" not in data
+    if not key_missing and max((_nesting_level(v) for v in _request_values(data)), default=0) <= _DDB_SECOND_NESTING_LEVEL:
+        return None
+    def enum(member, wire, allowed, listed):
+        value = data.get(member)
+        if value is not None and value not in allowed:
+            return f"Value '{value}' at '{wire}' failed to satisfy constraint: Member must satisfy enum value set: [{listed}]"
+        return None
+
+    def absent(member, wire):
+        return f"Value null at '{wire}' failed to satisfy constraint: Member must not be null" if data.get(member) is None else None
+
+    name = data.get("TableName")
+    checks = {
+        "rv": lambda: enum("ReturnValues", "returnValues", _UPDATE_RV_VALUES, "ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW"),
+        "co": lambda: enum("ConditionalOperator", "conditionalOperator", ("AND", "OR"), "OR, AND"),
+        "rvoccf": lambda: enum("ReturnValuesOnConditionCheckFailure", "returnValuesOnConditionCheckFailure",
+                               ("ALL_OLD", "NONE"), "ALL_OLD, NONE"),
+        "rcc": lambda: enum("ReturnConsumedCapacity", "returnConsumedCapacity", _RETURN_CONSUMED_CAPACITY_VALUES,
+                            "INDEXES, TOTAL, NONE"),
+        "ricm": lambda: enum("ReturnItemCollectionMetrics", "returnItemCollectionMetrics", ("SIZE", "NONE"), "SIZE, NONE"),
+        "item": lambda: absent("Item", "item"),
+        "key": lambda: absent("Key", "key"),
+        "name": lambda: (absent("TableName", "tableName") if name is None else
+                         "Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1"
+                         if name == "" else None),
+    }
+    order = {
+        "put": ("rv", "co", "item", "rvoccf", "rcc", "ricm", "name"),
+        "update": ("rcc", "name", "rv", "co", "rvoccf", "ricm", "key"),
+        "delete": ("rv", "co", "rvoccf", "rcc", "ricm", "key", "name"),
+    }[op]
+    pieces = [p for p in (checks[c]() for c in order) if p]
+    if not pieces and isinstance(name, str) and not name.startswith("arn:"):
+        # The name's length (in UTF-16 units) and pattern are checked once every member passes.
+        units = len(name.encode("utf-16-le")) // 2
+        if units < 3:
+            pieces.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3")
+        elif units > 255:
+            pieces.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255")
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name):
+            pieces.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: "
+                          "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
+    if pieces:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
+            f"{len(pieces)} validation error{'s' if len(pieces) > 1 else ''} detected: " + "; ".join(pieces), 400)
+    rv = data.get("ReturnValues")
+    if op == "delete" and rv in _UPDATE_RV_VALUES - _PUT_DELETE_RV_VALUES:
+        return error_response_json("ValidationException", "ReturnValues can only be ALL_OLD or NONE", 400)
+    return None
+
+
+def _expected_error(expected) -> str | None:
+    """The first malformed legacy Expected condition."""
+    if not isinstance(expected, dict):
+        return None
+    for name, cond in expected.items():
+        if not isinstance(cond, dict):
+            continue
+        has_value, has_list = "Value" in cond, "AttributeValueList" in cond
+        op = cond.get("ComparisonOperator")
+        if has_value and has_list:
+            return f"Value and AttributeValueList cannot be used together for Attribute: {name}"
+        if cond.get("Exists") is True and not has_value and not op:
+            return f"Value must be provided when Exists is true for Attribute: {name}"
+        if cond.get("Exists") is False and has_value:
+            return f"Value cannot be used when Exists is false for Attribute: {name}"
+        if op and not has_value and not has_list:
+            return f"Value or AttributeValueList must be used with ComparisonOperator: {op} for Attribute: {name}"
+        if op == "BETWEEN" and len(cond.get("AttributeValueList") or []) != 2:
+            return "Invalid number of argument(s) for the BETWEEN ComparisonOperator"
+    return None
+
+
+def _single_write_request_error(data) -> tuple | None:
+    """Request checks PutItem, UpdateItem and DeleteItem report inside the validation envelope."""
+    for field in ("ExpressionAttributeValues", "ExpressionAttributeNames"):
+        if field in data and data[field] == {}:
+            return error_response_json("ValidationException", f"1 validation error detected: {field} must not be empty", 400)
+    if not any(data.get(f) for f in ("ConditionExpression", "UpdateExpression")):
+        for field in ("ExpressionAttributeValues", "ExpressionAttributeNames"):
+            if data.get(field):
+                return error_response_json("ValidationException",
+                    f"1 validation error detected: {field} can only be specified when using expressions", 400)
+    if "ConditionExpression" in data and isinstance(data["ConditionExpression"], str) and not data["ConditionExpression"].strip():
+        return error_response_json("ValidationException",
+            "1 validation error detected: Invalid ConditionExpression: The expression can not be empty;", 400)
+    err = _expected_error(data.get("Expected"))
+    if err:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: One or more parameter values were invalid: {err}", 400)
     return None
 
 
@@ -1126,11 +1494,41 @@ def _check_per_op_param_enums(data: dict, rv_allowed: set | None, first_only: bo
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _INDEX_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+def _malformed_table_reference(name) -> bool:
+    """A data-plane table reference is a table name or a table ARN."""
+    if not isinstance(name, str):
+        return False
+    if name.startswith("arn:"):
+        return len(name) > 1024
+    return not 3 <= len(name) <= 255 or not _TABLE_NAME_RE.match(name)
 _VALID_ATTR_TYPES = {"S", "N", "B"}
 _VALID_KEY_TYPES = {"HASH", "RANGE"}
 _VALID_BILLING_MODES = {"PROVISIONED", "PAY_PER_REQUEST"}
 _VALID_TABLE_CLASSES = {"STANDARD", "STANDARD_INFREQUENT_ACCESS"}
 _VALID_PROJECTION_TYPES = {"ALL", "KEYS_ONLY", "INCLUDE"}
+
+
+def _name_constraint_errors(name, at, utf16):
+    """Every broken length and pattern constraint on a table or index name, length first.
+    Table names are measured in UTF-16 units; index names and ExclusiveStartTableName in characters."""
+    size = len(name.encode("utf-16-le")) // 2 if utf16 else len(name)
+    out = []
+    if size < 3:
+        out.append((name, at, "Member must have length greater than or equal to 3"))
+    elif size > 255:
+        out.append((name, at, "Member must have length less than or equal to 255"))
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name):
+        out.append((name, at, "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"))
+    return out
+
+
+def _control_plane_name_error(raw):
+    """DescribeTable, DeleteTable and UpdateTable check a plain table name before looking it up."""
+    if not isinstance(raw, str) or raw.startswith("arn:") or not raw:
+        return None
+    return _multi_validation_error(_name_constraint_errors(raw, "tableName", True))
 
 
 def _validate_table_name(name: str) -> tuple | None:
@@ -1140,16 +1538,7 @@ def _validate_table_name(name: str) -> tuple | None:
     if not isinstance(name, str) or not name:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
-    if len(name) < 3:
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", 400)
-    if len(name) > 255:
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
-    if not _TABLE_NAME_RE.match(name):
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
-    return None
+    return _multi_validation_error(_name_constraint_errors(name, "tableName", True))
 
 
 def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tableName") -> tuple | None:
@@ -1217,6 +1606,17 @@ def _create_table(data):
             "The parameter 'TableName' is required but was not present in the request", 400)
     name = data.get("TableName")
     err = _validate_table_name(name)
+    if err:
+        return err
+    # Index names are member constraints, GSIs before LSIs whatever the request's order.
+    failures = []
+    for field, member in (("GlobalSecondaryIndexes", "globalSecondaryIndexes"), ("LocalSecondaryIndexes", "localSecondaryIndexes")):
+        for position, index in enumerate(data.get(field) or [], start=1):
+            iname = index.get("IndexName") if isinstance(index, dict) else None
+            if not isinstance(iname, str):
+                continue
+            failures.extend(_name_constraint_errors(iname, f"{member}.{position}.member.indexName", False))
+    err = _multi_validation_error(failures)
     if err:
         return err
     vector_indexes = data.get("VectorIndexes") or []
@@ -1306,7 +1706,6 @@ def _create_table(data):
 
     # Validate index Projection settings.
     for idx in gsis + lsis:
-        idx_name = idx.get("IndexName", "<unnamed>")
         proj = idx.get("Projection") or {}
         ptype = proj.get("ProjectionType", "ALL")
         if ptype not in _VALID_PROJECTION_TYPES:
@@ -1383,7 +1782,8 @@ def _create_table(data):
             if billing_mode == "PAY_PER_REQUEST"
             else data.get("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}),
         "BillingModeSummary": {"BillingMode": billing_mode},
-        "StreamSpecification": data.get("StreamSpecification"),
+        # Captured: a disabled stream at creation leaves no StreamSpecification, label or ARN.
+        "StreamSpecification": data.get("StreamSpecification") if _stream_enabled(data) else None,
         "SSEDescription": _sse_description_from_spec(data.get("SSESpecification")),
         "DeletionProtectionEnabled": data.get("DeletionProtectionEnabled", False),
     }
@@ -1403,17 +1803,24 @@ def _create_table(data):
             "MaxReadRequestUnits": int(on_demand.get("MaxReadRequestUnits", -1)),
             "MaxWriteRequestUnits": int(on_demand.get("MaxWriteRequestUnits", -1)),
         }
-    if data.get("StreamSpecification"):
+    if data.get("WarmThroughput"):
+        _tables[name]["WarmThroughput"] = _warm_throughput_description(data["WarmThroughput"])
+    if _stream_enabled(data):
         stream_label = _stream_label()
         _tables[name]["LatestStreamLabel"] = stream_label
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
         _tags[_tables[name]["TableArn"]] = data["Tags"]
+    if data.get("ResourcePolicy"):
+        _resource_policies[_tables[name]["TableArn"]] = {"Policy": data["ResourcePolicy"], "RevisionId": new_uuid()}
     logger.info("DynamoDB table created: %s", name)
     return json_response({"TableDescription": _table_description(name)})
 
 
 def _delete_table(data):
+    err = _control_plane_name_error(data.get("TableName"))
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
@@ -1439,6 +1846,9 @@ def _delete_table(data):
 
 
 def _describe_table(data):
+    err = _control_plane_name_error(data.get("TableName"))
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
@@ -1448,6 +1858,10 @@ def _describe_table(data):
 def _list_tables(data):
     limit = data.get("Limit", 100)
     start = data.get("ExclusiveStartTableName", "")
+    if isinstance(start, str) and start:
+        err = _multi_validation_error(_name_constraint_errors(start, "exclusiveStartTableName", False))
+        if err:
+            return err
     names = sorted(_tables.keys())
     if start:
         names = [n for n in names if n > start]
@@ -1564,7 +1978,28 @@ def _replicate_write(table, event_name, old_item, new_item):
                                copy.deepcopy(new_item) if new_item is not None else None, replicate=False)
 
 
+def _warm_throughput_description(requested, current=None):
+    desc = dict(current or {"ReadUnitsPerSecond": 0, "WriteUnitsPerSecond": 0})
+    for key in ("ReadUnitsPerSecond", "WriteUnitsPerSecond"):
+        if requested.get(key) is not None:
+            desc[key] = int(requested[key])
+    desc["Status"] = "ACTIVE"
+    return desc
+
+
 def _update_table(data):
+    err = _control_plane_name_error(data.get("TableName"))
+    if err:
+        return err
+    failures = []
+    for position, update in enumerate(data.get("GlobalSecondaryIndexUpdates") or [], start=1):
+        iname = ((update or {}).get("Create") or {}).get("IndexName") if isinstance(update, dict) else None
+        if isinstance(iname, str):
+            failures.extend(_name_constraint_errors(
+                iname, f"globalSecondaryIndexUpdates.{position}.member.create.indexName", False))
+    err = _multi_validation_error(failures)
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
@@ -1583,6 +2018,9 @@ def _update_table(data):
             "At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, "
             "GlobalSecondaryIndexUpdates, SSESpecification, ReplicaUpdates or TableClass "
             "is required", 400)
+
+    if "StreamSpecification" in data and not _stream_enabled(data) and not _stream_enabled(table):
+        return error_response_json("ValidationException", f"Table has no stream to disable: TableName: {name}", 400)
 
     current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
     new_billing = data.get("BillingMode")
@@ -1630,11 +2068,12 @@ def _update_table(data):
             existing_ad.setdefault(ad["AttributeName"], ad)
         table["AttributeDefinitions"] = list(existing_ad.values())
     if "StreamSpecification" in data:
-        stream_spec = data["StreamSpecification"]
-        stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
+        stream_spec = data["StreamSpecification"] or {}
+        stream_was_enabled = _stream_enabled(table)
         if stream_was_enabled and not stream_spec.get("StreamEnabled"):
             drop_stream_records(name, table)
-        table["StreamSpecification"] = stream_spec
+        # Captured: disabling drops StreamSpecification; the last label and ARN stay.
+        table["StreamSpecification"] = stream_spec if stream_spec.get("StreamEnabled") else None
         if stream_spec.get("StreamEnabled") and not stream_was_enabled:
             stream_label = _stream_label()
             table["LatestStreamLabel"] = stream_label
@@ -1661,6 +2100,8 @@ def _update_table(data):
             "MaxReadRequestUnits": int(odt.get("MaxReadRequestUnits", -1)),
             "MaxWriteRequestUnits": int(odt.get("MaxWriteRequestUnits", -1)),
         }
+    if data.get("WarmThroughput"):
+        table["WarmThroughput"] = _warm_throughput_description(data["WarmThroughput"], table.get("WarmThroughput"))
 
     existing_idx_names = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])}
     # A new index's key attributes must all appear in the REQUEST's own
@@ -1758,10 +2199,11 @@ def _table_description(name):
         desc["VectorIndexes"] = [_vector_index_description(v) for v in t["VectorIndexes"]]
         if desc["TableStatus"] == "ACTIVE" and any(_vector_phase(v) == "allocating" for v in t["VectorIndexes"]):
             desc["TableStatus"] = "UPDATING"
-    if t.get("StreamSpecification"):
+    if _stream_enabled(t):
         desc["StreamSpecification"] = t["StreamSpecification"]
+    if t.get("LatestStreamArn"):
         desc["LatestStreamLabel"] = t.get("LatestStreamLabel", "")
-        desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
+        desc["LatestStreamArn"] = t["LatestStreamArn"]
     if t.get("SSEDescription"):
         desc["SSEDescription"] = t["SSEDescription"]
     if t.get("TableClassSummary"):
@@ -1786,6 +2228,7 @@ def _table_description(name):
 # ---------------------------------------------------------------------------
 
 _PUT_DELETE_RV_VALUES = {"NONE", "ALL_OLD"}
+_OLDER_RV_ENUM = "Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
 _UPDATE_RV_VALUES = {"NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"}
 _RETURN_ITEM_COLLECTION_METRICS = {"NONE", "SIZE"}
 _RETURN_CONSUMED_CAPACITY_VALUES = {"NONE", "TOTAL", "INDEXES"}
@@ -1850,34 +2293,40 @@ def _projection_overlap_response(data) -> tuple | None:
     return error_response_json("ValidationException", message, 400) if message else None
 
 
-def _expression_size_error(data, expression_fields: tuple) -> tuple | None:
-    """Each expression is capped at 4096 bytes of its raw text."""
+def _expression_size_error(data, expression_fields: tuple, wording: str | dict = "figure") -> tuple | None:
+    """Each expression is capped at 4096 bytes of its raw text. PutItem and UpdateItem wrap the
+    sentence in the validation envelope, reads and transactions give it bare (``wording``)."""
     for fname in expression_fields:
         body = data.get(fname) or ""
         size = len(body.encode("utf-8")) if isinstance(body, str) else 0
         if size > _DDB_EXPR_MAX_BYTES:
-            return error_response_json("ValidationException",
-                f"Invalid {fname}: Expression size has exceeded the maximum allowed size; expression size: {size}", 400)
+            style = wording.get(fname, "figure") if isinstance(wording, dict) else wording
+            message = f"Invalid {fname}: Expression size has exceeded the maximum allowed size;"
+            if style == "envelope":
+                message = f"1 validation error detected: {message}"
+            elif style == "figure":
+                message += f" expression size: {size}"
+            return error_response_json("ValidationException", message, 400)
     return None
 
 
-def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
-    """AWS rejects ExpressionAttributeValues / ExpressionAttributeNames when
-    no expression field references them at all, AND when any defined alias
-    isn't used by any of the expressions, AND when any `:foo` or `#bar`
-    referenced by an expression isn't defined."""
-    # Expression string length limit: 4096 bytes each.
-    err = _expression_size_error(data, expression_fields)
+def _envelope_condition_refs(err: tuple | None) -> tuple | None:
+    """A single-item write reports an undefined reference in its condition inside the envelope."""
+    if err and b'"Invalid ConditionExpression: An expression attribute' in err[2]:
+        message = json.loads(err[2])["message"]
+        return error_response_json("ValidationException", f"1 validation error detected: {message}", 400)
+    return err
+
+
+def _validate_expression_attrs(data, expression_fields: tuple, size_wording: str | dict = "figure") -> tuple | None:
+    """Expression size, then names and values defined but unused, or used but undefined."""
+    err = _expression_size_error(data, expression_fields, size_wording)
     if err:
         return err
     has_any_expr = any(data.get(f) for f in expression_fields)
     eav = data.get("ExpressionAttributeValues")
     ean = data.get("ExpressionAttributeNames")
     if eav and not has_any_expr:
-        # AWS-canonical: EAV without any expression is rejected with the
-        # "can only be used when..." wording. Real AWS appends the first
-        # expression-slot name ("<Field> is null") for write ops; for ops
-        # with multiple expression slots the suffix is omitted.
         suffix = ""
         if len(expression_fields) == 1:
             suffix = f": {expression_fields[0]} is null"
@@ -1898,10 +2347,6 @@ def _validate_expression_attrs(data, expression_fields: tuple) -> tuple | None:
             if alias not in expr_text:
                 return error_response_json("ValidationException",
                     f"Value provided in ExpressionAttributeNames unused in expressions: keys: {{{alias}}}", 400)
-    # Inverse: every `:foo` / `#bar` in expressions must be defined.
-    # AWS scopes the error to the *specific* expression that contains the bad
-    # reference: "Invalid FilterExpression: An expression attribute value
-    # used in expression is not defined; attribute value: :v".
     for fname in expression_fields:
         body = data.get(fname) or ""
         if not body:
@@ -1959,8 +2404,14 @@ def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: di
 
 
 def _put_item(data):
+    err = (_older_validation_region() and _older_member_errors(data, "put")) or _older_layer_error(data, "put")
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _leading_underscore_error(data, ('ConditionExpression',), True)
     if err:
         return err
     err = _check_per_op_param_enums(data, _PUT_DELETE_RV_VALUES)
@@ -1970,11 +2421,18 @@ def _put_item(data):
     if not table:
         return error_response_json("ResourceNotFoundException",
             "Requested resource not found", 400)
-    err = _validate_expression_attrs(data, ("ConditionExpression",))
+    err = _values_error_response(_request_values(data), envelope=True) or _single_write_request_error(data)
+    if err:
+        return err
+    err = _envelope_condition_refs(_validate_expression_attrs(data, ("ConditionExpression",), "envelope"))
     if err:
         return err
 
     item = data.get("Item", {})
+    if isinstance(item, dict):
+        level = max((_nesting_level(v) for v in item.values()), default=0)
+        if _DDB_MAX_NESTING_DEPTH < level <= _DDB_SECOND_NESTING_LEVEL:
+            return error_response_json("ValidationException", f"1 validation error detected: {_NESTING_MSG}", 400)
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
     if err:
         return err
@@ -2032,6 +2490,9 @@ def _get_item(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('ProjectionExpression',), False)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, None)
     if err:
         return err
@@ -2039,6 +2500,9 @@ def _get_item(data):
     if not table:
         return error_response_json("ResourceNotFoundException",
             "Requested resource not found", 400)
+    err = _values_error_response(_request_values(data), envelope=False)
+    if err:
+        return err
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
@@ -2047,7 +2511,7 @@ def _get_item(data):
         _pe_err = _validate_projection_expression_syntax(_pe)
         if _pe_err:
             return error_response_json("ValidationException", _pe_err, 400)
-    err = _validate_expression_attrs(data, ("ProjectionExpression",)) or _projection_overlap_response(data)
+    err = _validate_expression_attrs(data, ("ProjectionExpression",), "bare") or _projection_overlap_response(data)
     if err:
         return err
 
@@ -2068,10 +2532,19 @@ def _get_item(data):
 
 
 def _delete_item(data):
+    err = _older_layer_error(data, "delete")
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('ConditionExpression',), True)
+    if err:
+        return err
+    if data.get("ReturnValues") in _UPDATE_RV_VALUES - _PUT_DELETE_RV_VALUES:
+        return error_response_json("ValidationException",
+            "1 validation error detected: ReturnValues can only be ALL_OLD or NONE", 400)
     err = _check_per_op_param_enums(data, _PUT_DELETE_RV_VALUES)
     if err:
         return err
@@ -2079,7 +2552,10 @@ def _delete_item(data):
     if not table:
         return error_response_json("ResourceNotFoundException",
             "Requested resource not found", 400)
-    err = _validate_expression_attrs(data, ("ConditionExpression",))
+    err = _values_error_response(_request_values(data), envelope=True) or _single_write_request_error(data)
+    if err:
+        return err
+    err = _envelope_condition_refs(_validate_expression_attrs(data, ("ConditionExpression",)))
     if err:
         return err
 
@@ -2127,8 +2603,14 @@ def _key_attribute_update_error(table, updated_attrs):
 
 
 def _update_item(data):
+    err = (_older_validation_region() and _older_member_errors(data, "update")) or _older_layer_error(data, "update")
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
-    err = _validate_data_plane_table_name(name)
+    err = _validate_data_plane_table_name(name, both=True)
+    if err:
+        return err
+    err = _leading_underscore_error(data, ('UpdateExpression', 'ConditionExpression'), True)
     if err:
         return err
     # UpdateItem stops at the first invalid enum, unlike the other writes.
@@ -2139,6 +2621,9 @@ def _update_item(data):
     if not table:
         return error_response_json("ResourceNotFoundException",
             "Requested resource not found", 400)
+    err = _values_error_response(_request_values(data), envelope=True) or _single_write_request_error(data)
+    if err:
+        return err
     # Pre-validate UpdateExpression syntax BEFORE the unused-EAV check.
     # AWS reports `"Invalid UpdateExpression: Syntax error; token: <first>,
     # near: <first second>"` for a body that doesn't start with a clause
@@ -2150,11 +2635,13 @@ def _update_item(data):
             _near = " ".join(_ue_tokens[:2])
             return error_response_json("ValidationException",
                 f'Invalid UpdateExpression: Syntax error; token: "{_ue_tokens[0]}", near: "{_near}"', 400)
-    err = _validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"))
+    err = _envelope_condition_refs(_validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"), "envelope"))
     if err:
         return err
-    if any(_nesting_exceeded(v) for v in (data.get("ExpressionAttributeValues") or {}).values()):
-        return error_response_json("ValidationException", f"1 validation error detected: {_NESTING_MSG}", 400)
+    first_limit = _DDB_MAX_NESTING_DEPTH + 1 if get_region() in _DEEP_EAV_REGIONS else _DDB_MAX_NESTING_DEPTH
+    err = _value_nesting_error(data.get("ExpressionAttributeValues") or {}, first_limit)
+    if err:
+        return err
 
     key = data.get("Key", {})
     pk_val, sk_val, key_err = _resolve_table_key_values(table, key, allow_extra=False)
@@ -2164,6 +2651,10 @@ def _update_item(data):
     existing = table["items"].get(pk_val, {}).get(sk_val)
     old_item = copy.deepcopy(existing) if existing else None
     item = copy.deepcopy(existing) if existing else dict(key)
+    update_text = data.get("UpdateExpression")
+    if update_text and _update_request_charge(update_text, data.get("ExpressionAttributeValues"),
+                                              data.get("ExpressionAttributeNames"), existing or {}) > _DDB_ITEM_MAX_BYTES:
+        return error_response_json("ValidationException", _UPDATE_SIZE_MSG, 400)
 
     cond_expr = data.get("ConditionExpression")
     expected = data.get("Expected")
@@ -2236,8 +2727,6 @@ def _update_item(data):
     err = _validate_item(item, table.get("pk_name"), table.get("sk_name"), _UPDATE_SIZE_MSG)
     if err:
         return err
-    if update_expr and _update_statement_size(item, update_expr, ean) > _DDB_ITEM_MAX_BYTES:
-        return error_response_json("ValidationException", _UPDATE_SIZE_MSG, 400)
     # Validate GSI/LSI key attribute types and values after the update is applied.
     err = _validate_index_key_values(table, item, update_expr=bool(data.get("UpdateExpression")))
     if err:
@@ -2271,18 +2760,85 @@ def _update_item(data):
 # Query / Scan
 # ---------------------------------------------------------------------------
 
+_KEY_OPERAND_TYPES = {"begins_with": {"S", "B"}}
+
+
+def _key_condition_clauses(tokens) -> list:
+    """Top-level AND-separated clauses; the AND inside BETWEEN stays in its clause."""
+    clauses, current, depth, in_between = [], [], 0, False
+    for tok in tokens:
+        if tok[0] == "EOF":
+            break
+        depth += tok[0] == "LPAREN"
+        depth -= tok[0] == "RPAREN"
+        is_and = tok[0] == "IDENT" and tok[1].upper() == "AND" and depth == 0
+        if is_and and in_between:
+            in_between = False
+        elif is_and:
+            clauses.append(current)
+            current = []
+            continue
+        elif tok[0] == "IDENT" and tok[1].upper() == "BETWEEN":
+            in_between = True
+        current.append(tok)
+    if current:
+        clauses.append(current)
+    return clauses
+
+
+def _key_condition_operand_error(key_cond: str, eav: dict) -> tuple | None:
+    """Clauses in written order: a value the request never defined, or an operand no key type fits."""
+    for clause in _key_condition_clauses(_tokenize(key_cond)):
+        idents = {tok[1].lower() for tok in clause if tok[0] == "IDENT"}
+        if "begins_with" in idents:
+            op, allowed = "begins_with", _KEY_OPERAND_TYPES["begins_with"]
+        elif "between" in idents:
+            op, allowed = "BETWEEN", {"S", "N", "B"}
+        else:
+            ordering = next((tok[1] for tok in clause if tok[0] in ("LT", "LE", "GT", "GE")), None)
+            op, allowed = ordering, ({"S", "N", "B"} if ordering else None)
+        for tok in clause:
+            if tok[0] != "VALUE_REF":
+                continue
+            value = (eav or {}).get(tok[1])
+            if value is None:
+                return error_response_json("ValidationException",
+                    "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; "
+                    f"attribute value: {tok[1]}", 400)
+            vtype = next(iter(value)) if isinstance(value, dict) and value else None
+            if allowed and vtype not in allowed:
+                return error_response_json("ValidationException",
+                    "Invalid KeyConditionExpression: Incorrect operand type for operator or function; "
+                    f"operator or function: {op}, operand type: {vtype}", 400)
+    return None
+
+
 def _query(data):
     name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('KeyConditionExpression', 'FilterExpression', 'ProjectionExpression'), False)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, None)
     if err:
         return err
+    if data.get("ConditionalOperator") is not None and data["ConditionalOperator"] not in ("AND", "OR"):
+        return error_response_json("ValidationException",
+            f"Value '{data['ConditionalOperator']}' at 'conditionalOperator' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [AND, OR]", 400)
+    if data.get("KeyConditionExpression"):
+        err = _key_condition_operand_error(data["KeyConditionExpression"], data.get("ExpressionAttributeValues"))
+        if err:
+            return err
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
             "Requested resource not found", 400)
+    err = _values_error_response(_request_values(data), envelope=False)
+    if err:
+        return err
     # Non-existent IndexName → ValidationException (not ResourceNotFoundException).
     idx_req = data.get("IndexName")
     if idx_req:
@@ -2308,7 +2864,8 @@ def _query(data):
                     return error_response_json("ValidationException", _err, 400)
             except Exception:
                 pass
-    err = (_validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"))
+    err = (_validate_expression_attrs(data, ("KeyConditionExpression", "FilterExpression", "ProjectionExpression"),
+                                       {"FilterExpression": "bare", "ProjectionExpression": "bare"})
            or _projection_overlap_response(data))
     if err:
         return err
@@ -2401,6 +2958,20 @@ def _query(data):
             return error_response_json("ValidationException",
                 "The provided starting key is invalid", 400)
 
+    if key_cond:
+        named = []
+        for clause in _key_condition_clauses(_tokenize(key_cond)):
+            ref = next((t for t in clause if t[0] in ("IDENT", "NAME_REF") and t[1].lower() not in _DDB_EXPR_FUNCTIONS
+                        and t[1].upper() not in ("AND", "BETWEEN")), None)
+            if ref:
+                named.append(ean.get(ref[1], ref[1]) if ref[0] == "NAME_REF" else ref[1])
+        if len(set(named)) < len(named):
+            return error_response_json("ValidationException",
+                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key", 400)
+        key_count = len([n for n in hash_names + range_names if n])
+        if len(named) > key_count:
+            return error_response_json("ValidationException",
+                f"The number of query conditions ({len(named)}) exceeds the number of key attributes defined in the schema ({key_count})", 400)
     # Every partition-key attribute needs an equality condition; a
     # multi-attribute partition is the tuple of their values.
     pk_vals = []
@@ -2457,9 +3028,9 @@ def _query(data):
                         f"Query condition missed key schema element: {resolved}", 400)
         # Multi-attribute sort keys are queried left to right without gaps,
         # and only the last one queried may use a range condition.
-        if len(range_names) > 1 and not _multi_sort_condition_ok(kce_tokens, ean, range_names):
-            return error_response_json("ValidationException",
-                "Query key condition not supported", 400)
+        multi_err = _multi_sort_condition_error(kce_tokens, ean, range_names) if len(range_names) > 1 else None
+        if multi_err:
+            return error_response_json("ValidationException", multi_err, 400)
         # Key-condition operands are validated like key values themselves:
         # an empty string/binary operand is rejected with the same error AWS
         # raises for empty key attribute values.
@@ -2589,9 +3160,16 @@ def _scan(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('FilterExpression', 'ProjectionExpression'), False)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, None)
     if err:
         return err
+    scan_filter = data.get("ScanFilter")
+    if data.get("ConditionalOperator") and isinstance(scan_filter, dict) and len(scan_filter) < 2:
+        return error_response_json("ValidationException",
+            "ConditionalOperator can only be used when Filter or Expected has two or more elements", 400)
     table = _tables.get(name)
     if not table:
         return error_response_json("ResourceNotFoundException",
@@ -2628,7 +3206,7 @@ def _scan(data):
             if _t and _t not in ("S", "B"):
                 return error_response_json("ValidationException",
                     f"Invalid FilterExpression: Incorrect operand type for operator or function; operator or function: begins_with, operand type: {_t}", 400)
-    err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression")) or _projection_overlap_response(data)
+    err = _validate_expression_attrs(data, ("FilterExpression", "ProjectionExpression"), {"FilterExpression": "bare"}) or _projection_overlap_response(data)
     if err:
         return err
 
@@ -2646,9 +3224,11 @@ def _scan(data):
         select = "SPECIFIC_ATTRIBUTES" if (data.get("ProjectionExpression") or data.get("AttributesToGet")) else "ALL_ATTRIBUTES"
 
     # Limit must be > 0 when provided (AWS rejects Limit=0).
+    echoing = get_region() in _ECHOING_SCAN_REGIONS
     if limit is not None and int(limit) <= 0:
+        member = f"Value '{limit}' at 'limit'" if echoing else "Value at 'Limit'"
         return error_response_json("ValidationException",
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
+            f"1 validation error detected: {member} failed to satisfy constraint: Member must have value greater than or equal to 1", 400)
     if data.get("ProjectionExpression") and data.get("AttributesToGet"):
         return error_response_json("ValidationException",
             "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}", 400)
@@ -2673,11 +3253,13 @@ def _scan(data):
         # envelope with the lowercase 'segment' slot and "greater than or
         # equal to 0" floor — distinct from the segment>=totalSegments error.
         if seg < 0:
+            member = f"Value '{seg}' at 'segment'" if echoing else "Value at 'Segment'"
             return error_response_json("ValidationException",
-                "1 validation error detected: Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0", 400)
+                f"1 validation error detected: {member} failed to satisfy constraint: Member must have value greater than or equal to 0", 400)
         if seg >= ts:
+            detail = f": Segment: {seg} is not less than TotalSegments: {ts}" if echoing else ""
             return error_response_json("ValidationException",
-                "The Segment parameter is zero-based and must be less than parameter TotalSegments", 400)
+                f"The Segment parameter is zero-based and must be less than parameter TotalSegments{detail}", 400)
     # Select validation per AWS (messages measured against real DynamoDB by
     # paritysuite — Scan reuses the Query-worded IndexName message verbatim).
     if "Select" in data and data.get("ProjectionExpression"):
@@ -2695,7 +3277,8 @@ def _scan(data):
             "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName", 400)
     if select == "SPECIFIC_ATTRIBUTES" and not data.get("ProjectionExpression") and not data.get("AttributesToGet"):
         return error_response_json("ValidationException",
-            "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES", 400)
+            ("" if echoing else "1 validation error detected: ")
+            + "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES", 400)
     # ConsistentRead on a GSI is invalid.
     if index_name and data.get("ConsistentRead"):
         _, _, is_gsi_scan = _resolve_index_keys(table, index_name)
@@ -2750,8 +3333,8 @@ def _scan(data):
         if index_name:
             required.update(idx_hashes + idx_ranges)
         if not required.issubset(esk.keys()):
-            return error_response_json("ValidationException",
-                "The provided starting key is invalid", 400)
+            return error_response_json("ValidationException", "The provided starting key is invalid" + (
+                ": The provided key element does not match the schema" if echoing else ""), 400)
         if index_name:
             # For index scans, use index-aware ordering (same as Query pagination).
             all_items = _apply_exclusive_start_key(
@@ -2815,6 +3398,13 @@ def _execute_statement(data):
 
     if not statement or not statement.strip():
         return error_response_json("ValidationException", "Statement must not be null or empty", 400)
+    limit = data.get("Limit")
+    if isinstance(limit, str):
+        return error_response_json("SerializationException", "STRING_VALUE cannot be converted to Integer", 400)
+    if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit < 1:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: "
+            "Member must have value greater than or equal to 1", 400)
 
     try:
         parsed = _parse_partiql(statement, parameters)
@@ -2825,20 +3415,25 @@ def _execute_statement(data):
     table_name = parsed["table"]
     table = _tables.get(table_name)
     if not table:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Requested resource not found: Table: {table_name} not found", 400)
+        message = "Requested resource not found"
+        if not parsed.get("from_first"):
+            message += f": Table: {table_name} not found"
+        return error_response_json("ResourceNotFoundException", message, 400)
 
     if op == "SELECT":
         if parsed.get("index"):
             status, headers, body = _partiql_select_index(table, parsed, data)
         else:
-            status, headers, body = _partiql_select(table, parsed)
+            overlap = _pq_overlap_error(table, parsed.get("where"))
+            if overlap:
+                return error_response_json("ValidationException", overlap, 400)
+            status, headers, body = _partiql_select_paged(table, parsed, data)
     elif op == "INSERT":
         status, headers, body = _partiql_insert(table, parsed)
     elif op == "UPDATE":
-        status, headers, body = _partiql_update(table, parsed)
+        status, headers, body = _partiql_update(table, parsed, data)
     elif op == "DELETE":
-        status, headers, body = _partiql_delete(table, parsed)
+        status, headers, body = _partiql_delete(table, parsed, data)
     else:
         return error_response_json("ValidationException", f"Unsupported PartiQL operation: {op}", 400)
     # Attach ConsumedCapacity per AWS when ReturnConsumedCapacity != NONE.
@@ -2856,6 +3451,45 @@ def _execute_statement(data):
     return status, headers, body
 
 
+def _pq_and_conjuncts(where):
+    out, stack = [], [where]
+    while stack:
+        node = stack.pop()
+        if node[0] == "and":
+            stack.extend((node[2], node[1]))
+        else:
+            out.append(node)
+    return out
+
+
+def _pq_path_roots(node):
+    roots, stack = [], [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, tuple) and n and n[0] == "path":
+            if n[1] and isinstance(n[1][0], str):
+                roots.append(n[1][0])
+        elif isinstance(n, (tuple, list)):
+            stack.extend(reversed([c for c in n if isinstance(c, (tuple, list))]))
+    return roots
+
+
+def _java_hash_set_order(names):
+    """Iteration order of a java.util.HashSet built from `names` (DynamoDB lists these that way)."""
+    names = list(dict.fromkeys(names))
+    capacity = 16
+    while len(names) > capacity * 0.75:
+        capacity *= 2
+
+    def bucket(name):
+        h = 0
+        for unit in struct.unpack(f">{len(name.encode('utf-16-be')) // 2}H", name.encode("utf-16-be")):
+            h = (31 * h + unit) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (capacity - 1)
+
+    return sorted(names, key=lambda n: (bucket(n), names.index(n)))
+
+
 def _partiql_select_index(table, parsed, data):
     """Serve SELECT ... FROM "table"."index" per real DynamoDB (paritysuite):
     membership and projection follow the index; an LSI reaches back to the
@@ -2864,6 +3498,9 @@ def _partiql_select_index(table, parsed, data):
     unprojected attributes; capacity lands on the index arm; NextTokens are
     bound to the index that minted them."""
     index_name = parsed["index"]
+    refusal = _pq_multi_attribute_index_error(table, index_name)
+    if refusal:
+        return error_response_json("ValidationException", refusal, 400)
     gsis = {i.get("IndexName"): (i, True) for i in table.get("GlobalSecondaryIndexes", []) or []}
     lsis = {i.get("IndexName"): (i, False) for i in table.get("LocalSecondaryIndexes", []) or []}
     idx, is_gsi = (gsis.get(index_name) or lsis.get(index_name) or (None, None))
@@ -2892,8 +3529,17 @@ def _partiql_select_index(table, parsed, data):
 
     conditions = parsed.get("conditions") or []
     keyed = any(attr in key_names for attr, _op, _v in conditions)
+    filter_attrs = [a for a, _op, _v in conditions]
+    if not conditions and parsed.get("where") is not None and parsed["where"][0] == "and":
+        # An OR beside the key condition stays a filter on what it names.
+        for conjunct in _pq_and_conjuncts(parsed["where"]):
+            atoms = _pq_conditions(conjunct)
+            if atoms and all(a in key_names for a, _op, _v in atoms):
+                keyed = True
+            else:
+                filter_attrs.extend(_pq_path_roots(conjunct))
     if keyed and view_attrs is not None:
-        unprojected_filters = list(dict.fromkeys(a for a, _op, _v in conditions if a not in view_attrs))
+        unprojected_filters = list(dict.fromkeys(a for a in filter_attrs if a not in view_attrs))
         if unprojected_filters:
             return error_response_json("ValidationException",
                 f"One or more parameter values were invalid: Secondary index {index_name} does not project "
@@ -2902,7 +3548,7 @@ def _partiql_select_index(table, parsed, data):
     projections = parsed.get("projections")
     reach_back = False
     if projections and view_attrs is not None:
-        unprojected = [a for a in projections if a not in view_attrs]
+        unprojected = _java_hash_set_order(a for a in projections if a not in view_attrs)
         if unprojected:
             if is_gsi:
                 return error_response_json("ValidationException",
@@ -2925,32 +3571,46 @@ def _partiql_select_index(table, parsed, data):
         return tuple(json.dumps(it.get(k), sort_keys=True) for k in key_names + table_keys)
     members.sort(key=_order_key)
 
-    # Rows walked = rows matching the key conditions (filters apply later).
-    key_conds = [(a, o, v) for a, o, v in conditions if a in key_names]
-    walked = [it for it in members
-              if all(_eval_partiql_pred(_index_view(it), a, o, v) for a, o, v in key_conds)]
+    # A set of index keys (an OR or IN) reads each key in turn, each charged on its own.
+    idx_pk = next((k.get("AttributeName") for k in idx.get("KeySchema") or [] if k.get("KeyType") == "HASH"), None)
+    idx_sk = next((k.get("AttributeName") for k in idx.get("KeySchema") or [] if k.get("KeyType") == "RANGE"), None)
+    plan, plan_err = _pq_read_plan(
+        {"pk_name": idx_pk, "sk_name": idx_sk, "AttributeDefinitions": table.get("AttributeDefinitions")}, parsed)
+    segmented = not plan_err and plan is not None and len(plan) > 1
 
-    # Pagination: tokens are bound to the index that minted them.
-    offset = 0
     token = data.get("NextToken")
+    state = {}
     if token:
         try:
             import base64 as _b64
-            tk = json.loads(_b64.b64decode(token).decode("utf-8"))
-            assert tk.get("t") == table.get("TableName") and tk.get("i") == index_name
-            offset = int(tk.get("o", 0))
+            state = json.loads(_b64.b64decode(token).decode("utf-8"))
+            assert state.get("t") == table.get("TableName") and state.get("i") == index_name
+            assert ("s" in state) == segmented
         except Exception:
             return error_response_json("ValidationException",
                 "The provided NextToken is invalid", 400)
-    limit = data.get("Limit")
-    page = walked[offset:]
+    limit = _pq_limit(data)
     next_token = None
-    if limit is not None and int(limit) < len(page):
-        page = page[: int(limit)]
-        import base64 as _b64
-        next_token = _b64.b64encode(json.dumps(
-            {"t": table.get("TableName"), "i": index_name, "o": offset + len(page)}
-        ).encode("utf-8")).decode("ascii")
+    index_units = None
+    if segmented:
+        def size_units(rows):
+            return rate * max(1, -(-sum(_item_size_bytes(_index_view(r)) for r in rows) // 4096))
+        descending = bool(parsed.get("order") and parsed["order"][1])
+        page, index_units, nxt = _pq_walk(
+            plan, lambda v: [m for m in members if _ddb_equals(m.get(idx_pk), v)], idx_sk, _order_key,
+            limit, state, descending, size_units, False)
+        if nxt is not None:
+            next_token = _pq_token(table, {"i": index_name, **nxt})
+    else:
+        # Rows walked = rows matching the key conditions (filters apply later).
+        key_conds = [(a, o, v) for a, o, v in conditions if a in key_names]
+        walked = [it for it in members
+                  if all(_eval_partiql_pred(_index_view(it), a, o, v) for a, o, v in key_conds)]
+        offset = int(state.get("o", 0))
+        page = walked[offset:]
+        if limit is not None and limit < len(page):
+            page = page[:limit]
+            next_token = _pq_token(table, {"i": index_name, "o": offset + len(page)})
 
     where_fn = parsed.get("where_fn")
     kept = [it for it in page if (where_fn is None or where_fn(_index_view(it)))]
@@ -2982,11 +3642,12 @@ def _partiql_select_index(table, parsed, data):
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
         table_units = rate * len(page) if reach_back else 0.0
-        total = rate + table_units
+        index_units = rate if index_units is None else index_units
+        total = index_units + table_units
         cap = {"TableName": table.get("TableName"), "CapacityUnits": total}
         if rc == "INDEXES":
             cap["Table"] = {"CapacityUnits": table_units}
-            arm = {"GlobalSecondaryIndexes" if is_gsi else "LocalSecondaryIndexes": {index_name: {"CapacityUnits": rate}}}
+            arm = {"GlobalSecondaryIndexes" if is_gsi else "LocalSecondaryIndexes": {index_name: {"CapacityUnits": index_units}}}
             cap.update(arm)
         payload["ConsumedCapacity"] = cap
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3002,6 +3663,10 @@ def _partiql_select(table, parsed):
         filtered = [it for it in all_items if parsed["where_fn"](it)]
     else:
         filtered = all_items
+    if parsed.get("order"):
+        parts, descending = parsed["order"]
+        filtered.sort(key=lambda it: _ddb_comparable(_partiql_get_path(it, parts))[1] if _partiql_get_path(it, parts) else "",
+                      reverse=descending)
 
     projections = parsed.get("projections")
     if projections:
@@ -3028,8 +3693,354 @@ def _partiql_select(table, parsed):
     return json_response({"Items": filtered})
 
 
+_PQ_RANGE_OPS = ("<", "<=", ">", ">=")
+_PQ_OVERLAPPING = "Overlapping conditions with range keys are not supported in where clause"
+
+
+def _pq_key_type(table, name):
+    for definition in table.get("AttributeDefinitions") or []:
+        if definition.get("AttributeName") == name:
+            return definition.get("AttributeType")
+    return None
+
+
+def _pq_key_dnf(node, keys, cap=512):
+    """The WHERE clause as OR-branches of key atoms (attr, op, value). A non-key or negated term reads as
+    true, so it adds nothing; a negated key term adds the marker ("~", attr). None when it grows too wide."""
+    kind = node[0]
+
+    def attr(n):
+        return n[1][0] if n[0] == "path" and len(n[1]) == 1 and n[1][0] in keys else None
+
+    if kind == "and":
+        left, right = _pq_key_dnf(node[1], keys, cap), _pq_key_dnf(node[2], keys, cap)
+        if left is None or right is None or len(left) * len(right) > cap:
+            return None
+        return [a + b for a in left for b in right]
+    if kind == "or":
+        left, right = _pq_key_dnf(node[1], keys, cap), _pq_key_dnf(node[2], keys, cap)
+        if left is None or right is None:
+            return None
+        if [] in left or [] in right:
+            return [[]]
+        return left + right if len(left) + len(right) <= cap else None
+    if kind == "not" or (kind == "cmp" and node[1] == "<>"):
+        names = set()
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, tuple) and n and n[0] == "path" and len(n[1]) == 1 and n[1][0] in keys:
+                names.add(n[1][0])
+            elif isinstance(n, (tuple, list)):
+                stack.extend(c for c in n if isinstance(c, (tuple, list)))
+        return [[(a, "~", None) for a in sorted(names)]]
+    flip = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "="}
+    if kind == "cmp" and node[1] in flip:
+        if attr(node[2]) and node[3][0] == "lit":
+            return [[(attr(node[2]), node[1], node[3][1])]]
+        if attr(node[3]) and node[2][0] == "lit":
+            return [[(attr(node[3]), flip[node[1]], node[2][1])]]
+    if kind == "between" and attr(node[1]) and node[2][0] == node[3][0] == "lit":
+        return [[(attr(node[1]), ">=", node[2][1]), (attr(node[1]), "<=", node[3][1])]]
+    if kind == "in" and attr(node[1]) and node[2][0] == "options" and all(o[0] == "lit" for o in node[2][1]):
+        return [[(attr(node[1]), "=", o[1])] for o in node[2][1]] or [[]]
+    if kind == "call" and node[1] == "begins_with" and len(node[2]) == 2 and attr(node[2][0]) \
+            and node[2][1][0] == "lit":
+        return [[(attr(node[2][0]), "begins_with", node[2][1][1])]]
+    return [[]]
+
+
+def _pq_or_conjunct_errors(table, where):
+    """An OR inside the top-level AND: a negated sort-key term there stays in the filter, which may
+    not name a key; a lone OR mixing a sort-key branch with a non-key branch overlaps."""
+    sk = table.get("sk_name")
+    if not sk or where is None or where[0] != "and":
+        return None
+    conjuncts, stack = [], [where]
+    while stack:
+        node = stack.pop()
+        if node[0] == "and":
+            stack.extend((node[2], node[1]))
+        else:
+            conjuncts.append(node)
+    ors = [c for c in conjuncts if c[0] == "or"]
+    keys = {table.get("pk_name"), sk}
+    raws = [_pq_key_dnf_raw(group, keys) or [] for group in ors]
+    if any((sk, "~", None) in b for raw in raws for b in raw):
+        return f"Filter Expression can only contain non-primary key attributes: Primary key attribute: {sk}"
+    if len(raws) == 1:
+        positive = [any(a == sk and op != "~" for a, op, _ in b) for b in raws[0]]
+        if any(positive) and [] in raws[0]:
+            return _PQ_OVERLAPPING
+    return None
+
+
+def _pq_key_dnf_raw(node, keys):
+    """The branches of a single OR, without folding a branch that reads as true into the rest."""
+    if node[0] != "or":
+        return _pq_key_dnf(node, keys)
+    left, right = _pq_key_dnf_raw(node[1], keys), _pq_key_dnf_raw(node[2], keys)
+    return None if left is None or right is None else left + right
+
+
+def _pq_read_plan(table, parsed):
+    """How a base-table SELECT reads: a list of (pk value, segment) key reads in read order, or None
+    for a scan, or an error message. A segment is ("point", value) or ("range", lo, lo_inc, hi, hi_inc, prefix)."""
+    where = parsed.get("where")
+    pk, sk = table.get("pk_name"), table.get("sk_name")
+    err = _pq_or_conjunct_errors(table, where)
+    if err:
+        return None, err
+    if where is None:
+        return None, None
+    branches = _pq_key_dnf(where, {pk, sk} - {None})
+    if branches is None:
+        return None, None
+    pk_type = _pq_key_type(table, pk)
+    reads = []  # (pk value, segment, negated)
+    for branch in branches:
+        pk_atoms = [(op, v) for a, op, v in branch if a == pk]
+        if not pk_atoms or any(op != "=" for op, _ in pk_atoms):
+            return None, None
+        values = [v for _, v in pk_atoms]
+        sk_atoms = [(op, v) for a, op, v in branch if a == sk and op != "~"]
+        ranged = any(op in _PQ_RANGE_OPS or op == "begins_with" for op, _ in sk_atoms)
+        vtype = next(iter(values[0])) if isinstance(values[0], dict) and values[0] else None
+        if vtype not in ("S", "N", "B"):
+            if ranged:
+                return None, None
+            return None, f"Key value must be of type S, N, or B. Key name: {pk}, Key type: {vtype}"
+        if vtype != pk_type:
+            if ranged:
+                return None, None
+            return None, f"Key attribute's data type should match its data type in table's schema: Key {pk}"
+        if any(not _ddb_equals(values[0], v) for v in values[1:]):
+            continue
+        negated = any(a == sk and op == "~" for a, op, _ in branch)
+        points = [v for op, v in sk_atoms if op == "="]
+        lo = hi = prefix = None
+        lo_inc = hi_inc = True
+        for op, v in sk_atoms:
+            if op in (">", ">="):
+                if lo is None or _compare_ddb(v, ">", lo) or (_ddb_equals(v, lo) and op == ">"):
+                    lo, lo_inc = v, op == ">="
+            elif op in ("<", "<="):
+                if hi is None or _compare_ddb(v, "<", hi) or (_ddb_equals(v, hi) and op == "<"):
+                    hi, hi_inc = v, op == "<="
+            elif op == "begins_with":
+                prefix = v
+        if points:
+            point = points[0]
+            if any(not _ddb_equals(point, p) for p in points[1:]):
+                continue
+            if not _pq_in_segment(point, ("range", lo, lo_inc, hi, hi_inc, prefix)):
+                continue
+            reads.append((values[0], ("point", point), negated))
+        else:
+            reads.append((values[0], ("range", lo, lo_inc, hi, hi_inc, prefix), negated))
+    # Order: by partition, then by the segment's first sort key.
+    partitions = []
+    for value, _seg, _neg in reads:
+        if not any(_ddb_equals(value, p) for p in partitions):
+            partitions.append(value)
+    order = parsed.get("order")
+    descending = bool(order and order[1])
+    if order and len(partitions) > 1 and order[0] != [pk]:
+        return None, ("Must have hash key in ORDER BY clause when more than one hash key condition "
+                      "specified in WHERE clause.")
+    plan = []
+    for value in sorted(partitions, key=_ddb_comparable):
+        segs = [(seg, neg) for v, seg, neg in reads if _ddb_equals(v, value)]
+        unique = []
+        for seg, neg in segs:
+            if not any(seg[0] == "point" == u[0][0] and _ddb_equals(seg[1], u[0][1]) for u in unique):
+                unique.append((seg, neg))
+        for i, (a, a_neg) in enumerate(unique):
+            for b, b_neg in unique[i + 1:]:
+                if not (a_neg or b_neg) and _pq_segments_meet(a, b):
+                    return None, _PQ_OVERLAPPING
+        if any(seg[0] == "range" and seg[1:] == (None, True, None, True, None) for seg, _ in unique) \
+                or any(_pq_segments_meet(a, b) for i, (a, _) in enumerate(unique) for b, _ in unique[i + 1:]):
+            unique = [(("range", None, True, None, True, None), False)]
+        unique.sort(key=lambda s: _ddb_comparable(_pq_segment_start(s[0])) if _pq_segment_start(s[0]) else ("",))
+        if descending:
+            unique.reverse()
+        plan.extend((value, seg) for seg, _ in unique)
+    return plan, None
+
+
+def _pq_segment_start(seg):
+    return seg[1] if seg[0] == "point" else (seg[1] if seg[1] is not None else seg[5])
+
+
+def _pq_in_segment(value, seg):
+    if seg[0] == "point":
+        return _ddb_equals(value, seg[1])
+    _, lo, lo_inc, hi, hi_inc, prefix = seg
+    if lo is not None and not _compare_ddb(value, ">=" if lo_inc else ">", lo):
+        return False
+    if hi is not None and not _compare_ddb(value, "<=" if hi_inc else "<", hi):
+        return False
+    if prefix is not None:
+        return _pq_truthy(_pq_call("begins_with", [value, prefix], None))
+    return True
+
+
+def _pq_segments_meet(a, b):
+    if a[0] == "point":
+        return _pq_in_segment(a[1], b)
+    if b[0] == "point":
+        return _pq_in_segment(b[1], a)
+    def bounded(seg):
+        _, lo, lo_inc, hi, hi_inc, prefix = seg
+        if isinstance(prefix, dict) and "S" in prefix:
+            if lo is None or _compare_ddb(prefix, ">", lo):
+                lo, lo_inc = prefix, True
+            ceiling = {"S": prefix["S"] + "\U0010ffff"}
+            if hi is None or _compare_ddb(ceiling, "<", hi):
+                hi, hi_inc = ceiling, True
+        return lo, lo_inc, hi, hi_inc
+
+    alo, alo_inc, ahi, ahi_inc = bounded(a)
+    blo, blo_inc, bhi, bhi_inc = bounded(b)
+    def below(hi, hi_inc, lo, lo_inc):
+        if hi is None or lo is None:
+            return False
+        return _compare_ddb(hi, "<", lo) or (_ddb_equals(hi, lo) and not (hi_inc and lo_inc))
+    return not below(ahi, ahi_inc, blo, blo_inc) and not below(bhi, bhi_inc, alo, alo_inc)
+
+
+def _pq_limit(data):
+    limit = data.get("Limit")
+    if limit is None:
+        return None
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        return None
+    return None if limit >= 2 ** 31 else int(limit)
+
+
+def _pq_token(table, payload):
+    return base64.b64encode(json.dumps({"t": table.get("TableName"), **payload}).encode()).decode("ascii")
+
+
+def _pq_read_token(table, token):
+    try:
+        decoded = json.loads(base64.b64decode(token).decode("utf-8"))
+        if decoded.get("t") != table.get("TableName") or "i" in decoded:
+            raise ValueError
+        return decoded
+    except Exception:
+        return None
+
+
+def _pq_walk(plan, partition_rows, sk, order_key, limit, state, descending, size_units, unique):
+    """Read the plan's segments in order from state {"s": segment, "n": rows already read in it}.
+    Each segment is charged on the page that reaches it. With a unique sort key, a page that ends
+    on a segment's closed bound moves on to the next segment, so the last one mints no token."""
+    index, skip = int(state.get("s", 0)), int(state.get("n", 0))
+    read, units, next_state = [], 0.0, None
+    while index < len(plan):
+        value, seg = plan[index]
+        rows = [r for r in partition_rows(value) if sk is None or (sk in r and _pq_in_segment(r[sk], seg))]
+        rows.sort(key=order_key or (lambda r: _ddb_comparable(r.get(sk)) if sk else 0))
+        if descending:
+            rows.reverse()
+        rows = rows[skip:]
+        room = None if limit is None else limit - len(read)
+        taken = rows if room is None else rows[:room]
+        read.extend(taken)
+        if taken or not skip:
+            units += size_units(taken)
+        if room is not None and len(taken) >= room:
+            last = taken[-1].get(sk) if taken and sk else None
+            if seg[0] == "point":
+                bound, inclusive = seg[1], True
+            else:
+                bound, inclusive = (seg[1], seg[2]) if descending else (seg[3], seg[4])
+            closed = unique and last is not None and bound is not None and inclusive and _ddb_equals(last, bound)
+            if closed or (unique and seg[0] == "point"):
+                if index + 1 < len(plan):
+                    next_state = {"s": index + 1}
+            else:
+                next_state = {"s": index, "n": skip + len(taken)}
+            break
+        index, skip = index + 1, 0
+    return read, units, next_state
+
+
+def _partiql_select_paged(table, parsed, data):
+    """ExecuteStatement's base-table SELECT: key reads in order, each branch charged on the page that
+    reaches it, Limit counting the items read and a page ending on a closed bound ending the read."""
+    plan, err = _pq_read_plan(table, parsed)
+    if err:
+        return error_response_json("ValidationException", err, 400)
+    consistent = bool(data.get("ConsistentRead"))
+    rate = 1.0 if consistent else 0.5
+    limit = _pq_limit(data)
+    state = {}
+    if data.get("NextToken"):
+        state = _pq_read_token(table, data["NextToken"])
+        if state is None:
+            return error_response_json("ValidationException", "The provided NextToken is invalid", 400)
+    pk, sk = table.get("pk_name"), table.get("sk_name")
+    where_fn = parsed.get("where_fn")
+    read, units, next_state = [], 0.0, None
+
+    def size_units(rows):
+        return rate * max(1, -(-sum(_item_size_bytes(r) for r in rows) // 4096))
+
+    if plan is None:
+        rows = [table["items"][p][s] for p in sorted(table["items"]) for s in sorted(table["items"][p])]
+        start = int(state.get("o", 0))
+        page = rows[start:] if limit is None else rows[start:start + limit]
+        read = page
+        if limit is not None and start + len(page) < len(rows):
+            next_state = {"o": start + len(page)}
+        units = rate * max(4, -(-sum(_item_size_bytes(r) for r in page) // 4096))
+    else:
+        descending = bool(parsed.get("order") and parsed["order"][1])
+        partitions = lambda value: (table["items"].get(_extract_key_val(value)) or {}).values()  # noqa: E731
+        read, units, next_state = _pq_walk(plan, partitions, sk, None, limit, state, descending, size_units, True)
+
+    items = [r for r in read if where_fn is None or where_fn(r)]
+    if plan is None and parsed.get("order"):
+        parts, desc = parsed["order"]
+        items.sort(key=lambda it: _ddb_comparable(_partiql_get_path(it, parts)) if _partiql_get_path(it, parts) else ("",),
+                   reverse=desc)
+    projections = parsed.get("projections")
+    if projections:
+        projected = []
+        for it in items:
+            row = {}
+            for attr in projections:
+                if attr in it:
+                    row[attr] = it[attr]
+                elif "." in attr or "[" in attr:
+                    try:
+                        parts = _partiql_parse_path(attr)
+                    except ValueError:
+                        continue
+                    leaf = _partiql_get_path(it, parts)
+                    if leaf is not None:
+                        row[next((seg for seg in reversed(parts) if isinstance(seg, str)), attr)] = leaf
+            projected.append(row)
+        items = projected
+    payload = {"Items": items}
+    if next_state is not None:
+        payload["NextToken"] = _pq_token(table, next_state)
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    if rc in ("TOTAL", "INDEXES"):
+        cap = {"TableName": table.get("TableName"), "CapacityUnits": units}
+        if rc == "INDEXES":
+            cap["Table"] = {"CapacityUnits": units}
+        payload["ConsumedCapacity"] = cap
+    return json_response(payload)
+
+
 def _partiql_insert(table, parsed):
     item = parsed.get("item", {})
+    if isinstance(item, dict) and set(item) == {"M"}:
+        item = item["M"]
     if not item:
         return error_response_json("ValidationException", "INSERT requires a value list", 400)
     pk_val = _extract_key_val(item.get(table["pk_name"]))
@@ -3045,75 +4056,24 @@ def _partiql_insert(table, parsed):
     if _item_size_bytes(item) > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException", _ITEM_SIZE_MSG, 400)
     _set_item(table, pk_val, sk_val, item)
-    return json_response({})
+    return json_response({"Items": []})
 
 
 def _partiql_key_target(table, parsed):
-    """Return (pk_key, sk_key, non_key_fn, error_resp).
-
-    AWS PartiQL UPDATE/DELETE require equality conditions on every primary key
-    attribute. Non-key clauses act as a conditional check on the targeted item
-    — failure → ConditionalCheckFailedException, not a silent no-op.
-    """
-    conditions = parsed.get("conditions") or []
-    pk_attr = table.get("pk_name")
-    sk_attr = table.get("sk_name")
-
-    pk_typed = None
-    sk_typed = None
-    rest = []
-    for attr, op, val in conditions:
+    """(pk, sk, condition, error): the item every key attribute's equality names, and the WHERE as
+    a condition on it (a failing condition is ConditionalCheckFailedException)."""
+    pk_typed = sk_typed = None
+    pk_attr, sk_attr = table.get("pk_name"), table.get("sk_name")
+    for attr, op, val in parsed.get("conditions") or []:
         if attr == pk_attr and op == "=":
             pk_typed = val
         elif sk_attr and attr == sk_attr and op == "=":
             sk_typed = val
-        else:
-            rest.append((attr, op, val))
-
     if pk_typed is None or (sk_attr and sk_typed is None):
         return None, None, None, error_response_json(
-            "ValidationException",
-            "Where clause does not contain a mandatory equality on all key attributes",
-            400,
-        )
-
-    def non_key_fn(item):
-        # Each predicate is a fail-fast check: on a pass we fall through to the
-        # next condition rather than returning, so every predicate in a
-        # multi-condition WHERE is evaluated (not just the first special op).
-        for attr, op, val in rest:
-            if op == "begins_with":
-                iv = item.get(attr)
-                if iv is None or "S" not in iv:
-                    return False
-                prefix = val.get("S", "") if isinstance(val, dict) else str(val)
-                if not iv["S"].startswith(prefix):
-                    return False
-            elif op == "not_begins_with":
-                iv = item.get(attr)
-                if iv is not None and "S" in iv:
-                    prefix = val.get("S", "") if isinstance(val, dict) else str(val)
-                    if iv["S"].startswith(prefix):
-                        return False
-            elif op == "is_missing":
-                if item.get(attr) is not None:
-                    return False
-            elif op == "is_not_missing":
-                if item.get(attr) is None:
-                    return False
-            elif op == "IN":
-                iv = item.get(attr)
-                if iv is None or not any(_ddb_equals(iv, v) for v in val):
-                    return False
-            else:
-                if not _compare_ddb(item.get(attr), op, val):
-                    return False
-        return True
-
-    pk_key = _extract_key_val(pk_typed)
-    sk_key = _extract_key_val(sk_typed) if sk_attr else "__no_sort__"
-    return pk_key, sk_key, non_key_fn, None
-
+            "ValidationException", "Where clause does not contain a mandatory equality on all key attributes", 400)
+    where_fn = parsed.get("where_fn") or (lambda item: True)
+    return _extract_key_val(pk_typed), (_extract_key_val(sk_typed) if sk_attr else "__no_sort__"), where_fn, None
 
 def _partiql_parse_path(raw):
     """Parse a PartiQL document path: 'profile.sub' -> ["profile", "sub"],
@@ -3250,105 +4210,70 @@ def _partiql_modified_items(item_before, item_after, paths, want_old):
     return [frag] if frag else []
 
 
-def _build_partiql_returning(item_before, item_after, returning_clause):
-    """Build the Items list for a RETURNING clause response.
-
-    Supported: ALL OLD *, ALL NEW *, MODIFIED OLD *, MODIFIED NEW *
-    Returns (items_list, error_or_None)
-    """
-    if not returning_clause:
-        return [], None
-    r = returning_clause.upper().strip()
-    if r == "ALL OLD *":
-        return [item_before] if item_before else [], None
-    elif r == "ALL NEW *":
-        return [item_after] if item_after else [], None
-    elif r == "MODIFIED NEW *":
-        if not item_before or not item_after:
-            return [], None
-        changed = {k: v for k, v in item_after.items()
-                   if k not in item_before or item_before[k] != v}
-        return [changed] if changed else [], None
-    elif r == "MODIFIED OLD *":
-        if not item_before or not item_after:
-            return [], None
-        changed = {k: item_before[k] for k in item_before
-                   if k not in item_after or item_after[k] != item_before[k]}
-        return [changed] if changed else [], None
-    else:
-        return None, f"Invalid returning clause: {returning_clause}"
+def _pq_set_function(name, current, members):
+    """set_add / set_delete on the set an attribute holds; None removes the attribute."""
+    if not isinstance(members, dict) or next(iter(members), None) not in _PQ_SET_TYPES:
+        raise ValueError("An operand in the update expression has an incorrect data type")
+    mtype = next(iter(members))
+    if current is not None and next(iter(current)) != mtype:
+        raise ValueError("An operand in the update expression has an incorrect data type")
+    have = list(current[mtype]) if current else []
+    if name == "set_add":
+        return {mtype: have + [m for m in members[mtype] if m not in have]}
+    if current is None:
+        return None
+    kept = [m for m in have if m not in members[mtype]]
+    return {mtype: kept} if kept else None
 
 
-def _partiql_update(table, parsed):
-    set_attrs = parsed.get("set_attrs", {})
-    remove_attrs = parsed.get("remove_attrs", [])
+def _partiql_update(table, parsed, data=None):
     returning = parsed.get("returning")
-
-    if not parsed.get("where_fn") and not parsed.get("conditions"):
-        return error_response_json("ValidationException",
-                                   "UPDATE requires a WHERE clause", 400)
-    if not set_attrs and not remove_attrs:
-        return error_response_json("ValidationException",
-                                   "UPDATE requires SET or REMOVE clause", 400)
-
-    # Validate RETURNING clause
     if returning:
         valid_returning = {"ALL OLD *", "ALL NEW *", "MODIFIED OLD *", "MODIFIED NEW *"}
         if returning.upper().strip() not in valid_returning:
             return error_response_json("ValidationException",
                 f"Invalid returning clause: RETURNING {returning} is not supported", 400)
-
-    pk_key, sk_key, non_key_fn, err = _partiql_key_target(table, parsed)
+    pk_key, sk_key, condition, err = _partiql_key_target(table, parsed)
     if err:
         return err
-
     item = table["items"].get(pk_key, {}).get(sk_key)
     # UPDATE on a missing key → ConditionalCheckFailedException (not upsert).
     if item is None:
         return _conditional_check_failed({}, None)
-    if not non_key_fn(item):
-        return _conditional_check_failed({}, item)
-
+    try:
+        holds = condition(item)
+    except ValueError as exc:
+        return error_response_json("ValidationException", str(exc), 400)
+    if not holds:
+        return _conditional_check_failed(data or {}, item)
     item_before = copy.deepcopy(item)
     work = copy.deepcopy(item)
     applied_paths = []
-    for attr, val in set_attrs.items():
-        # Handle arithmetic: {"__partiql_arith": {"attr": "n", "op": "+", "val": {"N": "1"}}}
-        if isinstance(val, dict) and "__partiql_arith" in val:
-            arith = val["__partiql_arith"]
-            src_attr = arith["attr"]
-            op = arith["op"]
-            operand = arith["val"]
-            cur = work.get(src_attr)
-            if cur and "N" in cur and "N" in operand:
-                from decimal import Decimal
-                result_n = Decimal(cur["N"]) + Decimal(operand["N"]) if op == "+" else Decimal(cur["N"]) - Decimal(operand["N"])
-                work[attr] = {"N": str(result_n)}
+    try:
+        for parts, value in parsed.get("assignments") or []:
+            if value[0] == "setfn":
+                result = _pq_set_function(value[1], _partiql_get_path(work, parts), value[2])
+                if result is None:
+                    _partiql_remove_path(work, parts)
+                    applied_paths.append(parts)
+                    continue
             else:
-                work[attr] = operand  # fallback: just set to operand
-            applied_paths.append([attr])
-            continue
-        try:
-            parts = _partiql_parse_path(attr)
-        except ValueError as exc:
-            return error_response_json("ValidationException", str(exc), 400)
-        err_msg = _partiql_set_path(work, parts, val)
-        if err_msg:
-            return error_response_json("ValidationException", err_msg, 400)
-        applied_paths.append(parts)
-    for attr in remove_attrs:
-        try:
-            parts = _partiql_parse_path(attr)
-        except ValueError as exc:
-            return error_response_json("ValidationException", str(exc), 400)
+                result = _pq_eval(value, work)
+            if result is None:
+                return error_response_json("ValidationException", _PARTIQL_BAD_PATH, 400)
+            err_msg = _partiql_set_path(work, parts, _copy_attribute_value(result))
+            if err_msg:
+                return error_response_json("ValidationException", err_msg, 400)
+            applied_paths.append(parts)
+    except ValueError as exc:
+        return error_response_json("ValidationException", str(exc), 400)
+    for parts in parsed.get("removes") or []:
         _partiql_remove_path(work, parts)
         applied_paths.append(parts)
     if _item_size_bytes(work) > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException", _UPDATE_SIZE_MSG, 400)
-    # Nothing failed — commit the working copy.
     _set_item(table, pk_key, sk_key, work)
     item_after = work
-
     if returning:
         r = returning.upper().strip()
         if r in ("MODIFIED OLD *", "MODIFIED NEW *"):
@@ -3361,12 +4286,8 @@ def _partiql_update(table, parsed):
         return json_response({"Items": items_list})
     return json_response({"Items": []})
 
-
-def _partiql_delete(table, parsed):
+def _partiql_delete(table, parsed, data=None):
     returning = parsed.get("returning")
-    if not parsed.get("where_fn") and not parsed.get("conditions"):
-        return error_response_json("ValidationException",
-                                   "DELETE requires a WHERE clause", 400)
 
     # Validate RETURNING clause — DELETE only supports ALL OLD *
     if returning:
@@ -3388,9 +4309,12 @@ def _partiql_delete(table, parsed):
             return json_response({"Items": []})
         return json_response({"Items": []})
 
-    # Non-key predicate fails → ConditionalCheckFailed
-    if not non_key_fn(item):
-        return _conditional_check_failed({}, item)
+    try:
+        holds = non_key_fn(item)
+    except ValueError as exc:
+        return error_response_json("ValidationException", str(exc), 400)
+    if not holds:
+        return _conditional_check_failed(data or {}, item)
 
     item_before = copy.deepcopy(item) if returning else None
     _remove_item(table, pk_key, sk_key)
@@ -3398,6 +4322,25 @@ def _partiql_delete(table, parsed):
     if returning and returning.upper().strip() == "ALL OLD *":
         return json_response({"Items": [item_before] if item_before else []})
     return json_response({"Items": []})
+
+
+def _pq_select_key_error(table, parsed) -> bool:
+    """A batch or transaction SELECT reads one item: equality on every key attribute, no functions."""
+    if parsed.get("index"):
+        return True
+    eq_attrs = {attr for attr, op, _ in parsed.get("conditions") or [] if op == "="}
+    need = {table.get("pk_name")} | ({table.get("sk_name")} if table.get("sk_name") else set())
+    return not need.issubset(eq_attrs) or _pq_has_call(parsed.get("where"))
+
+
+def _pq_multi_attribute_index_error(table, index_name):
+    for idx in (table.get("GlobalSecondaryIndexes") or []) + (table.get("LocalSecondaryIndexes") or []):
+        if idx.get("IndexName") == index_name:
+            kinds = [k.get("KeyType") for k in idx.get("KeySchema") or []]
+            if kinds.count("HASH") > 1 or kinds.count("RANGE") > 1:
+                return ("PartiQL statements cannot be executed on tables with multi-attribute HASH keys "
+                        "or multi-attribute RANGE keys.")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3444,27 +4387,18 @@ def _batch_execute_statement(data):
         try:
             parsed = _parse_partiql(raw_stmt, stmt.get("Parameters", []))
         except ValueError as exc:
-            msg = str(exc)
-            if msg.startswith(("Unsupported PartiQL statement", "Could not parse")):
-                msg = "Statement wasn't well formed, can't be processed: Expected data manipulation"
-            responses.append({"Error": {"Code": "ValidationError", "Message": msg}})
+            responses.append({"Error": {"Code": "ValidationError", "Message": str(exc)}})
             continue
         if parsed["op"] == "SELECT":
-            # A batch SELECT must name the full table primary key with equality,
-            # and an index-qualified read is not reachable from a batch at all.
-            key_err = None
             tbl = _tables.get(parsed["table"])
-            if parsed.get("index"):
-                key_err = True
-            elif tbl is not None:
-                eq_attrs = {attr for attr, op_, _ in (parsed.get("conditions") or []) if op_ == "="}
-                need = {tbl.get("pk_name")} | ({tbl.get("sk_name")} if tbl.get("sk_name") else set())
-                key_err = not need.issubset(eq_attrs)
-            if key_err:
-                responses.append({"Error": {"Code": "ValidationError",
-                    "Message": "Select statements within BatchExecuteStatement must specify the primary key in the where clause"}})
+            refusal = _pq_multi_attribute_index_error(tbl, parsed.get("index")) if tbl else None
+            if refusal or (tbl is not None and _pq_select_key_error(tbl, parsed)):
+                responses.append({"Error": {"Code": "ValidationError", "Message": refusal or
+                    "Select statements within BatchExecuteStatement must specify the primary key in the where clause."}})
                 continue
         sub = {"Statement": raw_stmt, "Parameters": stmt.get("Parameters", [])}
+        if stmt.get("ReturnValuesOnConditionCheckFailure"):
+            sub["ReturnValuesOnConditionCheckFailure"] = stmt["ReturnValuesOnConditionCheckFailure"]
         status, _, body = _execute_statement(sub)
         try:
             payload = json.loads(body)
@@ -3489,6 +4423,8 @@ def _batch_execute_statement(data):
             elif short.endswith("Exception"):
                 short = short[: -len("Exception")]
             err_entry: dict = {"Error": {"Code": short, "Message": err_msg}}
+            if short == "ConditionalCheckFailed" and payload.get("Item"):
+                err_entry["Error"]["Item"] = payload["Item"]
             # TableName is echoed only on a member that ran and failed during
             # execution — not on one rejected before it reached its table.
             if short in ("ConditionalCheckFailed", "DuplicateItem"):
@@ -3559,17 +4495,30 @@ def _execute_transaction(data):
         if _re2.search(r'\s+RETURNING\s+', statement, _re2.IGNORECASE):
             return error_response_json("ValidationException",
                 f"Validation failed in TransactStatements[{stmt_index}]: RETURNING clause is not supported in ExecuteTransaction.", 400)
+        prefix = f"Validation failed in TransactStatements[{stmt_index}]: "
         try:
             parsed = _parse_partiql(statement, parameters)
+        except PartiqlError as e:
+            return error_response_json("ValidationException", (prefix if e.statement_level else "") + str(e), 400)
         except ValueError as e:
             return error_response_json("ValidationException", str(e), 400)
         if parsed.get("op") == "SELECT" and parsed.get("index"):
             return error_response_json("ValidationException",
-                f"Validation failed in TransactStatements[{stmt_index}]: Reads on indices are not supported within transactions.", 400)
+                f"{prefix}Reads on indices are not supported within transactions.", 400)
         table = _tables.get(parsed["table"])
         if not table:
             return error_response_json("ResourceNotFoundException",
                 f"Requested resource not found: Table: {parsed['table']} not found", 400)
+        if parsed["op"] == "SELECT" and _pq_select_key_error(table, parsed):
+            return error_response_json("ValidationException",
+                f"{prefix}Select statements within ExecuteTransaction must specify the primary key in the where clause.", 400)
+        if parsed["op"] == "EXISTS":
+            inner = parsed["select"]
+            key_only = all(op == "=" and attr in (table.get("pk_name"), table.get("sk_name"))
+                           for attr, op, _ in inner.get("conditions") or [])
+            if _pq_select_key_error(table, {**inner, "where": None}) or (key_only and not _pq_has_call(inner.get("where"))):
+                return error_response_json("ValidationException",
+                    f"{prefix}EXISTS() must contain a single item read with additional condition", 400)
         parsed_list.append((parsed, table))
 
     # Apply each statement; collect any failures to roll back. Take ONE
@@ -3584,6 +4533,14 @@ def _execute_transaction(data):
     responses = []
     failure = None
     for idx, (parsed, table) in enumerate(parsed_list):
+        if parsed["op"] == "EXISTS":
+            inner = parsed["select"]
+            pk_key, sk_key, condition, _err = _partiql_key_target(table, inner)
+            found = table["items"].get(pk_key, {}).get(sk_key)
+            if found is None or not condition(found):
+                failure = (idx, "ConditionalCheckFailed", "The conditional request failed")
+                break
+            continue
         if parsed["op"] == "SELECT":
             status, _, body = _partiql_select(table, parsed)
         elif parsed["op"] == "INSERT":
@@ -3629,7 +4586,8 @@ def _execute_transaction(data):
         }).encode("utf-8")
         return 400, {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": "TransactionCanceledException"}, body
 
-    result = {"Responses": responses}
+    reads = any(parsed["op"] == "SELECT" for parsed, _ in parsed_list)
+    result = {"Responses": responses if reads else []}
     # Per-table item sizes: a transactional write costs 2 x ceil(size/1KB) WCU,
     # a same-token replay 2 x ceil(size/4KB) RCU (measured, paritysuite).
     txn_sizes: dict = {}
@@ -3658,177 +4616,261 @@ def _execute_transaction(data):
     return json_response(result)
 
 
-def _parse_partiql(statement, parameters):
-    """Minimal PartiQL parser for DynamoDB statements."""
-    s = statement.strip().rstrip(";").strip()
-    upper = s.upper()
-
-    if upper.startswith("SELECT"):
-        return _parse_partiql_select(s, parameters)
-    elif upper.startswith("INSERT"):
-        return _parse_partiql_insert(s, parameters)
-    elif upper.startswith("UPDATE"):
-        return _parse_partiql_update(s, parameters)
-    elif upper.startswith("DELETE"):
-        return _parse_partiql_delete(s, parameters)
-    else:
-        raise ValueError(f"Unsupported PartiQL statement: {s[:20]}")
+_PARAM_NUMBER_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)(?:[eE]([+-]?\d+))?$")
+_INT32_MIN, _INT32_MAX = -(2 ** 31), 2 ** 31 - 1
 
 
-def _partiql_from_path_error(s):
-    """AWS checks the FROM path before resolving it: no empty component, at most two."""
-    import re
-    m = re.search(r'\bFROM\s+((?:"[^"]*"|[A-Za-z0-9_\-]+)(?:\s*\.\s*(?:"[^"]*"|[A-Za-z0-9_\-]+))*)', s, re.IGNORECASE)
-    if not m:
+def _wrap_int32(n: int) -> int:
+    return (n + 2 ** 31) % 2 ** 32 - 2 ** 31
+
+
+def _partiql_number_param_error(text) -> str | None:
+    """A number parameter is read as Java's BigDecimal reads a string: an exponent or scale outside
+    a 32-bit integer cannot be converted, and the magnitude check wraps in 32-bit arithmetic."""
+    unconvertible = "The parameter cannot be converted to a numeric value"
+    if not isinstance(text, str) or text == "":
+        return unconvertible
+    match = _PARAM_NUMBER_RE.match(text)
+    if not match:
+        return f"{unconvertible}: {text}"
+    exponent = int(match.group(2) or 0)
+    mantissa = match.group(1)
+    fraction = len(mantissa.split(".", 1)[1]) if "." in mantissa else 0
+    scale = fraction - exponent
+    if not _INT32_MIN <= exponent <= _INT32_MAX or not _INT32_MIN <= scale <= _INT32_MAX:
+        return f"{unconvertible}: {text}"
+    digits = mantissa.replace(".", "").lstrip("0")
+    if not digits:
         return None
-    components = re.findall(r'"[^"]*"|[A-Za-z0-9_\-]+', m.group(1))
-    if any(c == '""' for c in components):
-        return "Path component cannot be an empty string"
-    if len(components) > 2:
-        return "A path may contain at most 2 components in the FROM clause"
+    wrapped = _wrap_int32(len(digits) - scale)
+    if wrapped != len(digits) - scale:
+        if wrapped - 1 < _DDB_NUM_NEG_MIN_EXP:
+            return "Number underflow. Attempting to store a number with magnitude smaller than supported range"
+        return "Number overflow. Attempting to store a number with magnitude larger than supported range"
     return None
 
 
-def _parse_partiql_select(s, parameters):
-    import re
-    path_error = _partiql_from_path_error(s)
-    if path_error:
-        raise ValueError(path_error)
-    # SELECT <projections> FROM <table> [WHERE <condition>]
-    m = re.match(
-        r'SELECT\s+(.*?)\s+FROM\s+("?[A-Za-z0-9_.\-]+"?(?:\s*\.\s*"[A-Za-z0-9_.\-]+")?)(?:\s+WHERE\s+(.+))?$',
-        s, re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        raise ValueError(f"Could not parse SELECT statement: {s}")
-
-    proj_str = m.group(1).strip()
-    from_str = m.group(2).strip()
-    where_str = m.group(3)
-    # FROM "table"."index" — the index qualifier must be quoted, so a plain
-    # table name containing dots keeps its existing meaning.
-    index_name = None
-    qm = re.match(r'^"?([A-Za-z0-9_.\-]+?)"?\s*\.\s*"([A-Za-z0-9_.\-]+)"$', from_str)
-    if '"' in from_str and qm:
-        table_name = qm.group(1)
-        index_name = qm.group(2)
-    else:
-        table_name = from_str.strip('"')
-
-    projections = None
-    if proj_str != "*":
-        projections = [p.strip().strip('"') for p in proj_str.split(",")]
-
-    where_fn, conditions = (_build_partiql_where(where_str, parameters)
-                            if where_str else (None, []))
-
-    return {"op": "SELECT", "table": table_name, "index": index_name,
-            "projections": projections, "where_fn": where_fn, "conditions": conditions}
+def _partiql_parameter_error(value, level: int = 1) -> str | None:
+    """The first problem in a parameter, in document order: too deep, or a number that cannot be read."""
+    if level > _DDB_MAX_NESTING_DEPTH:
+        return _NESTING_MSG
+    if not isinstance(value, dict) or len(value) != 1:
+        return None
+    (vtype, vval), = value.items()
+    if vtype == "N":
+        return _partiql_number_param_error(vval)
+    if vtype == "NS" and isinstance(vval, list):
+        return next(filter(None, (_partiql_number_param_error(n) for n in vval)), None)
+    children = vval.values() if vtype == "M" and isinstance(vval, dict) else (
+        vval if vtype == "L" and isinstance(vval, list) else ())
+    return next(filter(None, (_partiql_parameter_error(v, level + 1) for v in children)), None)
 
 
-def _parse_partiql_insert(s, parameters):
-    import re
-    # INSERT INTO <table> VALUE { ... }
-    if re.search(r'INTO\s+"[^"]+"\s*\.\s*"', s, re.IGNORECASE):
-        raise ValueError(
-            "Statement wasn't well formed, can't be processed: FROM clause may only contain a single table name")
-    m = re.match(
-        r"INSERT\s+INTO\s+\"?([A-Za-z0-9_.\-]+)\"?\s+VALUE\s+(.+)$",
-        s, re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        raise ValueError(f"Could not parse INSERT statement: {s}")
-
-    table_name = m.group(1).strip()
-    value_str = m.group(2).strip()
-    item = _parse_partiql_value(value_str, parameters)
-    if not isinstance(item, dict) or not all(isinstance(v, dict) for v in item.values()):
-        raise ValueError("INSERT VALUE must be a map of DynamoDB-typed attributes")
-    return {"op": "INSERT", "table": table_name, "item": item}
-
-
-def _parse_partiql_update(s, parameters):
-    import re
-    # UPDATE <table> SET <assignments> [REMOVE <paths>] WHERE <condition> [RETURNING <clause>]
-    # Strip RETURNING clause first (it's always at the end).
-    returning = None
-    ret_match = re.search(r'\s+RETURNING\s+(.+)$', s, re.IGNORECASE)
-    if ret_match:
-        returning = ret_match.group(1).strip()
-        s = s[:ret_match.start()].strip()
-
-    if re.match(r'UPDATE\s+"[^"]+"\s*\.\s*"', s, re.IGNORECASE):
-        raise ValueError("This operation is not supported on an index")
-    # Try SET ... WHERE form first.
-    m = re.match(
-        r"UPDATE\s+\"?([A-Za-z0-9_.\-]+)\"?\s+SET\s+(.+?)\s+WHERE\s+(.+)$",
-        s, re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        table_name = m.group(1).strip()
-        set_str = m.group(2).strip()
-        where_str = m.group(3).strip()
-        remove_str = None
-        # Check for embedded REMOVE clause within SET string (SET x=v REMOVE y WHERE ...)
-        rem_in_set = re.search(r'\s+REMOVE\s+(.+)$', set_str, re.IGNORECASE)
-        if rem_in_set:
-            remove_str = rem_in_set.group(1).strip()
-            set_str = set_str[:rem_in_set.start()].strip()
-        set_attrs = {}
-        param_idx = [0]
-        for assignment in _split_top_level(set_str, ','):
-            parts = assignment.split("=", 1)
-            if len(parts) != 2:
-                raise ValueError(f"Invalid SET assignment: {assignment}")
-            attr = parts[0].strip().strip('"')
-            val_str = parts[1].strip()
-            set_attrs[attr] = _parse_partiql_literal(val_str, parameters, param_idx)
-        where_fn, conditions = _build_partiql_where(where_str, parameters, param_idx)
-        return {"op": "UPDATE", "table": table_name, "set_attrs": set_attrs,
-                "remove_attrs": [r.strip() for r in remove_str.split(",")] if remove_str else [],
-                "where_fn": where_fn, "conditions": conditions, "returning": returning}
-
-    # Try REMOVE ... WHERE form.
-    m = re.match(
-        r"UPDATE\s+\"?([A-Za-z0-9_.\-]+)\"?\s+REMOVE\s+(.+?)\s+WHERE\s+(.+)$",
-        s, re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        table_name = m.group(1).strip()
-        remove_str = m.group(2).strip()
-        where_str = m.group(3).strip()
-        param_idx = [0]
-        where_fn, conditions = _build_partiql_where(where_str, parameters, param_idx)
-        return {"op": "UPDATE", "table": table_name, "set_attrs": {},
-                "remove_attrs": [r.strip() for r in remove_str.split(",")],
-                "where_fn": where_fn, "conditions": conditions, "returning": returning}
-
-    raise ValueError(f"Could not parse UPDATE statement: {s}")
+def _parse_partiql(statement, parameters):
+    """Parse a PartiQL statement into the shape the executors run."""
+    for parameter in parameters or []:
+        err = _partiql_parameter_error(parameter)
+        if err:
+            raise ValueError(err)
+    parsed = parse_partiql_statement(statement, parameters)
+    where = parsed.get("where")
+    parsed["where_fn"] = (lambda item, _w=where: _pq_truthy(_pq_eval(_w, item))) if where is not None else None
+    parsed["conditions"] = _pq_conditions(where)
+    if parsed.get("projections") is not None:
+        parsed["projections"] = [_pq_path_text(parts) for parts in parsed["projections"]]
+    if parsed["op"] == "EXISTS":
+        inner = parsed["select"]
+        inner["where_fn"] = ((lambda item, _w=inner["where"]: _pq_truthy(_pq_eval(_w, item)))
+                             if inner.get("where") is not None else None)
+        inner["conditions"] = _pq_conditions(inner.get("where"))
+    return parsed
 
 
-def _parse_partiql_delete(s, parameters):
-    import re
-    # Strip RETURNING clause first.
-    returning = None
-    ret_match = re.search(r'\s+RETURNING\s+(.+)$', s, re.IGNORECASE)
-    if ret_match:
-        returning = ret_match.group(1).strip()
-        s = s[:ret_match.start()].strip()
+def _pq_path_text(parts):
+    return "".join(f"[{p}]" if isinstance(p, int) else (f".{p}" if i else p) for i, p in enumerate(parts))
 
-    if re.match(r'DELETE\s+FROM\s+"[^"]+"\s*\.\s*"', s, re.IGNORECASE):
-        raise ValueError("This operation is not supported on an index")
-    # DELETE FROM <table> WHERE <condition>
-    m = re.match(
-        r"DELETE\s+FROM\s+\"?([A-Za-z0-9_.\-]+)\"?\s+WHERE\s+(.+)$",
-        s, re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        raise ValueError(f"Could not parse DELETE statement: {s}")
-    table_name = m.group(1).strip()
-    where_str = m.group(2).strip()
-    where_fn, conditions = _build_partiql_where(where_str, parameters)
-    return {"op": "DELETE", "table": table_name, "where_fn": where_fn,
-            "conditions": conditions, "returning": returning}
+
+def _pq_truthy(value):
+    return isinstance(value, dict) and value.get("BOOL") is True
+
+
+def _pq_bool(flag):
+    return {"BOOL": bool(flag)}
+
+
+_PQ_SET_TYPES = ("SS", "NS", "BS")
+
+
+def _pq_eval(node, item):
+    """A PartiQL expression's value on an item; a missing path is None."""
+    kind = node[0]
+    if kind == "lit":
+        return node[1]
+    if kind == "path":
+        return _partiql_get_path(item, node[1])
+    if kind == "missing":
+        return None
+    if kind == "and":
+        return _pq_bool(_pq_truthy(_pq_eval(node[1], item)) and _pq_truthy(_pq_eval(node[2], item)))
+    if kind == "or":
+        return _pq_bool(_pq_truthy(_pq_eval(node[1], item)) or _pq_truthy(_pq_eval(node[2], item)))
+    if kind == "not":
+        return _pq_bool(not _pq_truthy(_pq_eval(node[1], item)))
+    if kind == "cmp":
+        return _pq_bool(_compare_ddb(_pq_eval(node[2], item), node[1], _pq_eval(node[3], item)))
+    if kind == "between":
+        value = _pq_eval(node[1], item)
+        return _pq_bool(_compare_ddb(value, ">=", _pq_eval(node[2], item))
+                        and _compare_ddb(value, "<=", _pq_eval(node[3], item)))
+    if kind == "in":
+        value = _pq_eval(node[1], item)
+        options = node[2]
+        candidates = ([_pq_eval(o, item) for o in options[1]] if options[0] == "options"
+                      else (options[1] or {}).get("L") or [])
+        return _pq_bool(value is not None and any(_ddb_equals(value, c) for c in candidates))
+    if kind == "is":
+        value, wanted, negated = _pq_eval(node[1], item), node[2], node[3]
+        if wanted == "MISSING":
+            result = value is None
+        elif wanted == "NULL":
+            result = value is None or value == {"NULL": True}
+        elif value is None:
+            result = False
+        else:
+            vtype = next(iter(value))
+            result = vtype in _PQ_SET_TYPES if wanted == "BAG" else vtype == wanted
+        return _pq_bool(result != negated)
+    if kind == "call":
+        return _pq_call(node[1], [_pq_eval(a, item) for a in node[2]], node[2])
+    if kind == "arith":
+        left, right = _pq_eval(node[2], item), _pq_eval(node[3], item)
+        if not (left and right and "N" in left and "N" in right):
+            raise ValueError("An operand in the update expression has an incorrect data type")
+        total = Decimal(left["N"]) + Decimal(right["N"]) if node[1] == "+" else Decimal(left["N"]) - Decimal(right["N"])
+        return {"N": _ddb_canonicalize_number(str(total)) or str(total)}
+    if kind == "map":
+        return {"M": {k: _pq_eval(v, item) for k, v in node[1]}}
+    if kind == "list":
+        return {"L": [_pq_eval(v, item) for v in node[1]]}
+    if kind == "like":
+        raise ValueError("Unsupported operation: Like")
+    raise ValueError(f"Unsupported operation: {kind}")
+
+
+def _pq_call(name, args, nodes):
+    first = args[0] if args else None
+    if name == "attribute_exists":
+        return _pq_bool(first is not None)
+    if name == "attribute_not_exists":
+        return _pq_bool(first is None)
+    second = args[1] if len(args) > 1 else None
+    if name == "begins_with":
+        if first is None or second is None:
+            return _pq_bool(False)
+        for t in ("S", "B"):
+            if t in first and t in second:
+                return _pq_bool(first[t].startswith(second[t]))
+        return _pq_bool(False)
+    if name == "contains":
+        if first is None or second is None:
+            return _pq_bool(False)
+        if "S" in first and "S" in second:
+            return _pq_bool(second["S"] in first["S"])
+        vtype = next(iter(first))
+        if vtype in _PQ_SET_TYPES:
+            member = second.get(vtype[0])
+            return _pq_bool(member is not None and member in first[vtype])
+        if vtype == "L":
+            return _pq_bool(any(_ddb_equals(v, second) for v in first["L"]))
+        return _pq_bool(False)
+    if name == "size":
+        if first is None:
+            return None
+        vtype, value = next(iter(first.items()))
+        if vtype == "S":
+            return {"N": str(len(value))}
+        if vtype == "B":
+            return {"N": str(len(base64.b64decode(value)) if isinstance(value, str) else len(value))}
+        if vtype in ("L", "M") or vtype in _PQ_SET_TYPES:
+            return {"N": str(len(value))}
+        return None
+    if name == "attribute_type":
+        return _pq_bool(first is not None and second is not None and second.get("S") == next(iter(first)))
+    raise ValueError(f"Unsupported operation: {name}")
+
+
+def _pq_conditions(where):
+    """Top-level AND conjuncts on a top-level attribute, as (attr, op, value) for key targeting."""
+    if where is None:
+        return []
+    conjuncts, stack = [], [where]
+    while stack:
+        node = stack.pop()
+        if node[0] == "and":
+            stack.extend((node[2], node[1]))
+        elif node[0] == "or":
+            return []
+        else:
+            conjuncts.append(node)
+    out = []
+
+    def attr_of(node):
+        return node[1][0] if node[0] == "path" and len(node[1]) == 1 else None
+
+    flip = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "=", "<>": "<>"}
+    for node in conjuncts:
+        negated = node[0] == "not"
+        inner = node[1] if negated else node
+        prefix = "NOT:" if negated else ""
+        if inner[0] == "cmp":
+            left, right = inner[2], inner[3]
+            if attr_of(left) and right[0] == "lit":
+                out.append((attr_of(left), prefix + inner[1], right[1]))
+            elif attr_of(right) and left[0] == "lit":
+                out.append((attr_of(right), prefix + flip[inner[1]], left[1]))
+        elif inner[0] == "between" and not negated and attr_of(inner[1]) and inner[2][0] == inner[3][0] == "lit":
+            out.append((attr_of(inner[1]), ">=", inner[2][1]))
+            out.append((attr_of(inner[1]), "<=", inner[3][1]))
+        elif inner[0] == "in" and not negated and attr_of(inner[1]):
+            options = inner[2]
+            if options[0] == "options" and all(o[0] == "lit" for o in options[1]):
+                out.append((attr_of(inner[1]), "IN", [o[1] for o in options[1]]))
+        elif inner[0] == "call" and inner[1] == "begins_with" and len(inner[2]) == 2 \
+                and attr_of(inner[2][0]) and inner[2][1][0] == "lit":
+            out.append((attr_of(inner[2][0]), "not_begins_with" if negated else "begins_with", inner[2][1][1]))
+        elif inner[0] == "is" and not negated and inner[2] == "MISSING" and attr_of(inner[1]):
+            out.append((attr_of(inner[1]), "is_not_missing" if inner[3] else "is_missing", None))
+    return out
+
+
+def _pq_has_call(where) -> bool:
+    if where is None:
+        return False
+    if where[0] == "call":
+        return True
+    return any(isinstance(c, tuple) and c and isinstance(c[0], str) and _pq_has_call(c) for c in where[1:])
+
+
+def _pq_overlap_error(table, where):
+    """OR branches overlapping on the sort key: one branch bounds it, another filters a non-key attribute."""
+    sk = table.get("sk_name")
+    if not sk or where is None or where[0] != "or":
+        return None
+    branches, stack = [], [where]
+    while stack:
+        node = stack.pop()
+        if node[0] == "or":
+            stack.extend((node[2], node[1]))
+        else:
+            branches.append(_pq_conditions(node) if node[0] != "or" else [])
+    keys = {table.get("pk_name"), sk}
+    positive = [any(a == sk and not op.startswith("NOT:") and op not in ("<>", "not_begins_with")
+                    for a, op, _ in b) for b in branches]
+    filtered = [any(a not in keys for a, _, _ in b) for b in branches]
+    for i, b in enumerate(branches):
+        if positive[i] and any(filtered[j] and not positive[j] for j in range(len(branches)) if j != i):
+            return "Overlapping conditions with range keys are not supported in where clause"
+    return None
 
 
 def _eval_partiql_pred(item, attr, op, val):
@@ -3856,329 +4898,6 @@ def _eval_partiql_pred(item, attr, op, val):
     return _compare_ddb(item_val, op, val)
 
 
-def _build_partiql_where(where_str, parameters, param_idx=None):
-    """Build a predicate function + structural conditions list for a PartiQL
-    WHERE. Top-level OR splits into branches (DNF); the conditions list is
-    only populated for the single-branch form, which is what key targeting
-    and batch key validation consume."""
-    if not where_str or not where_str.strip():
-        return None, []
-    if param_idx is None:
-        param_idx = [0]
-
-    branches = []
-    for branch_str in _split_top_level_by_or(where_str):
-        b = branch_str.strip()
-        # Strip one pair of parens wrapping the whole branch.
-        if b.startswith("(") and b.endswith(")"):
-            depth = 0
-            wraps = True
-            for k, ch in enumerate(b):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0 and k != len(b) - 1:
-                        wraps = False
-                        break
-            if wraps:
-                b = b[1:-1].strip()
-        branches.append(_parse_partiql_conditions(b, parameters, param_idx))
-
-    conditions = branches[0] if len(branches) == 1 else []
-
-    def where_fn(item):
-        return any(all(_eval_partiql_pred(item, attr, op, val) for attr, op, val in branch)
-                   for branch in branches)
-
-    return where_fn, conditions
-
-
-def _split_top_level_by_or(s):
-    """Split a WHERE string on OR at the top level (respecting parens/quotes)."""
-    parts = []
-    depth = 0
-    in_str = None
-    current = []
-    i = 0
-    s_up = s.upper()
-    while i < len(s):
-        ch = s[i]
-        if in_str:
-            current.append(ch)
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            in_str = ch
-            current.append(ch)
-            i += 1
-            continue
-        if ch in ('(', '[', '{'):
-            depth += 1
-            current.append(ch)
-            i += 1
-            continue
-        if ch in (')', ']', '}'):
-            depth -= 1
-            current.append(ch)
-            i += 1
-            continue
-        if depth == 0 and s_up[i:i+3] == ' OR' and (i + 3 >= len(s) or s[i+3] == ' '):
-            parts.append("".join(current))
-            current = []
-            i += 3
-            continue
-        current.append(ch)
-        i += 1
-    if current:
-        parts.append("".join(current))
-    return [p.strip() for p in parts if p.strip()]
-
-def _parse_partiql_conditions(where_str, parameters, param_idx):
-    """Parse WHERE conditions joined by AND. Returns list of (attr, op, ddb_value)."""
-    import re
-    conditions = []
-    # Split on AND (case-insensitive, word boundary) — but not inside parens.
-    parts = _split_top_level_by_and(where_str)
-    for part in parts:
-        part = part.strip()
-        # begins_with(attr, val)
-        m = re.match(r'begins_with\s*\(\s*"?([A-Za-z0-9_.\-]+)"?\s*,\s*(.+)\s*\)\s*$', part, re.IGNORECASE)
-        if m:
-            attr = m.group(1)
-            val = _parse_partiql_literal(m.group(2).strip(), parameters, param_idx)
-            conditions.append((attr, "begins_with", val))
-            continue
-        # NOT begins_with(attr, val)
-        m = re.match(r'NOT\s+begins_with\s*\(\s*"?([A-Za-z0-9_.\-]+)"?\s*,\s*(.+)\s*\)\s*$', part, re.IGNORECASE)
-        if m:
-            attr = m.group(1)
-            val = _parse_partiql_literal(m.group(2).strip(), parameters, param_idx)
-            conditions.append((attr, "not_begins_with", val))
-            continue
-        # attr IS MISSING
-        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IS\s+MISSING\s*$', part, re.IGNORECASE)
-        if m:
-            conditions.append((m.group(1), "is_missing", None))
-            continue
-        # attr IS NOT MISSING
-        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IS\s+NOT\s+MISSING\s*$', part, re.IGNORECASE)
-        if m:
-            conditions.append((m.group(1), "is_not_missing", None))
-            continue
-        # attr IN ('v1', 'v2', ...)
-        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IN\s*\[(.+)\]\s*$', part, re.IGNORECASE)
-        if not m:
-            m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+IN\s*\((.+)\)\s*$', part, re.IGNORECASE)
-        if m:
-            attr = m.group(1)
-            vals = [_parse_partiql_literal(v.strip(), parameters, param_idx)
-                    for v in _split_top_level(m.group(2), ',')]
-            conditions.append((attr, "IN", vals))
-            continue
-        # NOT <comparison> — negated predicate (begins_with has its own form).
-        mnot = re.match(r'NOT\s+("?[A-Za-z0-9_.\-]+"?\s*(?:=|<>|!=|<=|>=|<|>).+)$', part, re.IGNORECASE)
-        if mnot and not re.match(r'NOT\s+begins_with', part, re.IGNORECASE):
-            inner = _parse_partiql_conditions(mnot.group(1), parameters, param_idx)
-            for attr_i, op_i, val_i in inner:
-                conditions.append((attr_i, f"NOT:{op_i}", val_i))
-            continue
-        # attr BETWEEN lo AND hi (the inner AND is re-joined by the splitter)
-        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s+BETWEEN\s+(.+?)\s+AND\s+(.+)$', part, re.IGNORECASE)
-        if m:
-            attr = m.group(1)
-            lo = _parse_partiql_literal(m.group(2).strip(), parameters, param_idx)
-            hi = _parse_partiql_literal(m.group(3).strip(), parameters, param_idx)
-            for bound in (lo, hi):
-                bt = _ddb_type(bound)
-                if bt and bt not in ("S", "N", "B"):
-                    raise ValueError(
-                        f"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: {bt}")
-            conditions.append((attr, ">=", lo))
-            conditions.append((attr, "<=", hi))
-            continue
-        # Standard comparison
-        m = re.match(r'"?([A-Za-z0-9_.\-]+)"?\s*(=|<>|!=|<=|>=|<|>)\s*(.+)$', part)
-        if not m:
-            raise ValueError(f"Could not parse WHERE condition: {part}")
-        attr = m.group(1)
-        op = m.group(2)
-        if op == '!=':
-            op = '<>'
-        val_str = m.group(3).strip()
-        val = _parse_partiql_literal(val_str, parameters, param_idx)
-        if op in ("<", "<=", ">", ">="):
-            # Ordering only exists for S / N / B operands; AWS rejects the
-            # statement naming the operator as written (measured, paritysuite).
-            vt = _ddb_type(val)
-            if vt and vt not in ("S", "N", "B"):
-                raise ValueError(
-                    f"Incorrect operand type for operator or function; operator or function: {op}, operand type: {vt}")
-        conditions.append((attr, op, val))
-    return conditions
-
-
-def _split_top_level_by_and(s):
-    """Split a WHERE string on AND at the top level (respecting parens/quotes)."""
-    # Use the existing _split_top_level approach but with AND as delimiter
-    parts = []
-    depth = 0
-    in_str = None
-    current = []
-    i = 0
-    s_up = s.upper()
-    while i < len(s):
-        ch = s[i]
-        if in_str:
-            current.append(ch)
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            in_str = ch
-            current.append(ch)
-            i += 1
-            continue
-        if ch in ('(', '[', '{'):
-            depth += 1
-            current.append(ch)
-            i += 1
-            continue
-        if ch in (')', ']', '}'):
-            depth -= 1
-            current.append(ch)
-            i += 1
-            continue
-        # Check for AND keyword at depth 0 — but the AND that separates a
-        # BETWEEN's bounds belongs to the BETWEEN, not the conjunction.
-        if depth == 0 and s_up[i:i+4] == ' AND' and (i + 4 >= len(s) or s[i+4] == ' '):
-            cur_up = "".join(current).upper()
-            between_pending = (' BETWEEN ' in cur_up
-                               and ' AND ' not in cur_up.split(' BETWEEN ', 1)[1] + ' ')
-            if not between_pending:
-                parts.append("".join(current))
-                current = []
-                i += 4  # skip " AND"
-                continue
-        current.append(ch)
-        i += 1
-    if current:
-        parts.append("".join(current))
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _parse_partiql_literal(val_str, parameters, param_idx=None):
-    """Parse a PartiQL literal or ? parameter reference into a DynamoDB typed value."""
-    if param_idx is None:
-        param_idx = [0]
-    val_str = val_str.strip()
-
-    if val_str == "?":
-        if param_idx[0] >= len(parameters):
-            raise ValueError("Not enough parameters for ? placeholders")
-        val = parameters[param_idx[0]]
-        param_idx[0] += 1
-        return val
-
-    # String literal
-    if (val_str.startswith("'") and val_str.endswith("'")) or \
-       (val_str.startswith('"') and val_str.endswith('"')):
-        return {"S": val_str[1:-1]}
-
-    # Boolean
-    if val_str.upper() == "TRUE":
-        return {"BOOL": True}
-    if val_str.upper() == "FALSE":
-        return {"BOOL": False}
-
-    # NULL
-    if val_str.upper() == "NULL":
-        return {"NULL": True}
-
-    # Number
-    try:
-        Decimal(val_str)
-        return {"N": val_str}
-    except (InvalidOperation, ValueError):
-        pass
-
-    # Arithmetic expression: attr +/- number (e.g. "n + 1")
-    arith_m = re.match(r'^"?([A-Za-z0-9_.\-]+)"?\s*([+\-])\s*(.+)$', val_str)
-    if arith_m:
-        left_attr = arith_m.group(1)
-        operator = arith_m.group(2)
-        right_str = arith_m.group(3).strip()
-        right_val = _parse_partiql_literal(right_str, parameters, param_idx)
-        return {"__partiql_arith": {"attr": left_attr, "op": operator, "val": right_val}}
-
-    raise ValueError(f"Cannot parse PartiQL value: {val_str}")
-
-
-def _parse_partiql_value(val_str, parameters, param_idx=None):
-    """Parse a PartiQL VALUE map like {'attr': val, ...} into a DynamoDB item."""
-    if param_idx is None:
-        param_idx = [0]
-    val_str = val_str.strip()
-
-    if val_str == "?":
-        if param_idx[0] >= len(parameters):
-            raise ValueError("Not enough parameters for ? placeholders")
-        val = parameters[param_idx[0]]
-        param_idx[0] += 1
-        return val
-
-    # Parse DynamoDB JSON-style map: { 'key' : value, ... }
-    if not val_str.startswith("{") or not val_str.endswith("}"):
-        raise ValueError(f"Expected a map value, got: {val_str}")
-
-    inner = val_str[1:-1].strip()
-    result = {}
-    for pair in _split_top_level(inner, ','):
-        pair = pair.strip()
-        if not pair:
-            continue
-        kv = pair.split(":", 1)
-        if len(kv) != 2:
-            raise ValueError(f"Invalid key-value pair: {pair}")
-        key = kv[0].strip().strip("'\"")
-        val = _parse_partiql_literal(kv[1].strip(), parameters, param_idx)
-        result[key] = val
-    return result
-
-
-def _split_top_level(s, delimiter):
-    """Split string by delimiter, respecting nested braces/parens/quotes."""
-    parts = []
-    depth = 0
-    current = []
-    in_str = None
-    for ch in s:
-        if in_str:
-            current.append(ch)
-            if ch == in_str:
-                in_str = None
-        elif ch in ("'", '"'):
-            in_str = ch
-            current.append(ch)
-        elif ch in ('(', '{', '['):
-            depth += 1
-            current.append(ch)
-        elif ch in (')', '}', ']'):
-            depth -= 1
-            current.append(ch)
-        elif ch == delimiter and depth == 0:
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append("".join(current))
-    return parts
-
-
 # ---------------------------------------------------------------------------
 # Batch operations
 # ---------------------------------------------------------------------------
@@ -4204,6 +4923,9 @@ def _batch_write_item(data):
     if not request_items:
         return error_response_json("ValidationException",
             "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    err = _batch_members_error(data, request_items, write=True)
+    if err:
+        return err
     # Total request count cap (25 per BatchWriteItem call).
     total = sum(len(v) for v in request_items.values())
     if total > _DDB_BATCH_WRITE_MAX:
@@ -4230,7 +4952,8 @@ def _batch_write_item(data):
             # must not leave earlier members written.
             if "PutRequest" in req:
                 item = req["PutRequest"].get("Item", {})
-                err = _validate_item(item, table.get("pk_name"), table.get("sk_name"))
+                err = (_values_error_response(item.values() if isinstance(item, dict) else (), envelope=False)
+                       or _validate_item(item, table.get("pk_name"), table.get("sk_name")))
                 if err:
                     return err
                 _, _, key_err = _resolve_table_key_values(table, item, allow_extra=True)
@@ -4244,6 +4967,9 @@ def _batch_write_item(data):
                             _extract_key_val(item.get(table.get("sk_name") or "")) if table.get("sk_name") else None)
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"].get("Key", {})
+                err = _values_error_response(key.values() if isinstance(key, dict) else (), envelope=False)
+                if err:
+                    return err
                 _, _, key_err = _resolve_table_key_values(table, key, allow_extra=False)
                 if key_err:
                     return key_err
@@ -4315,8 +5041,13 @@ def _batch_write_item(data):
 def _batch_get_item(data):
     request_items = data.get("RequestItems")
     if not request_items:
+        if get_region() in _OLDER_BATCH_GET_REGIONS:
+            return error_response_json("ValidationException", "The requestItems parameter is required for BatchGetItem", 400)
         return error_response_json("ValidationException",
             "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    err = _batch_members_error(data, request_items, write=False)
+    if err:
+        return err
     # Per-table key cap (100 per BatchGetItem call, per-table path in the error).
     for _bg_table_name, _bg_cfg in request_items.items():
         _bg_keys = _bg_cfg.get("Keys", [])
@@ -4328,6 +5059,11 @@ def _batch_get_item(data):
         if _normalize_table_name(table_name) not in _tables:
             return error_response_json("ResourceNotFoundException",
                 "Requested resource not found", 400)
+    for cfg in request_items.values():
+        for key in (cfg.get("Keys") or []) if isinstance(cfg, dict) else ():
+            err = _values_error_response(key.values() if isinstance(key, dict) else (), envelope=False)
+            if err:
+                return err
     # Duplicate-key rejection.
     for table_name, cfg in request_items.items():
         table = _tables[_normalize_table_name(table_name)]
@@ -4392,17 +5128,14 @@ def _transact_write_items(data):
     if len(items_list) > _DDB_TXN_WRITE_MAX_ITEMS:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '[{', '.join(repr(i) for i in items_list)}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_WRITE_MAX_ITEMS}", 400)
-    # An oversized expression in any member rejects the whole request up front.
+    err = _transact_write_members_error(data, items_list)
+    if err:
+        return err
+    # Each action is read in request order, before any table is looked up.
     for _member in items_list:
-        for _op in (_member.values() if isinstance(_member, dict) else []):
-            if isinstance(_op, dict):
-                err = _expression_size_error(_op, ("ConditionExpression", "UpdateExpression"))
-                if err:
-                    return err
-                values = list((_op.get("ExpressionAttributeValues") or {}).values())
-                values += list((_op.get("Item") or {}).values()) if isinstance(_op.get("Item"), dict) else []
-                if any(_nesting_exceeded(v) for v in values):
-                    return error_response_json("ValidationException", _NESTING_MSG, 400)
+        err = _transact_write_action_error(*_extract_transact_op(_member))
+        if err:
+            return err
     # 4MB total payload cap.
     try:
         if len(json.dumps(data).encode("utf-8")) > _DDB_TXN_MAX_BYTES:
@@ -4438,16 +5171,7 @@ def _transact_write_items(data):
                 return json_response(replay)
             return error_response_json("IdempotentParameterMismatchException",
                 "Request token already in use for another request with a different payload", 400)
-    # Member validation across the transaction. AWS validates every member
-    # before applying anything, but splits the failure into two shapes
-    # (verified against real DynamoDB):
-    #   * up-front input errors -> top-level ValidationException (Phase 0):
-    #     empty-string/binary key values, malformed item attrs, item size,
-    #     and duplicate target keys.
-    #   * per-item semantic errors -> TransactionCanceledException with a
-    #     positional ValidationError reason (Phase 1): wrong-typed keys and
-    #     update-expression type errors.
-    # Nothing is applied in either case.
+    # Up-front input errors are a ValidationException; wrong-typed keys and update type errors cancel.
     seen_targets = set()
     for transact in items_list:
         op_type, op = _extract_transact_op(transact)
@@ -4500,14 +5224,16 @@ def _transact_write_items(data):
 
     # Phase 1: wrong-typed keys and update-expression type errors surface as a
     # per-item ValidationError cancellation reason, not a top-level exception.
+    # Update-expression errors (expr_reasons) wait for the conditions, as in UpdateItem.
     val_reasons = {}
+    expr_reasons = {}
     for idx, transact in enumerate(items_list):
         op_type, op = _extract_transact_op(transact)
         if op is None:
             continue
         tbl = _tables.get(op.get("TableName", ""))
         if not tbl:
-            continue
+            return error_response_json("ResourceNotFoundException", "Requested resource not found", 400)
         key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
         type_msg = _key_type_mismatch_reason(tbl, key_src)
         if type_msg:
@@ -4530,13 +5256,15 @@ def _transact_write_items(data):
                 try:
                     probe, _ = _apply_update_expression(probe, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
                 except ValueError as exc:
-                    val_reasons[idx] = str(exc)
+                    expr_reasons[idx] = str(exc)
                 else:
                     imsg = _index_key_type_reason(tbl, probe)
                     if imsg:
                         val_reasons[idx] = imsg
                     elif _item_size_bytes(probe) > _DDB_ITEM_MAX_BYTES:
                         val_reasons[idx] = _UPDATE_SIZE_MSG
+                    elif any(_nesting_exceeded(v) for v in probe.values()):
+                        val_reasons[idx] = "Nesting Levels have exceeded supported limits"
     if val_reasons:
         return _transact_validation_cancel_response(len(items_list), val_reasons)
 
@@ -4547,21 +5275,26 @@ def _transact_write_items(data):
         op_type, op = _extract_transact_op(transact)
         if op is None:
             continue
-        tbl = _tables.get(op.get("TableName", ""))
-        if not tbl:
-            return error_response_json("ResourceNotFoundException", "Requested resource not found", 400)
+        tbl = _tables[op.get("TableName", "")]
         cond = op.get("ConditionExpression", "")
         if cond:
             if op_type == "Put":
                 existing = _get_item_by_key(tbl, _extract_key_from_item(tbl, op.get("Item", {})))
             else:
                 existing = _get_item_by_key(tbl, op.get("Key", {}))
-            if not _evaluate_condition(cond, existing or {}, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {})):
+            try:
+                holds = _evaluate_condition(cond, existing or {}, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
+            except ValueError as exc:
+                # e.g. begins_with on a number operand
+                return error_response_json("ValidationException", str(exc), 400)
+            if not holds:
                 fail_item = existing if op.get("ReturnValuesOnConditionCheckFailure") == "ALL_OLD" else None
                 failures[idx] = fail_item
 
-    if failures:
-        return _transact_cancel_response(len(items_list), failures)
+    # A failed condition wins over the member's own update-expression error.
+    expr_reasons = {i: msg for i, msg in expr_reasons.items() if i not in failures}
+    if failures or expr_reasons:
+        return _transact_cancel_response(len(items_list), failures, expr_reasons)
 
     _txn_write_effects: dict = {}
 
@@ -4696,6 +5429,15 @@ def _transact_get_items(data):
     if len(items_list) > _DDB_TXN_GET_MAX_ITEMS:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '[{', '.join(repr(i) for i in items_list)}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to {_DDB_TXN_GET_MAX_ITEMS}", 400)
+    failures = _transact_member_enum_failures(data)
+    for idx, member in enumerate(items_list, 1):
+        name = (member.get("Get") or {}).get("TableName") if isinstance(member, dict) else None
+        if _malformed_table_reference(name):
+            failures.append((name, f"transactItems.{idx}.member.get.tableName",
+                             "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"))
+    err = _multi_validation_error(failures)
+    if err:
+        return err
     # AWS pre-validates ProjectionExpression syntax + reserved keywords at the
     # request level for TransactGetItems — surfaces as a ValidationException,
     # not via the cancellation channel.
@@ -4705,6 +5447,10 @@ def _transact_get_items(data):
             _err = _validate_projection_expression_syntax(_pe)
             if _err:
                 return error_response_json("ValidationException", _err, 400)
+    for transact in items_list:
+        err = _values_error_response(((transact.get("Get") or {}).get("Key") or {}).values(), envelope=False)
+        if err:
+            return err
     # Per-action ValidationError (e.g. empty Key) surfaces as
     # TransactionCanceledException with reason "ValidationError" per AWS.
     _cancel_reasons = []
@@ -4797,6 +5543,98 @@ def _transact_get_items(data):
     return json_response(result)
 
 
+_TXN_TOKEN_TOO_LONG = ("1 validation error detected: Value at 'ClientRequestToken' failed to satisfy constraint: "
+                       "Member must have length less than or equal to 36")
+
+
+def _transact_member_enum_failures(data) -> list:
+    failures = []
+    rcc = data.get("ReturnConsumedCapacity")
+    if rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES:
+        failures.append((rcc, "returnConsumedCapacity", "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"))
+    ricm = data.get("ReturnItemCollectionMetrics")
+    if ricm is not None and ricm not in _RETURN_ITEM_COLLECTION_METRICS:
+        failures.append((ricm, "returnItemCollectionMetrics", "Member must satisfy enum value set: [SIZE, NONE]"))
+    return failures
+
+
+def _transact_write_members_error(data, items_list) -> tuple | None:
+    """Member constraints, reported together before the actions are read."""
+    crt = data.get("ClientRequestToken")
+    if isinstance(crt, str) and len(crt) > 36:
+        return error_response_json("ValidationException", _TXN_TOKEN_TOO_LONG, 400)
+    failures = _transact_member_enum_failures(data)
+    for idx, member in enumerate(items_list, 1):
+        op_type, op = _extract_transact_op(member) if isinstance(member, dict) else (None, None)
+        if op is None:
+            failures.append(("", "transactItems",
+                             "TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"))
+            continue
+        name = op.get("TableName") if isinstance(op, dict) else None
+        if _malformed_table_reference(name):
+            path = f"transactItems.{idx}.member.{op_type[0].lower() + op_type[1:]}.tableName"
+            failures.append((name, path, "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"))
+    return _multi_validation_error(failures)
+
+
+def _transact_write_action_error(op_type, op) -> tuple | None:
+    """An action's own checks: expressions, then names, depth and values."""
+    if not isinstance(op, dict):
+        return None
+    err = _expression_size_error(op, ("ConditionExpression", "UpdateExpression"),
+                                 {"ConditionExpression": "figure", "UpdateExpression": "bare"})
+    if err:
+        return err
+    for slot in ("ConditionExpression", "UpdateExpression"):
+        if slot in op and isinstance(op[slot], str) and not op[slot].strip():
+            return error_response_json("ValidationException", f"Invalid {slot}: The expression can not be empty;", 400)
+    eav, ean = op.get("ExpressionAttributeValues") or {}, op.get("ExpressionAttributeNames") or {}
+    if op.get("ConditionExpression"):
+        try:
+            _evaluate_condition(op["ConditionExpression"], {}, eav, ean)
+        except ValueError as exc:
+            return error_response_json("ValidationException", str(exc), 400)
+    fields = ("ConditionExpression", "UpdateExpression") if op_type == "Update" else ("ConditionExpression",)
+    err = _validate_expression_attrs(op, fields)
+    if err:
+        return err
+    item = op.get("Item") if isinstance(op.get("Item"), dict) else {}
+    if "" in item:
+        return error_response_json("ValidationException", "Empty attribute name", 400)
+    for container in (item, op.get("Key") if isinstance(op.get("Key"), dict) else {}):
+        if any(_nesting_exceeded(v) for v in container.values()):
+            return error_response_json("ValidationException", _NESTING_MSG, 400)
+    # A value one level past the item cap still reaches the condition.
+    for key, value in eav.items():
+        level = _nesting_level(value)
+        if level > _DDB_SECOND_NESTING_LEVEL - 1:
+            return error_response_json("ValidationException",
+                f"ExpressionAttributeValues contains invalid value: {_NESTING_MSG} for key {key}", 400)
+        if level > _DDB_MAX_NESTING_DEPTH + 1:
+            return error_response_json("ValidationException", _NESTING_MSG, 400)
+    return _values_error_response(_request_values(op), envelope=False)
+
+
+def _batch_members_error(data, request_items, write: bool) -> tuple | None:
+    """A malformed table name in RequestItems and the enums, reported together."""
+    pieces = []
+    if any(not isinstance(n, str) or _malformed_table_reference(n) for n in request_items):
+        echoed = json.dumps(request_items, separators=(",", ":"), ensure_ascii=False)
+        pieces.append(f"Value '{echoed}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: "
+                      "[Member must have length less than or equal to 255, Member must have length greater than or equal to 3, "
+                      "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]")
+    for name, entry in request_items.items():
+        members = entry if write else (entry.get("Keys") if isinstance(entry, dict) else None)
+        if isinstance(members, list) and not members:
+            path = f"RequestItems.{name}.member" + ("" if write else ".Keys")
+            pieces.append(f"Value at '{path}' failed to satisfy constraint: Member must have length greater than or equal to 1")
+    pieces += [f"Value '{v}' at '{path}' failed to satisfy constraint: {c}" for v, path, c in _transact_member_enum_failures(data)]
+    if not pieces:
+        return None
+    return error_response_json("ValidationException",
+        f"{len(pieces)} validation error{'s' if len(pieces) > 1 else ''} detected: " + "; ".join(pieces), 400)
+
+
 def _extract_transact_op(transact):
     for op_type in ("ConditionCheck", "Put", "Delete", "Update"):
         if op_type in transact:
@@ -4804,17 +5642,20 @@ def _extract_transact_op(transact):
     return None, None
 
 
-def _transact_cancel_response(total, failures):
+def _transact_cancel_response(total, failures, val_reasons):
     """Build a TransactionCanceledException response.
 
     *failures* is a dict mapping failed item indices to the existing item
     (or ``None`` if ``ReturnValuesOnConditionCheckFailure`` was not ``ALL_OLD``).
     All entries in the dict are marked ``ConditionalCheckFailed``; the rest are
-    ``None``.  AWS returns a reason entry for every item in the transaction.
+    ``None``, or ``ValidationError`` for the indices in *val_reasons*.  AWS
+    returns a reason entry for every item in the transaction.
     """
     reasons = []
     for i in range(total):
-        if i in failures:
+        if i in val_reasons:
+            reasons.append({"Code": "ValidationError", "Message": val_reasons[i]})
+        elif i in failures:
             entry = {"Code": "ConditionalCheckFailed", "Message": "The conditional request failed"}
             if failures[i] is not None:
                 entry["Item"] = failures[i]
@@ -4878,6 +5719,8 @@ def _describe_continuous_backups(data):
     pitr_desc: dict = {
         "PointInTimeRecoveryStatus": "ENABLED" if pitr_enabled else "DISABLED",
     }
+    if pitr_enabled:
+        pitr_desc["RecoveryPeriodInDays"] = 35 if pitr_enabled is True else pitr_enabled
     # AWS only meaningfully populates the restorable-date-time fields when PITR
     # is enabled; emitting `0` (Unix epoch 1970) misleads SDK consumers that
     # parse them into datetimes. Omit when disabled.
@@ -4899,13 +5742,15 @@ def _update_continuous_backups(data):
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("PointInTimeRecoverySpecification", {})
     enabled = spec.get("PointInTimeRecoveryEnabled", False)
-    _pitr_settings[name] = enabled
+    # Stored as the recovery period in days when enabled, False when disabled.
+    _pitr_settings[name] = int(spec.get("RecoveryPeriodInDays") or 35) if enabled else False
+    pitr_desc = {"PointInTimeRecoveryStatus": "ENABLED" if enabled else "DISABLED"}
+    if enabled:
+        pitr_desc["RecoveryPeriodInDays"] = _pitr_settings[name]
     return json_response({
         "ContinuousBackupsDescription": {
             "ContinuousBackupsStatus": "ENABLED",
-            "PointInTimeRecoveryDescription": {
-                "PointInTimeRecoveryStatus": "ENABLED" if enabled else "DISABLED",
-            }
+            "PointInTimeRecoveryDescription": pitr_desc,
         }
     })
 
@@ -5234,17 +6079,22 @@ def _update_contributor_insights(data):
     # ENABLE moves through ENABLING; AWS reports ENABLING immediately and
     # transitions to ENABLED on the next describe. Match that.
     new_status = "ENABLING" if action == "ENABLE" else "DISABLING"
+    mode = data.get("ContributorInsightsMode") or (_contributor_insights.get(key) or {}).get("ContributorInsightsMode")
     _contributor_insights[key] = {
         "ContributorInsightsStatus": new_status,
         "LastUpdateDateTime": int(time.time()),
         "ContributorInsightsRuleList": [],
     }
+    if mode:
+        _contributor_insights[key]["ContributorInsightsMode"] = mode
     resp = {
         "TableName": name,
         "ContributorInsightsStatus": new_status,
     }
     if index_name:
         resp["IndexName"] = index_name
+    if mode:
+        resp["ContributorInsightsMode"] = mode
     return json_response(resp)
 
 
@@ -5292,6 +6142,8 @@ def _describe_contributor_insights(data):
         resp["IndexName"] = index_name
     if last_update is not None:
         resp["LastUpdateDateTime"] = last_update
+    if entry and entry.get("ContributorInsightsMode"):
+        resp["ContributorInsightsMode"] = entry["ContributorInsightsMode"]
     return json_response(resp)
 
 
@@ -5318,6 +6170,8 @@ def _list_contributor_insights(data):
         }
         if iname:
             summary["IndexName"] = iname
+        if entry.get("ContributorInsightsMode"):
+            summary["ContributorInsightsMode"] = entry["ContributorInsightsMode"]
         summaries.append(summary)
     # Simple offset-based pagination
     start = 0
@@ -5357,6 +6211,52 @@ def _table_name_from_arn(arn: str) -> str | None:
         return None
     # Strip /stream/... or /index/... suffixes.
     return after.split("/")[0]
+
+
+_ITEM_ACTIONS = frozenset({"GetItem", "PutItem", "UpdateItem", "DeleteItem", "Query", "Scan", "BatchGetItem",
+                           "BatchWriteItem", "TransactGetItems", "TransactWriteItems"})
+
+
+def _item_table_refs(action, data):
+    if not isinstance(data, dict):
+        return []
+    if action in ("BatchGetItem", "BatchWriteItem"):
+        items = data.get("RequestItems")
+        return list(items) if isinstance(items, dict) else []
+    if action in ("TransactGetItems", "TransactWriteItems"):
+        items = data.get("TransactItems")
+        return [detail.get("TableName") for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict) for detail in item.values() if isinstance(detail, dict)]
+    return [data.get("TableName")]
+
+
+def _foreign_item_owner(action, data) -> str | None:
+    """The other account whose tables an item call names by ARN in this region; None for the caller's own."""
+    if action not in _ITEM_ACTIONS:
+        return None
+    owners = set()
+    for ref in _item_table_refs(action, data):
+        spec = _dynamodb_arn_spec(ref) if isinstance(ref, str) and ref.startswith("arn:") else None
+        if spec is None or spec.region != get_region() or not spec.resource.startswith("table/"):
+            owners.add(get_account_id())
+        else:
+            owners.add(spec.account_id)
+    owner = owners.pop() if len(owners) == 1 else None
+    return owner if owner and owner != get_account_id() else None
+
+
+def table_policy_for_arn(arn: str) -> tuple[str, str] | None:
+    """The table's resource policy and owner account, for the identity check. A table ARN of another
+    account answers even for a table that does not exist there, as AWS refuses it like a missing grant."""
+    spec = _dynamodb_arn_spec(arn) if isinstance(arn, str) else None
+    if spec is None or spec.region != get_region() or not spec.resource.startswith("table/"):
+        return None
+    name = spec.resource[len("table/"):].split("/")[0]
+    table_arn = f"arn:{spec.partition}:dynamodb:{spec.region}:{spec.account_id}:table/{name}"
+    if spec.account_id == get_account_id():
+        return None
+    entry = _resource_policies.get_scoped(spec.account_id, spec.region, table_arn)
+    return (entry or {}).get("Policy") or "", spec.account_id
 
 
 def _resource_arn_exists(arn: str) -> bool:
@@ -5578,9 +6478,18 @@ def _validate_csv_import_options(data):
     return None
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _import_description(desc):
     """The stored import without the result the grace window still holds back."""
-    return {k: v for k, v in desc.items() if not k.startswith("_")}
+    return _drop_none({k: v for k, v in desc.items() if not k.startswith("_")})
 
 
 class _ImportFailed(Exception):
@@ -5953,7 +6862,7 @@ def _list_imports(data):
     for desc in _imports.values():
         if table_arn_filter and desc.get("TableArn") != table_arn_filter:
             continue
-        summaries.append({
+        summaries.append(_drop_none({
             "ImportArn": desc["ImportArn"],
             "ImportStatus": desc["ImportStatus"],
             "TableArn": desc.get("TableArn"),
@@ -5962,7 +6871,7 @@ def _list_imports(data):
             "InputFormat": desc.get("InputFormat"),
             "StartTime": desc.get("StartTime"),
             "EndTime": desc.get("EndTime"),
-        })
+        }))
     start = 0
     if next_token:
         try:
@@ -6051,7 +6960,7 @@ def _describe_backup(data):
         return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
     # Strip the internal items snapshot from the wire response.
     public = {k: v for k, v in desc.items() if not k.startswith("_")}
-    return json_response({"BackupDescription": public})
+    return json_response({"BackupDescription": _drop_none(public)})
 
 
 def _delete_backup(data):
@@ -6063,7 +6972,7 @@ def _delete_backup(data):
     if not desc:
         return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
     public = {k: v for k, v in desc.items() if not k.startswith("_")}
-    return json_response({"BackupDescription": public})
+    return json_response({"BackupDescription": _drop_none(public)})
 
 
 def _list_backups(data):
@@ -6546,6 +7455,132 @@ def _check_redundant_parens(tokens, slot: str = "ConditionExpression") -> str | 
     return None
 
 
+_COND_TOKEN_RE = re.compile(
+    r"\s*(?:(?P<op><>|<=|>=|[=<>(),.\[\]])|(?P<name>#?[A-Za-z0-9_]+)|(?P<value>:[A-Za-z0-9_]+)|(?P<other>\S))")
+_COND_COMPARATORS = {"=", "<>", "<", "<=", ">", ">="}
+_COND_KEYWORDS = {"AND", "OR", "NOT", "BETWEEN", "IN"}
+
+
+class _ConditionSyntaxError(Exception):
+    pass
+
+
+def _condition_syntax_error(expr: str, slot: str) -> str | None:
+    """Grammar check of a condition, in one pass. Reports the token DynamoDB stops at and the text
+    from the token before it to the token after it; any other fault is left to the evaluator."""
+    tokens = []
+    for m in _COND_TOKEN_RE.finditer(expr):
+        if m.group("other"):
+            return None
+        group = "op" if m.group("op") else ("value" if m.group("value") else "name")
+        text = m.group(group)
+        kind = text.upper() if group == "name" and text.upper() in _COND_KEYWORDS else group
+        tokens.append((kind, text, m.start(group), m.end(group)))
+    pos = 0
+
+    def peek(offset=0):
+        i = pos + offset
+        return tokens[i] if i < len(tokens) else ("EOF", "<EOF>", len(expr), len(expr))
+
+    def fail():
+        start = tokens[pos - 1][2] if pos > 0 else (tokens[pos][2] if pos < len(tokens) else len(expr))
+        end = tokens[pos + 1][3] if pos + 1 < len(tokens) else (tokens[pos][3] if pos < len(tokens) else len(expr))
+        raise _ConditionSyntaxError(f'Invalid {slot}: Syntax error; token: "{peek()[1]}", near: "{expr[start:end]}"')
+
+    def take(kind=None, text=None):
+        nonlocal pos
+        tok = peek()
+        if (kind and tok[0] != kind) or (text and tok[1] != text):
+            fail()
+        pos += 1
+        return tok
+
+    def path():
+        if peek()[0] != "name" or peek()[1][0].isdigit():
+            fail()
+        take()
+        while peek()[1] in (".", "["):
+            if take()[1] == ".":
+                take("name")
+            else:
+                if not peek()[1].isdigit():
+                    fail()
+                take()
+                take("op", "]")
+
+    def operand():
+        tok = peek()
+        if tok[0] == "value":
+            take()
+        elif tok[0] == "name" and peek(1)[1] == "(":
+            take()
+            arguments()
+        else:
+            path()
+
+    def arguments():
+        take("op", "(")
+        operand()
+        while peek()[1] == ",":
+            take()
+            operand()
+        take("op", ")")
+
+    def atom():
+        tok = peek()
+        if tok[1] == "(":
+            take()
+            disjunction()
+            take("op", ")")
+            return
+        if tok[0] == "name" and peek(1)[1] == "(" and tok[1].lower() != "size":
+            take()
+            arguments()
+            return
+        operand()
+        nxt = peek()
+        if nxt[1] in _COND_COMPARATORS:
+            take()
+            operand()
+        elif nxt[0] == "BETWEEN":
+            take()
+            operand()
+            take("AND")
+            operand()
+        elif nxt[0] == "IN":
+            take()
+            arguments()
+        else:
+            fail()
+
+    def negation():
+        if peek()[0] == "NOT":
+            take()
+            negation()
+        else:
+            atom()
+
+    def conjunction():
+        negation()
+        while peek()[0] == "AND":
+            take()
+            negation()
+
+    def disjunction():
+        conjunction()
+        while peek()[0] == "OR":
+            take()
+            conjunction()
+
+    try:
+        disjunction()
+        if pos < len(tokens):
+            fail()
+    except _ConditionSyntaxError as exc:
+        return str(exc)
+    return None
+
+
 def _evaluate_condition(expr, item, attr_values, attr_names,
                         slot: str = "ConditionExpression"):
     """Evaluate a DynamoDB expression. ``slot`` controls the "Invalid <X>:"
@@ -6559,7 +7594,7 @@ def _evaluate_condition(expr, item, attr_values, attr_names,
         err = _check_redundant_parens(tokens, slot)
         if err:
             raise ValueError(err)
-        err = _check_reserved_keyword_usage(tokens)
+        err = _check_reserved_keyword_usage(tokens) or _condition_syntax_error(expr, slot)
         if err:
             raise ValueError(err)
         # AWS validates BETWEEN bounds at parse time for ConditionExpression too:
@@ -6636,6 +7671,15 @@ def _apply_update_expression(item, expr, attr_values, attr_names, updated_attrs=
     return item, updated_attrs
 
 
+def _copy_attribute_value(value):
+    """A copy sharing nothing, not even with itself (copy.deepcopy's memo would keep `[x, x]` shared)."""
+    if isinstance(value, dict):
+        return {k: _copy_attribute_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_attribute_value(v) for v in value]
+    return value
+
+
 def _apply_set(item, tokens, attr_values, attr_names, updated_attrs):
     # AWS semantics: all RHS references resolve against the pre-update snapshot
     # of the item. Resolve every value first, then apply assignments — so
@@ -6663,7 +7707,7 @@ def _apply_set(item, tokens, attr_values, attr_names, updated_attrs):
             pending.append((path_parts, value))
             updated_attrs.add(tuple(path_parts))
     for path_parts, value in pending:
-        _set_at_path(item, path_parts, value)
+        _set_at_path(item, path_parts, _copy_attribute_value(value))
 
 
 def _eval_set_value(tokens, item, attr_values, attr_names):
@@ -6939,9 +7983,11 @@ def _set_at_path(item, path_parts, value):
         if isinstance(part, int):
             if isinstance(item, dict) and "L" in item:
                 lst = item["L"]
-                while len(lst) <= part:
-                    lst.append({"NULL": True})
-                lst[part] = value
+                # An index past the end appends the value.
+                if part >= len(lst):
+                    lst.append(value)
+                else:
+                    lst[part] = value
         else:
             if isinstance(item, dict):
                 if "M" in item:
@@ -7577,7 +8623,26 @@ def _vector_score(fn: str, query: list, vector: list) -> float:
     return _to_f32(score) or 0.0
 
 
+_SEARCH_VECTORS_TYPES = {"TableName": "a string", "IndexName": "a string", "SearchVector": "a sequence", "TopK": "i32"}
+
+
+def _search_vectors_shape_error(data) -> tuple | None:
+    """SearchVectors reads its body with a strict deserialiser before any member is validated."""
+    body = json.dumps(data, separators=(",", ":"))
+    for key, value in data.items():
+        if value is None and key in _SEARCH_VECTORS_TYPES:
+            column = body.index(f'"{key}":null') + len(f'"{key}":null')
+            return error_response_json("SerializationException",
+                f"invalid type: null, expected {_SEARCH_VECTORS_TYPES[key]} at line 1 column {column}", 400)
+    if "TableName" not in data:
+        return error_response_json("ValidationException", f"missing field `TableName` at line 1 column {len(body)}", 400)
+    return None
+
+
 def _search_vectors(data):
+    err = _search_vectors_shape_error(data)
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
@@ -7855,9 +8920,9 @@ def _index_order_value(item, name, type_hint):
     return _sort_key_value(item.get(name), type_hint)
 
 
-def _multi_sort_condition_ok(tokens, ean, range_names):
-    """Sort-key attributes of a multi-attribute key must be queried left to
-    right without skipping any, with equality on all but the last."""
+def _multi_sort_condition_error(tokens, ean, range_names) -> str | None:
+    """Sort-key attributes of a multi-attribute key are queried left to right, with equality on all
+    but the last one named."""
     ops = {}
     i = 0
     while i < len(tokens):
@@ -7874,9 +8939,16 @@ def _multi_sort_condition_ok(tokens, ean, range_names):
             ops.setdefault(name, []).append("eq" if eq else "range")
         i += 1
     used = [n for n in range_names if n in ops]
-    if used != range_names[:len(used)] or any(len(ops[n]) != 1 for n in used):
-        return False
-    return all(ops[n] == ["eq"] for n in used[:-1])
+    if any(len(ops[n]) != 1 for n in used):
+        return "Query key condition not supported"
+    if not used:
+        return None
+    last = used[-1]
+    lacking = [n for n in range_names[:range_names.index(last)] if ops.get(n) != ["eq"]]
+    if lacking:
+        return (f"RANGE key attributes {', '.join(lacking)} must have equality conditions specified in the query "
+                f"because a condition is present on key attribute {last}")
+    return None
 
 
 def _index_order_keys(table, sk_name):
@@ -8409,21 +9481,7 @@ def _evaluate_legacy_filter(item, scan_filter):
 
 
 def _evaluate_expected(item, expected, conditional_operator="AND"):
-    """Evaluate legacy ``Expected`` conditions on an item.
-
-    Each key in *expected* is an attribute name.  The value is one of:
-
-    1. ``{"ComparisonOperator": "...", "AttributeValueList": [...]}``
-       – full comparison form.
-    2. ``{"Exists": true/false}``
-       – shorthand for NOT_NULL / NULL.
-    3. ``{"Value": <attr>}``
-       – shorthand for ``{"ComparisonOperator": "EQ", "AttributeValueList": [<attr>]}``.
-    4. ``{"Exists": false}``
-       – attribute must *not* exist.
-
-    *conditional_operator* is ``"AND"`` (default) or ``"OR"``.
-    """
+    """Evaluate legacy ``Expected`` conditions (comparison, Exists or Value shorthand) on an item."""
     results = []
     for attr_name, cond in expected.items():
         item_val = item.get(attr_name)
@@ -8612,6 +9670,18 @@ def _index_write_units(table, idx, old_item, new_item):
     return max(_capacity_kb(_item_size_bytes(ov[1])), _capacity_kb(_item_size_bytes(nv[1])))
 
 
+def _billed_item_bytes(table: dict, item: dict) -> int:
+    """A write bills an attribute a vector index reads at its name plus four bytes per dimension."""
+    size = _item_size_bytes(item)
+    dimensions = {(vix.get("VectorAttribute") or {}).get("AttributeName"): vix.get("Dimensions")
+                  for vix in table.get("VectorIndexes") or []}
+    for attr, dims in dimensions.items():
+        values = (item.get(attr) or {}).get("L") if attr else None
+        if isinstance(values, list) and len(values) == dims:
+            size += 4 * dims - _attribute_value_size(item[attr])
+    return size
+
+
 def _add_consumed_capacity(result, data, table_name, write=False, old_item=None,
                            new_item=None, index_name=None):
     rc = data.get("ReturnConsumedCapacity", "NONE")
@@ -8621,8 +9691,8 @@ def _add_consumed_capacity(result, data, table_name, write=False, old_item=None,
     gsi_units: dict = {}
     lsi_units: dict = {}
     if write:
-        old_size = _item_size_bytes(old_item) if old_item else 0
-        new_size = _item_size_bytes(new_item) if new_item else 0
+        old_size = _billed_item_bytes(table, old_item) if old_item else 0
+        new_size = _billed_item_bytes(table, new_item) if new_item else 0
         table_units = _capacity_kb(max(old_size, new_size))
         for idx in table.get("GlobalSecondaryIndexes", []) or []:
             u = _index_write_units(table, idx, old_item, new_item)

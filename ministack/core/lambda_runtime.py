@@ -45,6 +45,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "_LAMBDA_FUNCTION_ARN",
     "_LAMBDA_TIMEOUT",
     "LAMBDA_TASK_ROOT",
+    "AWS_EXECUTION_ENV",
 }
 
 
@@ -242,9 +243,26 @@ def run():
     # After sys.path is complete (so a function that bundles its own botocore
     # gets that one) and before the handler module builds any client.
     _ms_install_invoke_depth()
+    # The handler's module as the function names it, for the messages awslambdaric words with it.
+    _ms_modname = init.get("handler_module") or module_name
+
+    class _MsFault(Exception):
+        def __init__(self, etype, msg, trace=None):
+            super().__init__(msg)
+            self.etype, self.msg, self.trace = etype, msg, trace or []
+
     try:
-        mod = importlib.import_module(module_name)
-        handler_fn = getattr(mod, handler_name)
+        try:
+            mod = importlib.import_module(module_name)
+        except ImportError as e:
+            raise _MsFault("Runtime.ImportModuleError", "Unable to import module '%s': %s" % (_ms_modname, e))
+        except SyntaxError as e:
+            raise _MsFault("Runtime.UserCodeSyntaxError", "Syntax error in module '%s': %s" % (_ms_modname, e),
+                           ['  File "%s" Line %s\\n    %s' % (e.filename, e.lineno, e.text)])
+        try:
+            handler_fn = getattr(mod, handler_name)
+        except AttributeError:
+            raise _MsFault("Runtime.HandlerNotFound", "Handler '%s' missing on module '%s'" % (handler_name, _ms_modname))
         if init.get("snapstart"):
             # SnapStart runtime hooks (snapshot-restore-py, bundled in AWS's
             # python3.12+ runtimes). Each environment of a published SnapStart
@@ -267,7 +285,13 @@ def run():
         _real_stdout.write(json.dumps({"status": "ready", "cold": True}) + "\\n")
         _real_stdout.flush()
     except Exception as e:
-        _real_stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\\n")
+        if isinstance(e, _MsFault):
+            _ms_payload = {"errorMessage": e.msg, "errorType": e.etype, "requestId": "", "stackTrace": e.trace}
+        else:
+            _ms_payload = {"errorMessage": str(e), "errorType": type(e).__name__, "requestId": "",
+                           "stackTrace": traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])}
+        _real_stdout.write(json.dumps({"status": "error", "error": _ms_payload["errorMessage"],
+                                       "errorType": _ms_payload["errorType"], "payload": _ms_payload}) + "\\n")
         _real_stdout.flush()
         return
 
@@ -321,21 +345,58 @@ def run():
             "client_context": None,
             "get_remaining_time_in_millis": lambda self: max(0, int((_deadline - time.time()) * 1000)),
         })()
+        _ms_rid = _ms_ctx.get("request_id", "")
         try:
             result = handler_fn(event, context)
-            _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
         except Exception as e:
-            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()}) + "\\n")
+            # As awslambdaric reports it: the exception's own type, and the frames below the runtime's.
+            _ms_payload = {"errorMessage": str(e), "errorType": type(e).__name__, "requestId": _ms_rid,
+                           "stackTrace": traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])}
+            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc(),
+                                           "payload": _ms_payload}) + "\\n")
+        else:
+            try:
+                _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
+            except Exception as e:
+                _ms_payload = {"errorMessage": "Unable to marshal response: %s" % e, "errorType": "Runtime.MarshalError",
+                               "requestId": _ms_rid, "stackTrace": []}
+                _real_stdout.write(json.dumps({"status": "error", "error": _ms_payload["errorMessage"],
+                                               "payload": _ms_payload}) + "\\n")
         _real_stdout.flush()
 
 run()
 ''')
 
+# MiniStack's own endpoint for Node workers is http(s)://localhost:<port>, so
+# the host an SDK v3 operation builds with a prefix (ServiceDiscovery "data-",
+# Step Functions "sync-", the KeyValueStore "<account>.") is a valid URL. The
+# hook sends localhost, <label>.localhost and <label>-localhost to 127.0.0.1
+# (the gateway may listen on IPv4 only) and checks the gateway certificate
+# against localhost. It runs only when MiniStack set AWS_ENDPOINT_URL.
+GATEWAY_LOOPBACK_ENV = "_MINISTACK_GATEWAY_LOOPBACK"
+NODE_GATEWAY_LOOPBACK_BOOTSTRAP = r"""
+(function _msGatewayLoopback() {
+  if (process.env.%s !== "1") return;
+  const dns = require("dns");
+  const tls = require("tls");
+  const gateway = /^(?:[a-z0-9-]+[.-])?localhost$/i;
+  const lookup = dns.lookup;
+  dns.lookup = function (hostname, options, callback) {
+    if (typeof hostname === "string" && gateway.test(hostname)) hostname = "127.0.0.1";
+    return lookup.call(this, hostname, options, callback);
+  };
+  const checkServerIdentity = tls.checkServerIdentity;
+  tls.checkServerIdentity = function (hostname, cert) {
+    return checkServerIdentity.call(this, gateway.test(hostname) ? "localhost" : hostname, cert);
+  };
+}());
+""" % GATEWAY_LOOPBACK_ENV
+
 # ---------------------------------------------------------------------------
 # Node.js worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_NODEJS_WORKER_SCRIPT = _sub_runtime_tokens(r'''
+_NODEJS_WORKER_SCRIPT = NODE_GATEWAY_LOOPBACK_BOOTSTRAP + _sub_runtime_tokens(r'''
 const readline = require("readline");
 const path = require("path");
 const http = require("http");
@@ -370,6 +431,38 @@ fs.write = function(fd, ...args) {
 // a Lambda Layer with the actual SDK takes precedence; fall back to a stub
 // that routes through AWS_ENDPOINT_URL (Ministack).
 (function _installAwsSdkV3Stubs() {
+  // SigV4-sign a stub request with the function's credentials, as the real SDK does.
+  function _signedHeaders(service, method, ep, requestPath, body, headers) {
+    const crypto = require("crypto");
+    const accessKey = process.env.AWS_ACCESS_KEY_ID;
+    const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
+    if (!accessKey || !secretKey) return headers;
+    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+    const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const scope = amzDate.slice(0, 8) + "/" + region + "/" + service + "/aws4_request";
+    const signed = Object.assign({}, headers, { host: ep.host, "x-amz-date": amzDate });
+    if (process.env.AWS_SESSION_TOKEN) signed["x-amz-security-token"] = process.env.AWS_SESSION_TOKEN;
+    const values = {};
+    for (const name of Object.keys(signed)) values[name.toLowerCase()] = String(signed[name]).trim();
+    const names = Object.keys(values).sort();
+    const encode = (v) => encodeURIComponent(v)
+      .replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+    const [rawPath, rawQuery] = requestPath.split("?");
+    const query = new URLSearchParams(rawQuery || "");
+    const canonicalQuery = [...query.entries()].map(([k, v]) => encode(k) + "=" + encode(v)).sort().join("&");
+    const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
+    const hmac = (key, data) => crypto.createHmac("sha256", key).update(data).digest();
+    const canonical = [method, rawPath.split("/").map(encode).join("/"), canonicalQuery,
+      names.map((n) => n + ":" + values[n] + "\n").join(""), names.join(";"), hash(body || "")].join("\n");
+    let key = hmac("AWS4" + secretKey, amzDate.slice(0, 8));
+    for (const part of [region, service, "aws4_request"]) key = hmac(key, part);
+    const signature = crypto.createHmac("sha256", key)
+      .update(["AWS4-HMAC-SHA256", amzDate, scope, hash(canonical)].join("\n")).digest("hex");
+    signed["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope
+      + ", SignedHeaders=" + names.join(";") + ", Signature=" + signature;
+    return signed;
+  }
+
   // ── Lambda stub (REST-based, not JSON-RPC) ─────────────────────────────
   function _lambdaInvoke(params) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
@@ -387,14 +480,15 @@ fs.write = function(fd, ...args) {
     if (process.env.__DEPTH_ENV__) {
       headers["__DEPTH_HEADER__"] = process.env.__DEPTH_ENV__;
     }
+    const requestPath = "/2015-03-31/functions/" + fn + "/invocations" + qs;
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
-          path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
-          headers: headers,
+          path: requestPath,
+          headers: _signedHeaders("lambda", "POST", ep, requestPath, body, headers),
         },
         (res) => {
           const chunks = [];
@@ -414,21 +508,68 @@ fs.write = function(fd, ...args) {
     });
   }
 
+  // GET /2017-03-31/tags/{Resource}
+  function _lambdaListTags(params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const resourceArn = params.Resource || "";
+    const requestPath = "/2017-03-31/tags/" + encodeURIComponent(resourceArn);
+    return new Promise((resolve, reject) => {
+      const req = (ep.protocol === "https:" ? https : http).request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "GET",
+          path: requestPath,
+          headers: _signedHeaders("lambda", "GET", ep, requestPath, "", {}),
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = text ? JSON.parse(text) : {}; } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const type = parsed.__type || parsed.Code || "ResourceNotFoundException";
+              const code = String(type).split("#").pop();
+              const err = new Error(parsed.Message || parsed.message || text || "Lambda ListTags error");
+              err.statusCode = res.statusCode;
+              err.code = code;
+              err.name = code;
+              reject(err);
+            } else {
+              resolve({ Tags: parsed.Tags || {} });
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
   function _makeLambdaClientModule() {
     class Lambda {
       constructor(_cfg) {}
       invoke(params) { return _lambdaInvoke(params); }
+      listTags(params) { return _lambdaListTags(params); }
+      // Lambda is LambdaClient plus the generated convenience methods, so it also has .send().
+      send(cmd) { return cmd._run(); }
     }
     class LambdaClient {
       constructor(_cfg) {}
       send(cmd) { return cmd._run(); }
+    }
+    class ListTagsCommand {
+      constructor(params) { this._p = params; }
+      _run() { return _lambdaListTags(this._p); }
     }
     class InvokeCommand {
       constructor(params) { this._p = params; }
       _run() { return _lambdaInvoke(this._p); }
     }
     async function waitUntilFunctionActiveV2() { return { state: "SUCCESS" }; }
-    return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
+    return { Lambda, LambdaClient, InvokeCommand, ListTagsCommand, waitUntilFunctionActiveV2 };
   }
 
   // ── OpenSearch stub (REST-JSON, not JSON-RPC) ─────────────────────────
@@ -531,7 +672,7 @@ fs.write = function(fd, ...args) {
         headers["Content-Type"] = "application/json";
         headers["Content-Length"] = Buffer.byteLength(encodedBody);
       }
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
@@ -657,21 +798,21 @@ fs.write = function(fd, ...args) {
     "@aws-sdk/client-translate":                   "AWSShineFrontendService_20170701",
   };
 
-  function _jsonRpcRequest(targetPrefix, opName, params) {
+  function _jsonRpcRequest(targetPrefix, opName, params, service) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
     const body = JSON.stringify(params || {});
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
           path: "/",
-          headers: {
+          headers: _signedHeaders(service, "POST", ep, "/", body, {
             "Content-Type": "application/x-amz-json-1.1",
             "X-Amz-Target": targetPrefix + "." + opName,
             "Content-Length": Buffer.byteLength(body),
-          },
+          }),
         },
         (res) => {
           const chunks = [];
@@ -700,12 +841,21 @@ fs.write = function(fd, ...args) {
     });
   }
 
-  function _makeGenericJsonServiceModule(targetPrefix) {
+  // Signing names that differ from the package name.
+  const _SIGNING_NAMES = {
+    "sfn": "states", "cloudwatch-logs": "logs", "secrets-manager": "secretsmanager", "eventbridge": "events",
+    "dynamodb-streams": "dynamodb", "cognito-identity-provider": "cognito-idp", "emr": "elasticmapreduce",
+    "resource-groups-tagging-api": "tagging",
+  };
+
+  function _makeGenericJsonServiceModule(targetPrefix, id) {
+    const pkg = id.replace(/^@aws-sdk\/client-/, "");
+    const service = _SIGNING_NAMES[pkg] || pkg;
     // Command class factory: new PutParameterCommand(params) → has _run()
     function _cmdClass(opName) {
       return class {
         constructor(params) { this._params = params; }
-        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params); }
+        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params, service); }
       };
     }
 
@@ -722,7 +872,7 @@ fs.write = function(fd, ...args) {
           get(_, prop) {
             if (typeof prop !== "string") return undefined;
             const opName = prop[0].toUpperCase() + prop.slice(1);
-            return (params) => _jsonRpcRequest(targetPrefix, opName, params);
+            return (params) => _jsonRpcRequest(targetPrefix, opName, params, service);
           },
         });
       },
@@ -772,7 +922,7 @@ fs.write = function(fd, ...args) {
         requireError = err;
       }
       const prefix = _JSON_RPC_TARGETS[id];
-      if (prefix) return _makeGenericJsonServiceModule(prefix);
+      if (prefix) return _makeGenericJsonServiceModule(prefix, id);
       if (
         requireError.code !== "MODULE_NOT_FOUND"
         || !requireError.message.includes("'" + id + "'")
@@ -819,20 +969,31 @@ function patchAwsSdk() {
     };
   } catch (_) {}
 
-  // Patch https.request for bundled SDK
+  // Patch https.request for bundled SDK. Under USE_SSL the gateway serves only
+  // HTTPS, so requests to it keep TLS and only their port is rewritten.
+  const msTls = parsed.protocol === "https:";
   const origHttpsReq = https.request;
-  https.request = function(options, callback) {
-    if (typeof options === "string") options = url.parse(options);
-    else if (options instanceof url.URL) options = url.parse(options.toString());
-    else options = Object.assign({}, options);
+  https.request = function(input, options, callback) {
+    // Node takes (url[, options][, callback]) and (options[, callback]).
+    const original = Array.prototype.slice.call(arguments);
+    if (typeof options === "function") { callback = options; options = undefined; }
+    if (typeof input === "string") input = url.parse(input);
+    else if (input instanceof url.URL) input = url.parse(input.toString());
+    options = Object.assign({}, input, options);
 
     const host = options.hostname || options.host || "";
     if (host.endsWith(".amazonaws.com") || host.endsWith(".amazonaws.com.cn")) {
-      options.protocol = "http:";
       options.hostname = msHost;
       options.host = msHost + ":" + msPort;
       options.port = msPort;
       options.path = options.path || "/";
+      if (msTls) {
+        // Verify the gateway's name, not the AWS host the Host header carries.
+        options.protocol = "https:";
+        options.servername = require("net").isIP(msHost) ? "" : msHost;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       if (options.agent instanceof https.Agent) {
         options.agent = new http.Agent({ keepAlive: true });
       } else if (options.agent === undefined) {
@@ -845,13 +1006,18 @@ function patchAwsSdk() {
     // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
     // cfn-response.js calls https.request unconditionally for the ResponseURL
     // PUT, and also drops the port when constructing options.  Intercept here
-    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
+    // so the PUT reaches Ministack on msPort, not port 443 (over TLS under USE_SSL).
     const advertised = (process.env.MINISTACK_HOST || "").split(":")[0];
     if (host === "127.0.0.1" || host === "localhost" || host === msHost
         || (advertised && host === advertised)) {
-      options.protocol = "http:";
       // The https default port means the gateway port here, as in the container shim.
       options.port = options.port && String(options.port) !== "443" ? options.port : msPort;
+      if (msTls) {
+        options.protocol = "https:";
+        options.hostname = host;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       options.host = host + ":" + options.port;
       options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
@@ -872,16 +1038,49 @@ function patchAwsSdk() {
       return http.request(options, callback);
     }
 
-    return origHttpsReq.call(https, options, callback);
+    return origHttpsReq.apply(https, original);
   };
-  https.get = function(options, callback) {
-    var req = https.request(options, callback);
+  https.get = function() {
+    var req = https.request.apply(https, arguments);
     req.end();
     return req;
   };
 }
 
 let handlerFn = null;
+
+// The error document AWS's Node.js runtime client posts (formatError in src/utils/error.ts).
+function _msFormatError(error) {
+  try {
+    if (error instanceof Error) {
+      return {
+        errorType: error.name?.replaceAll("\x7F", "%7F"),
+        errorMessage: error.message?.replaceAll("\x7F", "%7F"),
+        trace: error.stack?.replaceAll("\x7F", "%7F").split("\n") || [],
+      };
+    }
+    return { errorType: typeof error, errorMessage: String(error), trace: [] };
+  } catch {
+    return {
+      errorType: "handled",
+      errorMessage: "callback called with Error argument, but there was a problem while retrieving one or more of its message, name, and stack",
+      trace: [],
+    };
+  }
+}
+
+function _msRuntimeError(name, message, stack) {
+  const e = new Error(message);
+  e.name = name;
+  e.stack = stack || String(e.stack).replace(/^Error/, name);
+  return e;
+}
+
+function _msFail(error, extra) {
+  const payload = _msFormatError(error);
+  _realStdoutWrite(JSON.stringify(Object.assign(
+    { status: "error", error: payload.errorMessage, payload }, extra || {})) + "\n");
+}
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 let lineNum = 0;
@@ -931,17 +1130,35 @@ rl.on("line", async (line) => {
         }
         handlerFn = mod[handlerName] || (mod.default && mod.default[handlerName]) || mod.default;
         if (typeof handlerFn !== "function") {
-          _realStdoutWrite(JSON.stringify({
-            status: "error",
-            error: `Handler ${handlerName} is not a function in ${modPath}`
-          }) + "\n");
+          const full = modPath + "." + handlerName;
+          const err = _msRuntimeError("Runtime.HandlerNotFound", handlerFn === undefined
+            ? `${full} is undefined or not exported` : `${full} is not a function`);
+          _msFail(err, { errorType: err.name });
+          return;
+        }
+        // AWS's Node.js 24+ runtime refuses a callback-based handler at init.
+        const major = /^AWS_Lambda_nodejs(\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
+        if (major && Number(major[1]) >= 24 && handlerFn.length >= 3
+            && !handlerFn[Symbol.for("aws.lambda.runtime.handler.streaming")]) {
+          const err = _msRuntimeError("Runtime.CallbackHandlerDeprecated",
+            "ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
+              + "Node.js 24. You need to modify this function to use a supported handler signature to use Node.js 24 or "
+              + "later. For more information see https://docs.aws.amazon.com/lambda/latest/dg/nodejs-handler.html.");
+          _msFail(err, { errorType: err.name });
           return;
         }
         _realStdoutWrite(JSON.stringify({ status: "ready", cold: true }) + "\n");
       } catch (e) {
-        _realStdoutWrite(JSON.stringify({
-          status: "error", error: e.message
-        }) + "\n");
+        // As the runtime client loads the module: a syntax error or a missing CommonJS module is
+        // reported under its Runtime.* name with String(err) as the message; anything else as itself.
+        let err = e;
+        if (e instanceof SyntaxError) {
+          err = _msRuntimeError("Runtime.UserCodeSyntaxError", String(e), e.stack);
+        } else if (e instanceof Error && e.code === "MODULE_NOT_FOUND") {
+          err = _msRuntimeError("Runtime.ImportModuleError", String(e));
+        }
+        const payload = _msFormatError(err);
+        _msFail(err, { errorType: payload.errorType });
       }
       return;
     }
@@ -1003,12 +1220,17 @@ rl.on("line", async (line) => {
         if (settled) return;
         settled = true;
         if (err) {
-          _realStdoutWrite(JSON.stringify({
-            status: "error", error: String(err.message || err), trace: err.stack || ""
-          }) + "\n");
-        } else {
-          _realStdoutWrite(JSON.stringify({ status: "ok", result: res }) + "\n");
+          _msFail(err, { trace: (err && err.stack) || "" });
+          return;
         }
+        let out;
+        try {
+          out = JSON.stringify({ status: "ok", result: res === undefined ? null : res });
+        } catch (_e) {
+          _msFail(_msRuntimeError("Runtime.JSONStringifyError", "Unable to stringify response body"));
+          return;
+        }
+        _realStdoutWrite(out + "\n");
       };
       const callback = (err, res) => settle(err, res);
       context.done = (err, res) => settle(err, res);
@@ -1026,9 +1248,7 @@ rl.on("line", async (line) => {
       // If handler accepts callback (arity >= 3) or returned undefined,
       // we wait for callback/context.done/context.succeed/context.fail
     } catch (e) {
-      _realStdoutWrite(JSON.stringify({
-        status: "error", error: e.message, trace: e.stack
-      }) + "\n");
+      _msFail(e, { trace: (e && e.stack) || "" });
     }
   } catch (e) {
     _realStdoutWrite(JSON.stringify({
@@ -1090,7 +1310,7 @@ class Worker:
         runtime = self.config.get("Runtime", "python3.12")
         binary, worker_script = _detect_runtime_binary(runtime)
         if not binary:
-            raise RuntimeError(f"Unsupported runtime: {runtime}")
+            raise LambdaServiceError(f"no local runtime binary for {runtime}")
 
         ext = _worker_script_extension(runtime)
         worker_path = os.path.join(self._tmpdir, f"_worker{ext}")
@@ -1157,6 +1377,16 @@ class Worker:
                             os.symlink(src, dst)
 
         handler = self.config.get("Handler", "index.handler")
+        if "." not in handler:
+            # The runtime client refuses it at init: awslambdaric words the unpack error, the Node.js client says "Bad handler".
+            if runtime.startswith("python"):
+                message = f"Bad handler '{handler}': not enough values to unpack (expected 2, got 1)"
+                payload = {"errorMessage": message, "errorType": "Runtime.MalformedHandlerName",
+                           "requestId": "", "stackTrace": []}
+            else:
+                message = "Bad handler"
+                payload = {"errorType": "Runtime.MalformedHandlerName", "errorMessage": message, "trace": []}
+            raise ProvidedRuntimeError(message, "Runtime.MalformedHandlerName", payload)
         module_name, handler_name = handler.rsplit(".", 1)
         # AWS Python Lambda accepts both dot (``pkg.mod.fn``) and slash
         # (``pkg/mod.fn``) in nested handler paths; ``__import__`` only
@@ -1190,16 +1420,22 @@ class Worker:
         # the function nor the host set one.
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
         from ministack.core import tls as _tls
+        spawn_env.pop(GATEWAY_LOOPBACK_ENV, None)
         if "AWS_ENDPOINT_URL" not in spawn_env:
+            host = "127.0.0.1"
+            if runtime.startswith("nodejs"):
+                host = "localhost"
+                spawn_env[GATEWAY_LOOPBACK_ENV] = "1"
             if _tls.use_ssl_enabled():
-                spawn_env["AWS_ENDPOINT_URL"] = f"https://127.0.0.1:{port}"
+                spawn_env["AWS_ENDPOINT_URL"] = f"https://{host}:{port}"
                 _tls.trust_gateway_cert(spawn_env)
             else:
-                spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
+                spawn_env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault(HOST_PREFIX_ENV, "true")
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
+        spawn_env["AWS_EXECUTION_ENV"] = f"AWS_Lambda_{runtime}"
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_VERSION", self.config.get("Version", "$LATEST"))
@@ -1250,6 +1486,7 @@ class Worker:
         init = {
             "code_dir": code_dir,
             "module": module_name,
+            "handler_module": handler.rsplit(".", 1)[0],
             "handler": handler_name,
             "env": env_vars,
             "function_name": self.config.get("FunctionName", ""),
@@ -1274,7 +1511,11 @@ class Worker:
                     stderr_out = self._proc.stderr.read(4096)
                 except Exception:
                     pass
-                raise RuntimeError(f"Worker process exited immediately. stderr: {stderr_out}")
+                try:
+                    returncode = self._proc.wait(timeout=5)
+                except Exception:
+                    returncode = 1
+                raise RuntimeExitError(returncode, stderr_out)
             response_line = response_line.strip()
             if not response_line or not response_line.startswith("{"):
                 continue
@@ -1284,9 +1525,11 @@ class Worker:
             except json.JSONDecodeError:
                 continue
         if response is None:
-            raise RuntimeError("No JSON init response from worker")
+            raise LambdaServiceError("No JSON init response from worker")
         if response.get("status") != "ready":
-            raise RuntimeError(f"Worker init failed: {response.get('error')}")
+            if response.get("errorType"):
+                raise ProvidedRuntimeError(response.get("error", ""), response["errorType"], response.get("payload"))
+            raise LambdaServiceError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
@@ -1385,7 +1628,12 @@ class Worker:
                     for _ in range(200):
                         response_line = self._proc.stdout.readline()
                         if not response_line:
-                            result_box.append({"status": "error", "error": "Worker process died"})
+                            try:
+                                returncode = self._proc.wait(timeout=5)
+                            except Exception:
+                                returncode = 1
+                            result_box.append({"status": "error", "error_type": RuntimeExitError.error_type,
+                                               "error": runtime_exit_message(request_id, runtime_exit_reason(returncode))})
                             return
                         response_line = response_line.strip()
                         if not response_line:
@@ -1398,9 +1646,10 @@ class Worker:
                                     return
                             except json.JSONDecodeError:
                                 continue
-                    result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
+                    result_box.append({"status": "error", "service_error": True,
+                                       "error": "No JSON response from worker after 200 lines"})
                 except Exception as e:
-                    result_box.append({"status": "error", "error": str(e)})
+                    result_box.append({"status": "error", "service_error": True, "error": str(e)})
 
             reader = threading.Thread(target=_read_response, daemon=True)
             reader.start()
@@ -1421,7 +1670,8 @@ class Worker:
 
             if not result_box:
                 self._proc = None
-                return {"status": "error", "error": "Worker returned no response", "cold_start": cold}
+                return {"status": "error", "service_error": True, "error": "Worker returned no response",
+                        "cold_start": cold}
 
             response = result_box[0]
             if response.get("status") == "error":
@@ -1723,16 +1973,62 @@ _PROVIDED_LOG_MAX_LINES = 10000
 _INVOCATION_RESULT_RE = re.compile(r"/runtime/invocation/([^/]+)/(response|error)/?$")
 
 
+# What Go's syscall.Signal.String() names each Linux signal; the RIE reports a
+# runtime killed by a signal as "signal: <name>" (supervisor/model/model.go).
+_GO_SIGNAL_NAMES = {
+    1: "hangup", 2: "interrupt", 3: "quit", 4: "illegal instruction", 5: "trace/breakpoint trap",
+    6: "aborted", 7: "bus error", 8: "floating point exception", 9: "killed", 10: "user defined signal 1",
+    11: "segmentation fault", 12: "user defined signal 2", 13: "broken pipe", 14: "alarm clock",
+    15: "terminated",
+}
+
+
+def runtime_exit_reason(returncode: int) -> str:
+    """The error the Lambda runtime reports when the runtime process exits, as the RIE words it."""
+    if returncode == 0:
+        return "Runtime exited without providing a reason"
+    if returncode < 0:
+        return f"Runtime exited with error: signal: {_GO_SIGNAL_NAMES.get(-returncode, f'signal {-returncode}')}"
+    return f"Runtime exited with error: exit status {returncode}"
+
+
+# AWS's errorMessage for a provided.* function with no bootstrap (Runtime.InvalidEntrypoint).
+MISSING_BOOTSTRAP_MESSAGE = "Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]"
+
+
+def runtime_exit_message(request_id: str, reason: str) -> str:
+    return f"RequestId: {request_id} Error: {reason}" if request_id else f"Error: {reason}"
+
+
+class RuntimeExitError(RuntimeError):
+    """The runtime process exited: AWS's Runtime.ExitError, with the process's output as its log."""
+
+    error_type = "Runtime.ExitError"
+
+    def __init__(self, returncode: int, log: str = ""):
+        self.reason = runtime_exit_reason(returncode)
+        self.log = log
+        super().__init__(self.reason)
+
+
+class LambdaServiceError(RuntimeError):
+    """MiniStack's own execution machinery failed, not the function: Invoke answers ServiceException."""
+
+
 class ProvidedInitTimeout(RuntimeError):
     """The bootstrap started but did not reach the Runtime API in time."""
 
+    error_type = "Runtime.Unknown"
+
 
 class ProvidedRuntimeError(RuntimeError):
-    """A provided-runtime failure that carries the error type AWS reports."""
+    """A runtime failure that carries the error type AWS reports."""
 
-    def __init__(self, message: str, error_type: str):
+    def __init__(self, message: str, error_type: str, payload: dict | None = None):
         super().__init__(message)
         self.error_type = error_type
+        # The runtime's own error document, when it reported one, returned to Invoke as is.
+        self.payload = payload
 
 
 class ProvidedWorker(Worker):
@@ -1992,7 +2288,8 @@ class ProvidedWorker(Worker):
             # function returns a Runtime.InvalidEntrypoint error upon
             # invocation" (runtimes-custom.html).
             raise ProvidedRuntimeError(
-                "No bootstrap binary found in the deployment package.",
+                MISSING_BOOTSTRAP_MESSAGE if not os.path.exists(bootstrap_path)
+                else "Couldn't execute the bootstrap binary: permission denied",
                 "Runtime.InvalidEntrypoint",
             )
 
@@ -2085,15 +2382,13 @@ class ProvidedWorker(Worker):
         while not self._init_settled.wait(_PROVIDED_POLL):
             exit_code = self._proc.poll() if self._proc is not None else -1
             if exit_code is not None:
-                raise RuntimeError(
-                    f"bootstrap exited during init with code {exit_code}"
-                    f"{self._init_log_suffix()}")
+                raise RuntimeExitError(exit_code, self._drain_stderr_bounded(first_line_wait=0.1))
             if time.monotonic() >= deadline:
                 raise ProvidedInitTimeout(
                     f"bootstrap did not reach the Runtime API within "
                     f"{budget:g}s{self._init_log_suffix()}")
         if self._init_error is not None:
-            raise RuntimeError(f"init error: {self._init_error}")
+            raise ProvidedRuntimeError(f"init error: {self._init_error}", "Runtime.Unknown")
 
     def _init_log_suffix(self) -> str:
         log = self._drain_stderr_bounded(first_line_wait=0.1)
@@ -2148,7 +2443,8 @@ class ProvidedWorker(Worker):
                     # before the HTTP handler thread records it.
                     if self._response_ready.wait(_PROVIDED_POLL):
                         break
-                    failure = "Runtime exited before returning a response"
+                    failure = runtime_exit_message(
+                        request_id, runtime_exit_reason(proc.poll() if proc is not None else 1))
                     break
                 if time.monotonic() >= deadline:
                     failure = f"Task timed out after {timeout}.00 seconds"

@@ -35,9 +35,12 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
     set_request_region,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("athena")
@@ -46,6 +49,19 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "mock"
 ATHENA_DATA_DIR = S3_DATA_DIR
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def get_athena_engine():
@@ -819,11 +835,14 @@ def _start_query_execution(data):
     query = data.get("QueryString", "")
     query_id = new_uuid()
     workgroup = data.get("WorkGroup", "primary")
-    output_location = data.get("ResultConfiguration", {}).get(
-        "OutputLocation"
-    ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
-        "ResultConfiguration", {}
-    ).get("OutputLocation")
+    wg_config = _workgroups.get(workgroup, {}).get("Configuration", {})
+    wg_output = wg_config.get("ResultConfiguration", {}).get("OutputLocation")
+    client_output = data.get("ResultConfiguration", {}).get("OutputLocation")
+    # An enforced workgroup overrides the client-side result location
+    if wg_config.get("EnforceWorkGroupConfiguration"):
+        output_location = wg_output or client_output
+    else:
+        output_location = client_output or wg_output
     if not output_location:
         return error_response_json(
             "InvalidRequestException",
@@ -841,11 +860,22 @@ def _start_query_execution(data):
             extra={"AthenaErrorCode": "MALFORMED_QUERY"},
         )
 
+    wg_rc = wg_config.get("ResultConfiguration", {})
+    client_rc = data.get("ResultConfiguration", {})
+    result_config = {"OutputLocation": f"{output_location}{query_id}.csv"}
+    for key in ("EncryptionConfiguration", "ExpectedBucketOwner", "AclConfiguration"):
+        if wg_config.get("EnforceWorkGroupConfiguration"):
+            value = wg_rc.get(key, client_rc.get(key))
+        else:
+            value = client_rc.get(key, wg_rc.get(key))
+        if value is not None:
+            result_config[key] = value
+
     execution = {
         "QueryExecutionId": query_id,
         "Query": query,
         "StatementType": _detect_statement_type(query),
-        "ResultConfiguration": {"OutputLocation": f"{output_location}{query_id}.csv"},
+        "ResultConfiguration": result_config,
         "QueryExecutionContext": {"Database": db, "Catalog": catalog},
         "Status": {
             "State": "QUEUED",
@@ -871,6 +901,10 @@ def _start_query_execution(data):
         "_column_types": None,
         "_error": None,
     }
+    if data.get("ResultReuseConfiguration"):
+        execution["ResultReuseConfiguration"] = data["ResultReuseConfiguration"]
+    if data.get("ExecutionParameters"):
+        execution["ExecutionParameters"] = data["ExecutionParameters"]
     _executions[query_id] = execution
 
     asyncio.create_task(_execute_query(query_id, query, db, ddl, catalog))
@@ -936,6 +970,11 @@ async def _run_duckdb(query, database, catalog=None):
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            # DuckDB 2.0's type_pushdown makes the CSV reader's TRY_CAST strict; 1.x has no such optimizer.
+            try:
+                conn.execute("SET disabled_optimizers = 'type_pushdown'")
+            except duckdb.Error:
+                pass
             if s3_table_buckets:
                 _attach_s3_table_buckets(conn, s3_table_buckets)
             if "read_avro(" in rewritten:
@@ -1290,11 +1329,8 @@ async def _save_query_results(query_id):
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
     bucket_name = p.netloc
-    key_prefix = p.path.lstrip("/").rstrip("/")
-    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
-    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
-    # the files land at bucket root.
-    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    # OutputLocation already ends in <id>.csv
+    csv_key = p.path.lstrip("/")
     meta_key = f"{csv_key}.metadata"
 
     # Write directly to the S3 service's in-memory store via the public
@@ -1530,9 +1566,7 @@ def _get_workgroup(data):
         return error_response_json(
             "InvalidRequestException", f"WorkGroup {name} not found", 400
         )
-    out = dict(wg)
-    out.setdefault("WorkGroupConfiguration", out.get("Configuration", {}))
-    return json_response({"WorkGroup": out})
+    return json_response({"WorkGroup": to_output_shape("athena", "WorkGroup", wg)})
 
 
 def _list_workgroups(data):

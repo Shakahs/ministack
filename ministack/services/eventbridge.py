@@ -31,7 +31,9 @@ import json
 import logging
 import operator
 import os
+import random
 import re
+import string
 import threading
 import time
 import urllib.error
@@ -49,8 +51,10 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
     set_request_account_id,
     set_request_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("events")
@@ -135,6 +139,11 @@ def _ensure_default_bus():
             "CreationTime": _now_ts(),
             "LastModifiedTime": _now_ts(),
         }
+
+
+def _event_bus_exists(name):
+    """Whether the current tenant has bus ``name``; every account has a default bus."""
+    return name == "default" or name in _event_buses
 
 
 def _events_log_list() -> list:
@@ -407,9 +416,9 @@ def _list_event_buses(data):
             # than returning an empty string (Java SDK v2 sees a stray empty).
             policy = _event_bus_policies.get(n)
             if policy:
-                entry["Policy"] = json.dumps(policy)
+                entry["Policy"] = json.dumps(policy, separators=(",", ":"))
             buses.append(entry)
-    return json_response({"EventBuses": buses})
+    return _offset_page(data, "EventBuses", buses)
 
 
 def _describe_event_bus(data):
@@ -427,7 +436,7 @@ def _describe_event_bus(data):
     # AWS spec: Policy is optional; omit when no policy is set.
     policy = _event_bus_policies.get(name)
     if policy:
-        out["Policy"] = json.dumps(policy)
+        out["Policy"] = json.dumps(policy, separators=(",", ":"))
     for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
         if k in bus:
             out[k] = bus[k]
@@ -574,6 +583,18 @@ def _opaque_offset_decode(token: str) -> int:
         return 0
 
 
+def _offset_page(data, key, items, limit_key="Limit"):
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    try:
+        limit = int(data.get(limit_key) or len(items) or 1)
+    except (TypeError, ValueError):
+        limit = len(items) or 1
+    resp = {key: items[start:start + max(limit, 1)]}
+    if start + max(limit, 1) < len(items):
+        resp["NextToken"] = _opaque_offset_encode(start + max(limit, 1))
+    return json_response(resp)
+
+
 def _list_rules(data):
     prefix = data.get("NamePrefix", "")
     bus = data.get("EventBusName", "default")
@@ -587,7 +608,7 @@ def _list_rules(data):
             continue
         if prefix and not r["Name"].startswith(prefix):
             continue
-        rules.append(_rule_out(r))
+        rules.append(to_output_shape("events", "Rule", _rule_out(r)))
     rules.sort(key=lambda x: x["Name"])
     start = _opaque_offset_decode(data.get("NextToken", ""))
     page = rules[start:start + limit]
@@ -665,6 +686,9 @@ def _put_targets(data):
         error = _validate_target_arn(target)
         if error:
             return error
+    error = _validate_event_bus_targets(bus, targets)
+    if error:
+        return error
 
     if key not in _targets:
         _targets[key] = []
@@ -694,14 +718,48 @@ def _validate_target_arn(target):
             400,
         )
 
-    if (
-        spec.service == "events"
-        and spec.resource.startswith("event-bus/")
-        and (spec.account_id != get_account_id() or spec.region != get_region())
-        and not target.get("RoleArn")
-    ):
-        return error_response_json("ValidationException", "RoleArn is required", 400)
+    # Any other target in another account needs an execution role, in any region.
+    if spec.service != "events" and spec.account_id and spec.account_id != get_account_id() and not target.get("RoleArn"):
+        return error_response_json("ValidationException", f"RoleArn is required for target {arn}.", 400)
 
+    return None
+
+
+def _event_bus_spec(arn):
+    """The parsed ARN when ``arn`` names an event bus, else None."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    return spec if spec.service == "events" and spec.resource.startswith("event-bus/") else None
+
+
+def _validate_event_bus_targets(rule_bus, targets):
+    """AWS's checks on event bus targets, in its order: a cross-account role, then per target the rule's own bus and a RetryPolicy, then a missing RoleArn."""
+    buses = [(target, spec) for target in targets
+             if (spec := _event_bus_spec(target.get("Arn", ""))) is not None]
+    for target, _ in buses:
+        try:
+            role_account = parse_arn(target.get("RoleArn", "")).account_id
+        except ArnParseError:
+            continue
+        if role_account != get_account_id():
+            return error_response_json(
+                "AccessDeniedException",
+                f"Access to the resource {target['RoleArn']} is denied. Reason: Cross-account pass role is not allowed.",
+                400,
+            )
+    for target, spec in buses:
+        if (spec.account_id == get_account_id() and spec.region == get_region()
+                and spec.resource == f"event-bus/{rule_bus}"):
+            return error_response_json(
+                "ValidationException", "Source EventBus and Target EventBus must not be the same.", 400)
+        if "RetryPolicy" in target:
+            return error_response_json(
+                "ValidationException", "Retry policy is not supported for Event bus targets.", 400)
+    for target, _ in buses:
+        if not target.get("RoleArn"):
+            return error_response_json("ValidationException", f"RoleArn is required for target {target['Arn']}.", 400)
     return None
 
 
@@ -720,7 +778,7 @@ def _list_targets_by_rule(data):
     bus = data.get("EventBusName", "default")
     key = _rule_key(rule_name, bus)
     targets = _targets.get(key, [])
-    return json_response({"Targets": targets})
+    return _offset_page(data, "Targets", list(targets))
 
 
 def _list_rule_names_by_target(data):
@@ -978,8 +1036,197 @@ def _resolve_taggable_events_arn(arn):
     return arn, None
 
 
+def _event_bus_in_other_region(ref):
+    """Whether ``ref`` is an event bus ARN naming a region other than the request's."""
+    if not isinstance(ref, str) or not ref.startswith("arn:"):
+        return False
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return False
+    return spec.service == "events" and spec.resource.startswith("event-bus/") and spec.region != get_region()
+
+
+def _foreign_event_bus(ref):
+    """``(owner account, bus name)`` when ``ref`` is the ARN of an event bus
+    another account owns in this region, else None. PutEvents delivers to it."""
+    if not ref or not ref.startswith("arn:"):
+        return None
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return None
+    name = spec.resource.split("/", 1)[1] if spec.resource.startswith("event-bus/") else ""
+    # Patterns from the PutEvents model. AWS refuses anything else with a
+    # ValidationException; MiniStack keeps its existing per-entry answer for it.
+    if (spec.partition != "aws" or spec.service != "events" or not re.fullmatch(r"[.\-_A-Za-z0-9]+", name)
+            or spec.region != get_region() or not re.fullmatch(r"[0-9]{12}", spec.account_id or "")
+            or spec.account_id == get_account_id()):
+        return None
+    return spec.account_id, name
+
+
+def _strings(value):
+    """Whether ``value`` is a string or a non-empty list of strings."""
+    return isinstance(value, str) or (isinstance(value, list) and bool(value)
+                                      and all(isinstance(item, str) for item in value))
+
+
+# An AWS principal a bus policy can name: everyone, an account, or an IAM or STS ARN without wildcards.
+_AWS_PRINCIPAL = re.compile(r"\*|[0-9]{12}|arn:aws[a-z-]*:(iam|sts)::[0-9]{12}:[^*?]+")
+
+
+def _known_operator(operator):
+    """Whether the IAM evaluator implements condition ``operator``."""
+    from ministack.core.iam_evaluator import _CONDITION_OPS
+
+    op = operator.lower()
+    if op == "null":
+        return True
+    op = op[:-len("ifexists")] if op.endswith("ifexists") else op
+    op = op.split(":", 1)[1] if op.startswith(("forallvalues:", "foranyvalue:")) else op
+    return op in _CONDITION_OPS
+
+
+def _readable_statement(stmt):
+    """``stmt`` in the form AWS evaluates it, or None when it cannot be read.
+
+    A ``Policy`` document is stored as given; a PutPermission grant keeps its
+    ``Condition`` as the request's Type/Key/Value, which AWS accepts only as
+    StringEquals on aws:PrincipalOrgID with Principal ``*``."""
+    if not isinstance(stmt, dict) or not _strings(stmt.get("Action", stmt.get("NotAction"))):
+        return None
+    if not _strings(stmt.get("Resource", stmt.get("NotResource"))) or "NotPrincipal" in stmt:
+        return None
+    principal, condition = stmt.get("Principal"), stmt.get("Condition")
+    if not (principal == "*" or (isinstance(principal, dict) and principal
+                                 and all(_strings(value) for value in principal.values()))):
+        return None
+    aws = principal.get("AWS", []) if isinstance(principal, dict) else []
+    if not all(_AWS_PRINCIPAL.fullmatch(p) for p in ([aws] if isinstance(aws, str) else aws)):
+        return None
+    stmt = dict(stmt)
+    if isinstance(condition, dict) and {"Type", "Key", "Value"} & set(condition):
+        if not (principal == "*" and condition.get("Type") == "StringEquals"
+                and condition.get("Key") == "aws:PrincipalOrgID" and isinstance(condition.get("Value"), str)):
+            return None
+        stmt["Condition"] = {"StringEquals": {"aws:PrincipalOrgID": condition["Value"]}}
+    elif condition is not None and not (
+            isinstance(condition, dict) and all(
+                _known_operator(operator) and isinstance(keys, dict)
+                and all(_strings(value) for value in keys.values())
+                for operator, keys in condition.items())):
+        return None
+    return stmt
+
+
+def _bus_policy_document(policy):
+    """The bus policy as AWS evaluates it, or None when it holds a Deny this
+    emulator cannot evaluate (unreadable, with ``NotPrincipal``, or with an
+    operator it does not implement), which then refuses every caller. A
+    statement that cannot be read grants nothing."""
+    statements = policy.get("Statement") if isinstance(policy, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    evaluable = []
+    for stmt in statements if isinstance(statements, list) else []:
+        readable = _readable_statement(stmt)
+        if isinstance(stmt, dict) and stmt.get("Effect") == "Deny" and readable is None:
+            return None
+        if readable is not None:
+            evaluable.append(readable)
+    return {"Version": "2012-10-17", "Statement": evaluable}
+
+
+def _foreign_bus_denial(entries):
+    """The AccessDeniedException that refuses a whole PutEvents request when an
+    entry names another account's bus whose policy does not allow the caller.
+    Only under AUTH=true, like the other resource-policy checks."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _principal_type, caller_arn, evaluate_resource_policy
+
+    principal = caller_arn()
+    for entry in entries:
+        bus_ref = entry.get("EventBusName", "default")
+        foreign = _foreign_event_bus(bus_ref)
+        if foreign is None:
+            continue
+        owner, name = foreign
+        with request_scope(owner, get_region()):
+            # A missing bus has no policy, even if a deleted one left its statements behind.
+            policy = _event_bus_policies.get(name) if name in _event_buses else None
+        ctx = EvalContext(
+            principal_arn=principal,
+            principal_type=_principal_type(principal, ""),
+            principal_account=get_account_id(),
+            action="events:PutEvents",
+            resource_arn=bus_ref,
+            region=get_region(),
+            # Conditions on the event are checked per entry; a direct publish is
+            # not an event bus invoking another.
+            service_context={"events:source": entry.get("Source"), "events:detail-type": entry.get("DetailType"),
+                             "events:eventbusinvocation": "false"},
+        )
+        document = _bus_policy_document(policy) if policy else {"Statement": []}
+        decision = "Deny" if document is None else evaluate_resource_policy(document, ctx).decision
+        if decision != "Allow":
+            reason = ("with an explicit deny in a resource-based policy" if decision == "Deny"
+                      else "because no resource-based policy allows the events:PutEvents action")
+            return error_response_json(
+                "AccessDeniedException",
+                f"User: {principal} is not authorized to perform: events:PutEvents on resource: {bus_ref} {reason}",
+                400,
+            )
+    return None
+
+
+def _endpoint_by_id(endpoint_id):
+    """The caller's global endpoint with *endpoint_id*, in whatever region it was created."""
+    return next((ep for (account, _region, _name), ep in _endpoints.all_items()
+                 if account == get_account_id() and ep.get("EndpointId") == endpoint_id), None)
+
+
+def _put_events_through_endpoint(data, endpoint):
+    """PutEvents to a healthy global endpoint: delivered in its primary region with the endpoint in
+    ``resources``, and, with replication enabled, copied to the secondary region's bus of the same name."""
+    primary = parse_arn(endpoint["Arn"]).region
+    now = int(_now_ts())
+    # The replica keeps the event's time, so both regions see one timestamp.
+    entries = [{**e, "Resources": list(e.get("Resources") or []) + [endpoint["Arn"]],
+                "Time": e.get("Time") if e.get("Time") is not None else now}
+               for e in data.get("Entries", [])]
+    with request_scope(get_account_id(), primary):
+        status, headers, body = _put_events({**data, "Entries": entries, "EndpointId": None})
+    secondary = (((endpoint.get("RoutingConfig") or {}).get("FailoverConfig") or {})
+                 .get("Secondary") or {}).get("Route")
+    if (status != 200 or not secondary or secondary == primary
+            or (endpoint.get("ReplicationConfig") or {}).get("State", "ENABLED") != "ENABLED"):
+        return status, headers, body
+    sent = json.loads(body).get("Entries", [])
+    for entry, result in zip(entries, sent):
+        if "EventId" not in result:
+            continue
+        bus_name, _ = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
+        record = {
+            "EventId": new_uuid(), "Source": entry.get("Source", ""), "DetailType": entry.get("DetailType", ""),
+            "Detail": entry.get("Detail", "{}"), "EventBusName": bus_name,
+            "Time": int(_coerce_timestamp(entry["Time"])) if isinstance(_coerce_timestamp(entry["Time"]), (int, float)) else now,
+            "Resources": entry["Resources"], "Account": get_account_id(), "Region": primary,
+        }
+        with request_scope(get_account_id(), secondary):
+            _events_log_list().append(record)
+            view = _pattern_event_view(record)
+            _dispatch_event(record, view)
+            _archive_event(record, view)
+    return status, headers, body
+
+
 def _put_events(data, allow_aws_source=False):
     """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
+    if data.get("EndpointId") and (endpoint := _endpoint_by_id(data["EndpointId"])):
+        return _put_events_through_endpoint(data, endpoint)
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -990,16 +1237,25 @@ def _put_events(data, allow_aws_source=False):
             "Member must have length less than or equal to 10" % len(entries),
             400,
         )
+    if any(_event_bus_in_other_region(entry.get("EventBusName")) for entry in entries):
+        # Captured on AWS: a bus ARN in another region fails the whole request.
+        return error_response_json("ValidationException", "Cross-region api call is not allowed.", 400)
+    denial = _foreign_bus_denial(entries)
+    if denial:
+        return denial
     results = []
     failed = 0
     for entry in entries:
         event_id = new_uuid()
-        bus_name, bus_error = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
-        if bus_error:
-            code, message = bus_error
-            results.append({"ErrorCode": code, "ErrorMessage": message})
-            failed += 1
-            continue
+        bus_ref = entry.get("EventBusName", "default")
+        owner, bus_name = _foreign_event_bus(bus_ref) or (get_account_id(), None)
+        if bus_name is None:
+            bus_name, bus_error = _event_bus_name_from_ref(bus_ref)
+            if bus_error:
+                code, message = bus_error
+                results.append({"ErrorCode": code, "ErrorMessage": message})
+                failed += 1
+                continue
         source = entry.get("Source")
         if not allow_aws_source and isinstance(source, str) and source.startswith("aws."):
             results.append({
@@ -1011,7 +1267,8 @@ def _put_events(data, allow_aws_source=False):
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds
         # (Java SDK v2 chokes on floats). Persisted in the event_record so
         # archive replay also dispatches the int form.
-        event_time = int(_now_ts())
+        sent_time = _coerce_timestamp(entry.get("Time"))
+        event_time = int(sent_time) if isinstance(sent_time, (int, float)) else int(_now_ts())
 
         event_record = {
             "EventId": event_id,
@@ -1024,14 +1281,16 @@ def _put_events(data, allow_aws_source=False):
             "Account": get_account_id(),
             "Region": get_region(),
         }
-        _events_log_list().append(event_record)
         results.append({"EventId": event_id})
         logger.debug("EventBridge event: %s / %s", entry.get('Source'), entry.get('DetailType'))
 
-        # One view for both walks; rebuilding it re-parses ``Detail``.
-        view = _pattern_event_view(event_record)
-        _dispatch_event(event_record, view)
-        _archive_event(event_record, view)
+        # The event keeps the publisher's account and lands on the owner's bus.
+        with request_scope(owner, get_region()):
+            _events_log_list().append(event_record)
+            # One view for both walks; rebuilding it re-parses ``Detail``.
+            view = _pattern_event_view(event_record)
+            _dispatch_event(event_record, view)
+            _archive_event(event_record, view)
 
     return json_response({"FailedEntryCount": failed, "Entries": results})
 
@@ -1054,14 +1313,10 @@ def _archive_event(event, view=None):
 
 def _dispatch_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
-    event_path = set(event.get("_DispatchPath") or [])
     view = view or _pattern_event_view(event)
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
-            continue
-        if key in event_path:
-            logger.warning("EventBridge: recursive rule dispatch skipped for %s", key)
             continue
         if rule.get("State") != "ENABLED":
             continue
@@ -2234,9 +2489,9 @@ def _matches_content_filter(value, filter_rule):
     return False
 
 
-def _invoke_target(target, event, rule, view=None):
+def _invoke_target(target, event, rule, view=None, from_rule=True):
+    """Deliver ``event`` to ``target``; a schedule passes ``from_rule`` False and itself as ``rule``."""
     arn = target.get("Arn", "")
-    event_path = set(event.get("_DispatchPath") or [])
 
     # The tree the rule matched on, so a rule cannot fire on a field whose
     # delivered value differs. Decoded once for the whole event.
@@ -2274,10 +2529,10 @@ def _invoke_target(target, event, rule, view=None):
             )
             _dispatch_to_api_destination(spec, event_payload, {**target, "HttpParameters": http_parameters})
         elif spec.service == "events":
-            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
+            _dispatch_to_event_bus(spec, event, rule, target, target_input_payload, from_rule)
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
-        elif not _target_matches_request_scope(spec):
+        elif not _target_matches_request_scope(spec, target):
             # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
             # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
             # that metric or DLQs, so the faithful observable outcome is to accept the target and drop
@@ -2291,48 +2546,197 @@ def _invoke_target(target, event, rule, view=None):
         elif spec.service == "lambda":
             _dispatch_to_lambda(arn, event_payload)
         elif spec.service == "sqs":
-            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            if _foreign_queue_allows_role(spec, target.get("RoleArn", "")):
+                _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            else:
+                logger.warning("EventBridge: target %s not delivered: its queue policy does not allow %s",
+                               arn, target.get("RoleArn"))
         elif spec.service == "sns":
             _dispatch_to_sns(arn, event_payload)
+        elif spec.service == "logs":
+            _dispatch_to_log_group(spec, event_payload, event, rule)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
 
-def _target_matches_request_scope(spec) -> bool:
+def _foreign_queue_allows_role(spec, role_arn: str) -> bool:
+    """Under AUTH=true, another account's queue takes the event only when its policy allows the target's role."""
+    from ministack.app import AUTH
+    if not AUTH or spec.account_id == get_account_id():
+        return True
+    from ministack.core.iam_evaluator import EvalContext, resource_policy_allows
+    from ministack.services import sqs as _sqs
+
+    found = _sqs.queue_policy_for_arn(str(spec))
+    if found is None:
+        return False
+    ctx = EvalContext(
+        principal_arn=role_arn,
+        principal_type="AssumedRole",
+        principal_account=role_arn.split(":")[4] if role_arn.count(":") >= 5 else "",
+        action="sqs:SendMessage",
+        resource_arn=str(spec),
+        region=spec.region,
+    )
+    return resource_policy_allows(found[0], ctx, same_account=False)
+
+
+def _target_matches_request_scope(spec, target=None) -> bool:
     # Cross-region targets are accepted at PutTargets but fail delivery here for AWS parity.
-    return spec.account_id == get_account_id() and spec.region == get_region()
+    if spec.region != get_region():
+        return False
+    if spec.account_id == get_account_id():
+        return True
+    # Another account's target in the same region is reached through its execution role; modelled for SQS.
+    return spec.service == "sqs" and bool((target or {}).get("RoleArn"))
 
 
-def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
-    if spec.service != "events" or not spec.resource.startswith("event-bus/"):
+# Hop markers: one same-region bus hop, one region crossing (new id and time), then one more same-region hop.
+_SAME_REGION_HOP = "_SameRegionBusHop"
+_CROSSED_REGION = "_CrossedRegion"
+
+
+def _event_bus_hop_refusal(event, same_region):
+    """The ``ERROR_CODE`` AWS records when a forwarded event may not hop again, or None."""
+    if same_region and event.get(_SAME_REGION_HOP):
+        return "THIRD_ACCOUNT_HOP_DETECTED"
+    if not same_region and event.get(_CROSSED_REGION):
+        return "THIRD_REGION_HOP_DETECTED"
+    return None
+
+
+def _events_may_assume(role, rule):
+    """Whether ``role``'s trust policy lets EventBridge assume it for ``rule`` (aws:SourceAccount/SourceArn are the rule's)."""
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _action_matches,
+        _conditions_met,
+        _service_principal_matches,
+    )
+
+    try:
+        statements = json.loads(role.get("AssumeRolePolicyDocument") or "{}").get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    ctx = EvalContext(
+        principal_arn="events.amazonaws.com",
+        principal_type="Service",
+        principal_account="",
+        action="sts:AssumeRole",
+        resource_arn=role.get("Arn", ""),
+        region=get_region(),
+        service_context={"aws:sourceaccount": get_account_id(), "aws:sourcearn": rule.get("Arn", "")},
+    )
+    allowed = False
+    for stmt in statements if isinstance(statements, list) else [statements]:
+        if not isinstance(stmt, dict):
+            continue
+        if "NotPrincipal" in stmt:
+            applies = not _service_principal_matches(stmt["NotPrincipal"], "events.amazonaws.com")
+        else:
+            principal = stmt.get("Principal")
+            aws = principal.get("AWS") if isinstance(principal, dict) else None
+            applies = (principal == "*" or _service_principal_matches(principal, "events.amazonaws.com")
+                       or aws == "*" or (isinstance(aws, list) and "*" in aws))
+        actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
+        if not applies or not _action_matches(
+                "sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
+                [not_actions] if isinstance(not_actions, str) else not_actions):
+            continue
+        if not _conditions_met(stmt.get("Condition") or {}, ctx):
+            continue
+        if stmt.get("Effect") == "Deny":
+            return False
+        allowed = allowed or stmt.get("Effect") == "Allow"
+    return allowed
+
+
+def _event_bus_target_denial(spec, event, rule, target):
+    """Under AUTH=true, ``NO_PERMISSIONS`` when the target's role cannot put the event on the bus, or None."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _permissions_boundary,
+        evaluate,
+        evaluate_resource_policy,
+    )
+    from ministack.services import iam as _iam
+
+    role_arn = target.get("RoleArn", "")
+    role_name = role_arn.rsplit("/", 1)[-1]
+    role = _iam._roles.get_scoped(get_account_id(), None, role_name)
+    if role is None or role.get("Arn") != role_arn or not _events_may_assume(role, rule):
+        return "NO_PERMISSIONS"
+    account = get_account_id()
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:sts::{account}:assumed-role/{role_name}/{new_uuid().replace('-', '')}",
+        principal_type="AssumedRole",
+        principal_account=account,
+        action="events:PutEvents",
+        resource_arn=target["Arn"],
+        region=spec.region,
+        service_context={"events:source": event.get("Source"), "events:detail-type": event.get("DetailType"),
+                         "events:eventbusinvocation": "true"},
+    )
+    limits = _permissions_boundary(_iam._roles, role_name, account)
+    if evaluate(ctx, _gather_role_policies(role_name, account), *limits).decision != "Allow":
+        return "NO_PERMISSIONS"
+    name = spec.resource.split("/", 1)[1]
+    with request_scope(spec.account_id, spec.region):
+        policy = _event_bus_policies.get(name) if _event_bus_exists(name) else None
+    same_account = spec.account_id == account
+    if policy is None:
+        return None if same_account else "NO_PERMISSIONS"
+    document = _bus_policy_document(policy)
+    decision = "Deny" if document is None else evaluate_resource_policy(document, ctx).decision
+    if decision == "Deny" or (decision != "Allow" and not same_account):
+        return "NO_PERMISSIONS"
+    return None
+
+
+def _dispatch_to_event_bus(spec, event, rule, target, target_input_payload=None, from_rule=True):
+    """Forward ``event`` to the bus ``spec`` names, in its owner's account and region; a refusal is logged with AWS's ERROR_CODE."""
+    if not spec.resource.startswith("event-bus/"):
         logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
         return
-
-    if spec.account_id != get_account_id() or spec.region != get_region():
-        logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
-        return
-
     bus_name = spec.resource.split("/", 1)[1]
-    if bus_name not in _event_buses:
-        logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
+    same_region = spec.region == get_region()
+    if from_rule:
+        if (spec.account_id == get_account_id() and same_region
+                and bus_name == event.get("EventBusName", "default")):
+            # PutTargets refuses such a target; state saved before it did, or a
+            # CloudFormation update moving a rule onto the bus, can still hold one.
+            logger.warning("EventBridge -> Event bus %s: not delivered: the rule's own bus", target["Arn"])
+            return
+        code = _event_bus_hop_refusal(event, same_region) or _event_bus_target_denial(spec, event, rule, target)
+        if code:
+            logger.warning("EventBridge -> Event bus %s: not delivered from rule %s: %s",
+                           target["Arn"], rule.get("Arn"), code)
+            return
+    elif spec.account_id != get_account_id() or not same_region:
+        logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
         return
-    source_rule_key = _rule_key(rule.get("Name"), rule.get("EventBusName", "default"))
-    if source_rule_key in event_path:
-        logger.warning("EventBridge -> Event bus: recursive target dispatch skipped for %s", spec)
-        return
-    forwarded = dict(event)
-    forwarded["EventBusName"] = bus_name
-    forwarded["Region"] = spec.region
-    forwarded["_DispatchPath"] = [*event_path, source_rule_key]
+    forwarded = dict(event, Account=event.get("Account", get_account_id()), Region=event.get("Region", get_region()))
+    if from_rule and same_region:
+        forwarded[_SAME_REGION_HOP] = True
+    elif from_rule:
+        forwarded.update({"EventId": new_uuid(), "Time": int(_now_ts()),
+                          _SAME_REGION_HOP: False, _CROSSED_REGION: True})
     if target_input_payload is not None:
         forwarded["Detail"] = target_input_payload
-    _dispatch_event(forwarded)
-    archived = dict(forwarded)
-    archived.pop("_DispatchPath", None)
-    _archive_event(archived)
-    logger.info("EventBridge -> Event bus %s: dispatched", spec)
+    with request_scope(spec.account_id, spec.region):
+        if not _event_bus_exists(bus_name):
+            logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
+            return
+        forwarded["EventBusName"] = bus_name
+        _dispatch_event(forwarded)
+        _archive_event({k: v for k, v in forwarded.items() if k not in (_SAME_REGION_HOP, _CROSSED_REGION)})
+    logger.info("EventBridge -> Event bus %s: dispatched", target["Arn"])
 
 
 def _apply_input_transformer(transformer, rule, view):
@@ -2514,6 +2918,28 @@ def _dispatch_to_sns(arn, payload):
         logger.warning("EventBridge → SNS: topic %s not found", arn)
         return
     logger.info("EventBridge → SNS %s", arn)
+
+
+def _dispatch_to_log_group(spec, payload, event, rule):
+    """Write one matched event as one line in a new log stream, as EventBridge does for a log group target."""
+    from ministack.services import cloudwatch_logs as _logs
+
+    group = _logs._log_group_name_from_identifier_arn(str(spec))
+    if group is None or group not in _logs._log_groups:
+        logger.warning("EventBridge → Logs: log group %s not found", spec)
+        return
+    stream = new_uuid()
+    if not _logs.log_group_policy_allows(group, stream, "events.amazonaws.com", rule.get("Arn", "")):
+        logger.warning("EventBridge → Logs %s not delivered: no resource policy allows events.amazonaws.com", group)
+        return
+    # Captured on AWS: the line's timestamp is the event's time, to the second.
+    seconds = event.get("Time")
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        seconds = time.time()
+    _logs._create_log_stream({"logGroupName": group, "logStreamName": stream})
+    _logs._put_log_events({"logGroupName": group, "logStreamName": stream,
+                           "logEvents": [{"timestamp": int(seconds) * 1000, "message": payload}]})
+    logger.info("EventBridge → Logs %s", group)
 
 
 def _dispatch_to_stepfunctions(arn, payload):
@@ -3000,26 +3426,39 @@ def _create_archive(data):
     if not name:
         return error_response_json("ValidationException", "ArchiveName is required", 400)
     if name in _archives:
-        return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists", 400)
+        return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists.", 400)
+
+    source_arn = data.get("EventSourceArn", "")
+    if ":event-bus/" in source_arn:
+        _ensure_default_bus()
+        bus_name = source_arn.split(":event-bus/", 1)[1]
+        if bus_name not in _event_buses:
+            return error_response_json("ResourceNotFoundException", f"Event bus {bus_name} does not exist.", 400)
 
     pattern_error = _event_pattern_error(data.get("EventPattern", ""))
     if pattern_error:
         return _invalid_event_pattern(pattern_error)
 
-    source_arn = data.get("EventSourceArn", "")
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:archive/{name}"
     _archives[name] = {
         "ArchiveName": name,
         "ArchiveArn": arn,
         "EventSourceArn": source_arn,
-        "Description": data.get("Description", ""),
-        "EventPattern": data.get("EventPattern", ""),
         "RetentionDays": data.get("RetentionDays", 0),
         "State": "ENABLED",
         "CreationTime": _now_ts(),
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    # An archive created without a description or a pattern has neither in
+    # DescribeArchive.
+    for key in ("Description", "EventPattern"):
+        if key in data:
+            _archives[name][key] = data[key]
+    # Unlike event buses, an empty identifier is not stored: an archive with no
+    # customer managed key has no KmsKeyIdentifier in DescribeArchive.
+    if data.get("KmsKeyIdentifier"):
+        _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
 
 
@@ -3036,7 +3475,7 @@ def _describe_archive(data):
     archive = _archives.get(name)
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
-    return json_response(archive)
+    return json_response(to_output_shape("events", "DescribeArchiveResponse", archive))
 
 
 def _update_archive(data):
@@ -3057,6 +3496,12 @@ def _update_archive(data):
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
+    if "KmsKeyIdentifier" in data:
+        # An empty identifier clears the stored key.
+        if data["KmsKeyIdentifier"]:
+            archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+        else:
+            archive.pop("KmsKeyIdentifier", None)
 
     archive["LastUpdatedTime"] = _now_ts()
     return json_response({
@@ -3064,6 +3509,10 @@ def _update_archive(data):
         "State": archive.get("State", "ENABLED"),
         "CreationTime": archive["CreationTime"],
     })
+
+
+_ARCHIVE_SUMMARY_KEYS = ("ArchiveName", "EventSourceArn", "State", "StateReason",
+                         "RetentionDays", "SizeBytes", "EventCount", "CreationTime")
 
 
 def _list_archives(data):
@@ -3078,8 +3527,8 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append(archive)
-    return json_response({"Archives": results})
+        results.append({k: archive[k] for k in _ARCHIVE_SUMMARY_KEYS if k in archive})
+    return _offset_page(data, "Archives", results)
 
 
 # ---------------------------------------------------------------------------
@@ -3203,12 +3652,11 @@ def _list_replays(data):
             continue
         results.append({
             "ReplayName": rep["ReplayName"],
-            "ReplayArn": rep["ReplayArn"],
             "State": rep["State"],
             "EventSourceArn": rep.get("EventSourceArn", ""),
             "ReplayStartTime": rep.get("ReplayStartTime", ""),
         })
-    return json_response({"Replays": results})
+    return _offset_page(data, "Replays", results)
 
 
 def _cancel_replay(data):
@@ -3235,70 +3683,186 @@ def _cancel_replay(data):
 # Global endpoints + SaaS partner event sources (minimal / stub)
 # ---------------------------------------------------------------------------
 
-def _create_endpoint(data):
+_ENDPOINT_NAME_RE = re.compile(r"[\.\-_A-Za-z0-9]+")
+_HEALTH_CHECK_RE = re.compile(r"^arn:aws([a-z]|\-)*:route53:::healthcheck/[\-a-z0-9]+$")
+_ROUTE_RE = re.compile(r"^[\-a-z0-9]+$")
+_ENDPOINT_BUS_ARN_RE = re.compile(r"^arn:aws[a-z-]*:events:[a-z]+-[a-z-]+-\d+:\d{12}:event-bus/[\w.-]+$")
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$")
+# An endpoint answers CREATING, then ACTIVE about a second later, as on AWS.
+_ENDPOINT_ACTIVATION_SECONDS = 1
+
+
+def _endpoint_shape_errors(data, create):
+    """The request's constraint violations, worded as EventBridge words them."""
+    errors = []
+
+    def null(path):
+        errors.append(f"Value null at '{path}' failed to satisfy constraint: Member must not be null")
+
+    def bad(value, path, constraint):
+        errors.append(f"Value '{value}' at '{path}' failed to satisfy constraint: {constraint}")
+
+    def string(value, path, lo, hi, pattern=None, pattern_text=None):
+        if len(value) < lo:
+            bad(value, path, f"Member must have length greater than or equal to {lo}")
+        elif len(value) > hi:
+            bad(value, path, f"Member must have length less than or equal to {hi}")
+        elif pattern is not None and not pattern.fullmatch(value):
+            bad(value, path, f"Member must satisfy regular expression pattern: {pattern_text or pattern.pattern}")
+
     name = data.get("Name")
-    if not name:
-        return error_response_json("ValidationException", "Name is required", 400)
-    if name in _endpoints:
-        return error_response_json("ResourceAlreadyExistsException",
-                                   f"Endpoint {name} already exists", 400)
+    if name is None:
+        null("name")
+    else:
+        string(name, "name", 1, 64, _ENDPOINT_NAME_RE)
+    if data.get("Description") is not None and len(data["Description"]) > 512:
+        bad(data["Description"], "description", "Member must have length less than or equal to 512")
+    routing = data.get("RoutingConfig")
+    if routing is None:
+        if create:
+            null("routingConfig")
+    else:
+        failover = routing.get("FailoverConfig")
+        if failover is None:
+            null("routingConfig.failoverConfig")
+        else:
+            primary, secondary = failover.get("Primary"), failover.get("Secondary")
+            if primary is None:
+                null("routingConfig.failoverConfig.primary")
+            elif primary.get("HealthCheck") is None:
+                null("routingConfig.failoverConfig.primary.healthCheck")
+            else:
+                string(primary["HealthCheck"], "routingConfig.failoverConfig.primary.healthCheck", 1, 1600,
+                       _HEALTH_CHECK_RE)
+            if secondary is None:
+                null("routingConfig.failoverConfig.secondary")
+            elif secondary.get("Route") is None:
+                null("routingConfig.failoverConfig.secondary.route")
+            else:
+                string(secondary["Route"], "routingConfig.failoverConfig.secondary.route", 9, 20, _ROUTE_RE)
+    replication = data.get("ReplicationConfig")
+    if replication is not None and replication.get("State") is not None \
+            and replication["State"] not in ("ENABLED", "DISABLED"):
+        bad(replication["State"], "replicationConfig.state", "Member must satisfy enum value set: [ENABLED, DISABLED]")
+    buses = data.get("EventBuses")
+    if buses is None:
+        if create:
+            null("eventBuses")
+    else:
+        if len(buses) != 2:
+            listed = ", ".join(f"EndpointEventBus(eventBusArn={b.get('EventBusArn')})" for b in buses)
+            bad(f"[{listed}]", "eventBuses", "Member must have length greater than or equal to 2" if len(buses) < 2
+                else "Member must have length less than or equal to 2")
+        for i, bus in enumerate(buses, start=1):
+            arn = bus.get("EventBusArn")
+            if arn is None:
+                null(f"eventBuses.{i}.member.eventBusArn")
+            else:
+                string(arn, f"eventBuses.{i}.member.eventBusArn", 1, 512, _ENDPOINT_BUS_ARN_RE)
+    if data.get("RoleArn"):
+        string(data["RoleArn"], "roleArn", 1, 256, _ROLE_ARN_RE)
+    if not errors:
+        return None
+    count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+    return error_response_json("ValidationException", count + "; ".join(errors), 400)
+
+
+def _endpoint_config_error(config):
+    """The checks EventBridge makes on a well-formed endpoint configuration."""
+    from ministack.services import iam as _iam
+    from ministack.services import route53 as _route53
+
+    replication = (config.get("ReplicationConfig") or {}).get("State", "ENABLED")
+    role_arn = config.get("RoleArn") or ""
+    if replication == "ENABLED" and not role_arn:
+        return error_response_json("ValidationException", "When replication is enabled, role cannot be empty.", 400)
+    failover = config["RoutingConfig"]["FailoverConfig"]
+    route = failover["Secondary"]["Route"]
+    if route == get_region():
+        return error_response_json("ValidationException", "Parameter Route is not valid. Reason: Provided route "
+                                   "for the secondary region cannot be the same as the primary region.", 400)
+    buses = [parse_arn(b["EventBusArn"]) for b in config["EventBuses"]]
+    if sorted(b.region for b in buses) != sorted([get_region(), route]):
+        return error_response_json("ValidationException", "Parameter EventBuses is not valid. Reason: An event bus "
+                                   "must be provided in both the primary and secondary regions.", 400)
+    if buses[0].resource != buses[1].resource:
+        return error_response_json("ValidationException", "Parameter EventBuses is not valid. Reason: Event bus "
+                                   "names must match in the primary and secondary regions.", 400)
+    health_check = failover["Primary"]["HealthCheck"]
+    if health_check.rsplit("/", 1)[-1] not in _route53._health_checks:
+        return error_response_json("ValidationException", f"A health check with ARN {health_check} does not exist.",
+                                   400)
+    if role_arn:
+        role = _iam._roles.get_scoped(get_account_id(), None, role_arn.rsplit("/", 1)[-1])
+        if role is None or role.get("Arn") != role_arn or not _events_may_assume(role, {"Arn": config["Arn"]}):
+            return error_response_json("ValidationException", f"Provided role '{role_arn}' cannot be assumed by "
+                                       "principal 'events.amazonaws.com'.", 400)
+    return None
+
+
+def _endpoint_view(ep, full=True):
+    """The endpoint as AWS reports it: CREATING first, and its EndpointId and URL only once ACTIVE."""
+    if ep["State"] == "CREATING" and _now_ts() >= ep["_active_at"]:
+        ep["State"], ep["LastModifiedTime"] = "ACTIVE", ep["_active_at"]
+    out = {"Name": ep["Name"]}
+    if ep.get("Description"):
+        out["Description"] = ep["Description"]
+    out.update({"Arn": ep["Arn"], "RoutingConfig": ep["RoutingConfig"], "ReplicationConfig": ep["ReplicationConfig"],
+                "EventBuses": ep["EventBuses"], "RoleArn": ep["RoleArn"]})
+    if ep["State"] != "CREATING":
+        out.update({"EndpointId": ep["EndpointId"], "EndpointUrl": ep["EndpointUrl"]})
+    out["State"] = ep["State"]
+    if full:
+        out.update({"CreationTime": ep["CreationTime"], "LastModifiedTime": ep["LastModifiedTime"]})
+    return out
+
+
+def _endpoint_not_found(name):
+    return error_response_json("ResourceNotFoundException", f"Endpoint {name} does not exist in region {get_region()}.",
+                               400)
+
+
+def _create_endpoint(data):
+    err = _endpoint_shape_errors(data, create=True)
+    if err:
+        return err
+    name = data["Name"]
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:endpoint/{name}"
+    config = {"RoutingConfig": data["RoutingConfig"], "ReplicationConfig": data.get("ReplicationConfig") or {},
+              "EventBuses": data["EventBuses"], "RoleArn": data.get("RoleArn") or "", "Arn": arn}
+    err = _endpoint_config_error(config)
+    if err:
+        return err
+    if name in _endpoints:
+        return error_response_json("ResourceAlreadyExistsException", f"Endpoint {name} already exists.", 400)
     now = _now_ts()
+    endpoint_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "." + \
+        "".join(random.choices(string.ascii_lowercase, k=3))
     _endpoints[name] = {
+        **config,
         "Name": name,
         "Description": data.get("Description", ""),
-        "RoutingConfig": data.get("RoutingConfig", {}),
-        "ReplicationConfig": data.get("ReplicationConfig", {}),
-        "EventBuses": data.get("EventBuses", []),
-        "RoleArn": data.get("RoleArn", ""),
-        "Arn": arn,
-        "EndpointUrl": f"https://{name}.global-events.{get_region()}.amazonaws.com",
-        "State": "ACTIVE",
+        "EndpointId": endpoint_id,
+        "EndpointUrl": f"https://{endpoint_id}.endpoint.events.amazonaws.com",
+        "State": "CREATING",
         "CreationTime": now,
         "LastModifiedTime": now,
+        "_active_at": now + _ENDPOINT_ACTIVATION_SECONDS,
     }
-    ep = _endpoints[name]
-    return json_response({
-        "Name": ep["Name"],
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep["RoutingConfig"],
-        "ReplicationConfig": ep["ReplicationConfig"],
-        "EventBuses": ep["EventBuses"],
-        "RoleArn": ep["RoleArn"],
-        "State": ep["State"],
-    })
+    return json_response(_endpoint_view(_endpoints[name], full=False))
 
 
 def _delete_endpoint(data):
-    name = data.get("Name")
-    if name not in _endpoints:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    del _endpoints[name]
+    # Deleting an endpoint that does not exist succeeds, as on AWS.
+    _endpoints.pop(data.get("Name"), None)
     return json_response({})
 
 
 def _describe_endpoint(data):
-    name = data.get("Name")
-    ep = _endpoints.get(name)
+    ep = _endpoints.get(data.get("Name"))
     if not ep:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    return json_response({
-        "Name": ep["Name"],
-        "Description": ep.get("Description", ""),
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep.get("RoutingConfig", {}),
-        "ReplicationConfig": ep.get("ReplicationConfig", {}),
-        "EventBuses": ep.get("EventBuses", []),
-        "RoleArn": ep.get("RoleArn", ""),
-        "EndpointId": ep["Name"],
-        "EndpointUrl": ep["EndpointUrl"],
-        "State": ep["State"],
-        "StateReason": "",
-        "CreationTime": ep["CreationTime"],
-        "LastModifiedTime": ep.get("LastModifiedTime", ep["CreationTime"]),
-    })
+        return _endpoint_not_found(data.get("Name"))
+    return json_response(_endpoint_view(ep))
 
 
 def _list_endpoints(data):
@@ -3306,43 +3870,33 @@ def _list_endpoints(data):
     home = data.get("HomeRegion", "")
     results = []
     for n in sorted(_endpoints.keys()):
-        ep = _endpoints[n]
         if prefix and not n.startswith(prefix):
             continue
         if home and get_region() != home:
             continue
-        results.append({
-            "Name": ep["Name"],
-            "Arn": ep["Arn"],
-            "EndpointUrl": ep["EndpointUrl"],
-            "State": ep["State"],
-            "CreationTime": ep["CreationTime"],
-        })
-    return json_response({"Endpoints": results})
+        results.append(_endpoint_view(_endpoints[n]))
+    return _offset_page(data, "Endpoints", results, "MaxResults")
 
 
 def _update_endpoint(data):
-    name = data.get("Name")
-    if name not in _endpoints:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    ep = _endpoints[name]
-    now = _now_ts()
-    for key in ("Description", "RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn"):
-        if key in data:
-            ep[key] = data[key]
-    ep["LastModifiedTime"] = now
-    return json_response({
-        "Name": ep["Name"],
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep["RoutingConfig"],
-        "ReplicationConfig": ep["ReplicationConfig"],
-        "EventBuses": ep["EventBuses"],
-        "RoleArn": ep["RoleArn"],
-        "EndpointId": ep["Name"],
-        "EndpointUrl": ep["EndpointUrl"],
-        "State": ep["State"],
-    })
+    err = _endpoint_shape_errors(data, create=False)
+    if err:
+        return err
+    name = data["Name"]
+    ep = _endpoints.get(name)
+    if not ep:
+        return _endpoint_not_found(name)
+    config = {key: data[key] if key in data else ep[key]
+              for key in ("RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn")}
+    config["Arn"] = ep["Arn"]
+    err = _endpoint_config_error(config)
+    if err:
+        return err
+    ep.update({k: v for k, v in config.items() if k != "Arn"})
+    if "Description" in data:
+        ep["Description"] = data["Description"]
+    ep["LastModifiedTime"] = _now_ts()
+    return json_response(_endpoint_view(ep, full=False))
 
 
 def _activate_event_source(data):
@@ -3406,7 +3960,6 @@ def _describe_partner_event_source(data):
             return json_response({
                 "Name": rec["Name"],
                 "Arn": rec["EventSourceArn"],
-                "State": "ACTIVE",
             })
     return error_response_json("ResourceNotFoundException",
                                f"Partner event source {name} does not exist.", 400)
@@ -3421,14 +3974,13 @@ def _list_partner_event_sources(data):
         results.append({
             "Name": rec["Name"],
             "Arn": rec["EventSourceArn"],
-            "State": "ACTIVE",
         })
-    return json_response({"PartnerEventSources": results})
+    return _offset_page(data, "PartnerEventSources", results)
 
 
 def _list_partner_event_source_accounts(data):
     _ = data.get("EventSourceName", "")
-    return json_response({"PartnerEventSourceAccounts": [], "NextToken": ""})
+    return json_response({"PartnerEventSourceAccounts": []})
 
 
 def _list_event_sources(data):
@@ -3447,8 +3999,40 @@ def _put_partner_events(data):
 # Permissions (resource policies)
 # ---------------------------------------------------------------------------
 
+def _policy_statement_error(document, bus_arn):
+    """The ValidationException message for a Policy document AWS refuses, or None."""
+    statements = document.get("Statement") if isinstance(document, dict) else None
+    for statement in statements if isinstance(statements, list) else [statements]:
+        resources = statement.get("Resource") if isinstance(statement, dict) else None
+        for resource in resources if isinstance(resources, list) else [resources]:
+            if isinstance(resource, str) and resource != bus_arn and resource.startswith("arn:"):
+                relative = resource.split(":", 5)[5] if resource.count(":") >= 5 else resource
+                return f'The relative-id "{relative}" is invalid for ARN "{resource}"'
+    return None
+
+
 def _put_permission(data):
     bus_name = data.get("EventBusName", "default")
+    bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
+    if "Policy" in data:
+        if any(data.get(k) is not None for k in ("Action", "Principal", "StatementId", "Condition")):
+            return error_response_json(
+                "ValidationException",
+                "Action, Principal, StatementId and Condition could not be combined with Policy parameter.", 400)
+        try:
+            document = json.loads(data["Policy"]) if isinstance(data["Policy"], str) else None
+        except ValueError:
+            document = None
+        if not isinstance(document, dict):
+            return error_response_json("ValidationException", "This policy contains invalid Json", 400)
+        message = _policy_statement_error(document, bus_arn)
+        if message:
+            return error_response_json("ValidationException", message, 400)
+        # A Policy replaces the bus's whole policy.
+        _event_bus_policies[bus_name] = document
+        _touch_bus(bus_name)
+        return json_response({})
+
     statement_id = data.get("StatementId") or new_uuid()
 
     if bus_name not in _event_bus_policies:
@@ -3457,19 +4041,29 @@ def _put_permission(data):
     policy = _event_bus_policies[bus_name]
     policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != statement_id]
 
+    principal = data.get("Principal", "*")
+    if isinstance(principal, str) and re.fullmatch(r"\d{12}", principal):
+        principal = {"AWS": f"arn:aws:iam::{principal}:root"}
     statement = {
         "Sid": statement_id,
         "Effect": "Allow",
-        "Principal": data.get("Principal", "*"),
+        "Principal": principal,
         "Action": data.get("Action", "events:PutEvents"),
-        "Resource": f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}",
+        "Resource": bus_arn,
     }
     condition = data.get("Condition")
     if condition:
         statement["Condition"] = condition
     policy["Statement"].append(statement)
+    _touch_bus(bus_name)
 
     return json_response({})
+
+
+def _touch_bus(bus_name):
+    bus = _event_buses.get(bus_name)
+    if bus:
+        bus["LastModifiedTime"] = _now_ts()
 
 
 def _remove_permission(data):
@@ -3597,11 +4191,28 @@ def _create_connection(data):
         "LastModifiedTime": now,
         "LastAuthorizedTime": now,
     }
+    _apply_connection_extras(_connections[name], data)
     return json_response({
         "ConnectionArn": arn,
         "ConnectionState": "AUTHORIZED",
         "CreationTime": now,
     })
+
+
+def _apply_connection_extras(conn, data):
+    if data.get("KmsKeyIdentifier"):
+        conn["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+    connectivity = data.get("InvocationConnectivityParameters")
+    if isinstance(connectivity, dict) and isinstance(connectivity.get("ResourceParameters"), dict):
+        config_arn = connectivity["ResourceParameters"].get("ResourceConfigurationArn")
+        current = (conn.get("InvocationConnectivityParameters") or {}).get("ResourceParameters", {})
+        association = current.get("ResourceAssociationArn") if current.get("ResourceConfigurationArn") == config_arn else None
+        conn["InvocationConnectivityParameters"] = {"ResourceParameters": {
+            "ResourceConfigurationArn": config_arn,
+            "ResourceAssociationArn": association or (
+                f"arn:aws:vpc-lattice:{get_region()}:{get_account_id()}:servicenetworkresourceassociation/"
+                f"snra-{new_uuid().replace('-', '')[:17]}"),
+        }}
 
 
 def _describe_connection(data):
@@ -3610,7 +4221,7 @@ def _describe_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
-    return json_response(conn)
+    return json_response(to_output_shape("events", "DescribeConnectionResponse", conn))
 
 
 def _delete_connection(data):
@@ -3646,7 +4257,25 @@ def _list_connections(data):
             "LastModifiedTime": conn["LastModifiedTime"],
             "LastAuthorizedTime": conn.get("LastAuthorizedTime", ""),
         })
-    return json_response({"Connections": results})
+    return _offset_page(data, "Connections", results)
+
+
+_AUTH_TYPE_BLOCKS = {
+    "BASIC": "BasicAuthParameters",
+    "API_KEY": "ApiKeyAuthParameters",
+    "OAUTH_CLIENT_CREDENTIALS": "OAuthParameters",
+}
+
+
+def _merge_auth_params(stored, sent):
+    if not isinstance(sent, dict):
+        return sent
+    for key, value in sent.items():
+        if isinstance(value, dict) and isinstance(stored.get(key), dict):
+            stored[key] = _merge_auth_params(stored[key], value)
+        else:
+            stored[key] = copy.deepcopy(value)
+    return stored
 
 
 def _update_connection(data):
@@ -3665,9 +4294,17 @@ def _update_connection(data):
             return endpoint_error
     conn = _connections[name]
     now = _now_ts()
-    for key in ("AuthorizationType", "AuthParameters", "Description"):
+    if "AuthParameters" in data:
+        stored = copy.deepcopy(conn.get("AuthParameters")) if isinstance(conn.get("AuthParameters"), dict) else {}
+        new_type = data.get("AuthorizationType")
+        if new_type and new_type != conn.get("AuthorizationType"):
+            for block in _AUTH_TYPE_BLOCKS.values():
+                stored.pop(block, None)
+        conn["AuthParameters"] = _merge_auth_params(stored, data["AuthParameters"])
+    for key in ("AuthorizationType", "Description"):
         if key in data:
             conn[key] = data[key]
+    _apply_connection_extras(conn, data)
     if "AuthParameters" in data or "AuthorizationType" in data:
         # Re-authorization: the new credentials, not the cached token, decide
         # what the next invocation carries. A description-only update does not
@@ -3789,7 +4426,7 @@ def _list_api_destinations(data):
             "CreationTime": dest["CreationTime"],
             "LastModifiedTime": dest["LastModifiedTime"],
         })
-    return json_response({"ApiDestinations": results})
+    return _offset_page(data, "ApiDestinations", results)
 
 
 def _update_api_destination(data):

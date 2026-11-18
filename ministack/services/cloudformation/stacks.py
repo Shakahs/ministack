@@ -7,12 +7,14 @@ CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 import asyncio
 import contextvars
 import copy
+import json
 import logging
 from contextlib import contextmanager
 
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import get_region, new_uuid, now_iso, set_request_region
 
+from .custom_resource import _normalise_resource_properties
 from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
@@ -78,8 +80,8 @@ def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None 
 def _runs_on_worker_thread(resource_type: str) -> bool:
     """The types whose provisioning blocks, so they run on a worker thread:
     custom resources wait for the ResponseURL PUT, a WaitCondition for the
-    signals on its handle, and a nested stack deploys inline and may contain
-    either. ElastiCache clusters and replication groups start and stop their
+    signals on its handle, and a nested stack or a StackSet's instance
+    deploys inline and may contain either. ElastiCache clusters and replication groups start and stop their
     containers through the Docker daemon, the calls elasticache.py itself
     keeps off the event loop. An IoT certificate is registered through the
     async IoT handler, which a worker thread can wait for."""
@@ -87,6 +89,7 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::WaitCondition",
                                  "AWS::CloudFormation::Stack",
+                                 "AWS::CloudFormation::StackSet",
                                  "AWS::ElastiCache::CacheCluster",
                                  "AWS::ElastiCache::ReplicationGroup",
                                  "AWS::IoT::Certificate"))
@@ -160,8 +163,10 @@ CLIENT_REQUEST_TOKEN = contextvars.ContextVar("cfn_client_request_token", defaul
 
 
 def _add_event(stack_id, stack_name, logical_id, resource_type, status,
-               reason="", physical_id="", detailed_status=""):
-    """Record a stack event."""
+               reason="", physical_id="", detailed_status="", properties=None):
+    """Record a stack event; ``properties`` are the resolved template properties
+    the operation uses for the resource, reported as the event's ResourceProperties
+    in CloudFormation's wire form (every primitive a string)."""
     from ministack.services.cloudformation import _stack_events
     event = {
         "StackId": stack_id,
@@ -179,9 +184,38 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
         event["ClientRequestToken"] = token
     if detailed_status:
         event["DetailedStatus"] = detailed_status
+    if properties is not None:
+        event["ResourceProperties"] = json.dumps(
+            _mask_no_echo(_normalise_resource_properties(properties), _no_echo_values(stack_name, stack_id)),
+            separators=(",", ":"), default=str)
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
+
+
+def _no_echo_values(stack_name, stack_id) -> list:
+    """The values of the stack's NoEcho parameters."""
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name)
+    if not stack or stack.get("StackId") != stack_id:
+        return []
+    return [str(p["ParameterValue"]) for p in stack.get("Parameters", [])
+            if p.get("NoEcho") and p.get("ParameterValue")]
+
+
+def _mask_no_echo(node, secrets):
+    """AWS shows a NoEcho parameter's value as **** in an event's ResourceProperties (capture 2026-11-18);
+    a value written in the template is shown as is."""
+    if not secrets:
+        return node
+    if isinstance(node, dict):
+        return {k: _mask_no_echo(v, secrets) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_no_echo(v, secrets) for v in node]
+    if isinstance(node, str):
+        for secret in secrets:
+            node = node.replace(secret, "****")
+    return node
 
 
 # The reasons AWS gives the events of an imported resource.
@@ -267,10 +301,12 @@ def _rollback_failure_reason(failed_records: dict) -> str:
 
 def _sends_back_failed_update(resource_type: str) -> bool:
     """Whether the resource whose own update failed is sent back too: a provider
-    or a child stack may have changed state before failing; a type's handler did not."""
+    or a child stack (a StackSet's instance is one) may have changed state before
+    failing; a type's handler did not."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
-                                 "AWS::CloudFormation::Stack"))
+                                 "AWS::CloudFormation::Stack",
+                                 "AWS::CloudFormation::StackSet"))
 
 
 def _mark_rolled_back(record):
@@ -285,7 +321,7 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
     """Send an in-place update back to the previous properties through the
     type's update handler; ``record`` takes the attributes it answers."""
     _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
-               physical_id=physical_id)
+               physical_id=physical_id, properties=previous_props)
     seed_token = _NAME_SEED.set((record or {}).get("_name_seed", ""))
     try:
         if _runs_on_worker_thread(rtype):
@@ -299,7 +335,7 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
     except Exception as exc:
         logger.error("Rollback update of %s failed: %s", logical_id, exc)
         _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_FAILED",
-                   str(exc), physical_id)
+                   str(exc), physical_id, properties=previous_props)
         raise
     finally:
         _NAME_SEED.reset(seed_token)
@@ -312,7 +348,7 @@ async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
             record["Attributes"] = {**record.get("Attributes", {}), **new_attrs}
     _mark_rolled_back(record)
     _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_COMPLETE",
-               physical_id=new_pid)
+               physical_id=new_pid, properties=previous_props)
 
 
 async def _continue_update_rollback_async(stack_name: str, stack_id: str,
@@ -533,7 +569,7 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
             provisioned_resources.pop(logical_id, None)
             continue
         _add_event(stack_id, stack_name, logical_id, rtype,
-                   "DELETE_IN_PROGRESS", physical_id=pid)
+                   "DELETE_IN_PROGRESS", physical_id=pid, properties=res_props)
         try:
             if _runs_on_worker_thread(rtype):
                 await run_reentrant(
@@ -543,12 +579,12 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
             else:
                 _delete_resource(rtype, pid, res_props, stack_name, logical_id)
             _add_event(stack_id, stack_name, logical_id, rtype,
-                       "DELETE_COMPLETE", physical_id=pid)
+                       "DELETE_COMPLETE", physical_id=pid, properties=res_props)
         except Exception as del_exc:
             logger.error("Rollback delete of %s failed: %s",
                          logical_id, del_exc)
             _add_event(stack_id, stack_name, logical_id, rtype,
-                       "DELETE_FAILED", str(del_exc), pid)
+                       "DELETE_FAILED", str(del_exc), pid, properties=res_props)
             if cleanup_phase:
                 provisioned_resources.pop(logical_id, None)
                 continue
@@ -619,38 +655,90 @@ def _static_property(raw, resources_defs, param_values, conditions, mappings, st
 
 
 def _validation_errors(resources_defs, ordered, param_values, conditions, mappings, stack_name, stack_id,
-                       owned_buckets=frozenset()):
+                       previous_stack=None):
     """Pre-deployment validation errors as ``(logical_id, type, validation name,
-    path, reason)``: properties outside their schema enum, and AWS::S3::Bucket
-    names the stack can't take (NAME_CONFLICT_VALIDATION, observed on AWS); a
-    bucket the stack already owns is not a conflict for its update."""
-    from ministack.services.cloudformation.provisioners import s3_bucket_name_conflict
+    path, reason)``: properties outside their schema enum, ListenerRule
+    Transforms and AWS::Events::Archive properties that break the resource
+    schema, and AWS::S3::Bucket and AWS::Events::Archive names the stack can't
+    take (NAME_CONFLICT_VALIDATION, observed on AWS). A bucket the stack already
+    owns is not a conflict for its update, and an archive name is only checked
+    for an archive new to the stack: AWS lets a replacement onto a taken name
+    through to the handler, which refuses it."""
+    from ministack.services.cloudformation.provisioners import (
+        eb_archive_name_conflict,
+        eb_archive_schema_errors,
+        listener_rule_transforms_schema_errors,
+        s3_bucket_name_conflict,
+    )
+
+    previous = (previous_stack or {}).get("_resources", {})
+    owned_buckets = {r.get("PhysicalResourceId") for r in previous.values()
+                     if r.get("ResourceType") == "AWS::S3::Bucket"}
+
+    def static(raw):
+        # A value that does not resolve yet, such as a missing export, is left to deploy time.
+        try:
+            return _static_property(raw, resources_defs, param_values, conditions, mappings, stack_name, stack_id)
+        except ValueError:
+            return None
+
+    def property_path(logical_id, path):
+        return f"/Resources/{logical_id}/Properties" + (f"/{path}" if path else "")
 
     errors = []
-    for logical_id in ordered:
+    # In logical id order, whatever the template's (measured); an archive's
+    # name conflict comes before its property errors.
+    for logical_id in sorted(ordered):
         res_def = resources_defs[logical_id]
         cond = res_def.get("Condition")
         if cond and not conditions.get(cond, True):
             continue
         rtype = res_def.get("Type", "")
-        raw_props = res_def.get("Properties") or {}
+        raw_props = res_def.get("Properties") if isinstance(res_def.get("Properties"), dict) else {}
         props = {}
         for prop in _PROPERTY_ENUMS.get(rtype, {}):
             if any(name in resources_defs for name, _ in _intrinsic_references(raw_props.get(prop))):
                 continue
-            props[prop] = _static_property(raw_props.get(prop), resources_defs, param_values, conditions,
-                                           mappings, stack_name, stack_id)
+            props[prop] = static(raw_props.get(prop))
         # The enum check's validation name is not observed; PROPERTY_VALIDATION is inferred.
-        errors += [(logical_id, rtype, "PROPERTY_VALIDATION", f"/Resources/{logical_id}/Properties/{prop}", reason)
+        errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, prop), reason)
                    for prop, reason in _property_enum_errors(rtype, props)]
+        if (rtype == "AWS::ElasticLoadBalancingV2::ListenerRule" and "Transforms" in raw_props
+                and not any(name in resources_defs for name, _ in _intrinsic_references(raw_props["Transforms"]))):
+            transforms = static(raw_props["Transforms"])
+            errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, path), reason)
+                       for path, reason in listener_rule_transforms_schema_errors(transforms)]
+        if rtype == "AWS::ElastiCache::UserGroup" and "UserIds" in raw_props:
+            user_ids = static(raw_props["UserIds"])
+            if isinstance(user_ids, list) and len({repr(u) for u in user_ids}) != len(user_ids):
+                errors.append((logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, "UserIds"),
+                               "#/UserIds: array items are not unique"))
+        if rtype == "AWS::Events::Archive":
+            archive_props = {key: static(value) for key, value in raw_props.items()}
+            archive_props = {key: value for key, value in archive_props.items() if value is not _NO_VALUE}
+            name = archive_props.get("ArchiveName")
+            conflict = (eb_archive_name_conflict(name)
+                        if isinstance(name, str) and logical_id not in previous else None)
+            if conflict:
+                errors.append((logical_id, rtype, "NAME_CONFLICT_VALIDATION", f"/Resources/{logical_id}", conflict))
+            errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, path), reason)
+                       for path, reason in eb_archive_schema_errors(archive_props)]
         if rtype == "AWS::S3::Bucket" and raw_props.get("BucketName"):
-            name = _static_property(raw_props["BucketName"], resources_defs, param_values, conditions,
-                                    mappings, stack_name, stack_id)
+            name = static(raw_props["BucketName"])
             conflict = (s3_bucket_name_conflict(name)
                         if isinstance(name, str) and name not in owned_buckets else None)
             if conflict:
                 errors.append((logical_id, rtype, "NAME_CONFLICT_VALIDATION", f"/Resources/{logical_id}", conflict))
     return errors
+
+
+def change_set_validation_errors(template, param_values, stack_name, stack_id, logical_ids, previous_stack=None):
+    """``_validation_errors`` for the resources a change set adds or modifies;
+    ``previous_stack`` is the stack an UPDATE change set changes."""
+    conditions = _evaluate_conditions(template, param_values)
+    resources_defs = template.get("Resources", {})
+    return _validation_errors(resources_defs, [r for r in resources_defs if r in logical_ids], param_values,
+                              conditions, template.get("Mappings", {}), stack_name, stack_id, previous_stack)
 
 
 def _operation_event(stack_id, operation_id, event_type, operation_type="CREATE_STACK", **fields):
@@ -667,10 +755,8 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
     for DescribeEvents, which the stack event points the caller to. A failed
     update rolls back to ``previous_stack`` (observed on AWS 2026-10-16)."""
     is_update = previous_stack is not None
-    owned = {r.get("PhysicalResourceId") for r in (previous_stack or {}).get("_resources", {}).values()
-             if r.get("ResourceType") == "AWS::S3::Bucket"}
     errors = _validation_errors(resources_defs, ordered, param_values, conditions, mappings,
-                                stack_name, stack_id, frozenset(owned))
+                                stack_name, stack_id, previous_stack)
     if not errors:
         return False
     operation_id = new_uuid()
@@ -679,7 +765,7 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
     for logical_id, rtype, validation_name, path, reason in errors:
         logger.warning("Stack %s validation: %s: %s", stack_name, path, reason)
         operation_events.append(_operation_event(
-            stack_id, operation_id, "VALIDATION_ERROR", operation_type,
+            stack_id, operation_id, "VALIDATION_ERROR", operation_type, OperationStatus=None,
             LogicalResourceId=logical_id, ResourceType=rtype,
             ValidationFailureMode="FAIL", ValidationName=validation_name, ValidationStatus="FAILED",
             ValidationStatusReason=reason, ValidationPath=path))
@@ -688,7 +774,8 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
         _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack", status, reason, stack_id,
                    detailed_status=detailed_status)
         operation_events.append(_operation_event(
-            stack_id, operation_id, "PROVISIONING_ERROR", operation_type, LogicalResourceId=stack_name,
+            stack_id, operation_id, "PROVISIONING_ERROR", operation_type, OperationStatus=None,
+            LogicalResourceId=stack_name,
             PhysicalResourceId=stack_id, ResourceType="AWS::CloudFormation::Stack", ResourceStatus=status,
             ResourceStatusReason=reason, **({"DetailedStatus": detailed_status} if detailed_status else {})))
 
@@ -736,6 +823,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
     stack.pop("_failed_operation", None)
+    validation_scope = stack.pop("_validation_scope", None)
 
     mappings = template.get("Mappings", {})
     conditions = _evaluate_conditions(template, param_values)
@@ -757,8 +845,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                    str(exc), stack_id)
         return
 
+    validated = [r for r in ordered if r not in imports and (validation_scope is None or r in validation_scope)]
     if not stack.get("_disable_validation") and _fail_property_validation(
-            stack, stack_id, stack_name, resources_defs, ordered, param_values,
+            stack, stack_id, stack_name, resources_defs, validated, param_values,
             conditions, mappings, disable_rollback,
             previous_stack=(previous_stack or {}) if is_update else None):
         return
@@ -807,6 +896,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         raw_props = res_def.get("Properties", {})
         update_attempt = None
         name_seed = ""
+        resolved_props = None
 
         try:
             # Resolve properties
@@ -846,7 +936,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
             if logical_id not in imports:
                 _add_event(stack_id, stack_name, logical_id, resource_type,
-                           f"{status_prefix}_IN_PROGRESS")
+                           f"{status_prefix}_IN_PROGRESS", properties=resolved_props)
 
             # On stack update, route previously-provisioned resources through
             # the type's update handler when one exists; otherwise fall back
@@ -882,7 +972,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     _add_event(stack_id, stack_name, logical_id, resource_type,
                                "UPDATE_IN_PROGRESS",
                                "Requested update requires the creation of a new "
-                               "physical resource; hence creating one.", old_pid)
+                               "physical resource; hence creating one.", old_pid,
+                               properties=resolved_props)
                 elif not refused:
                     update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
@@ -928,7 +1019,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                          logical_id, resource_type, exc)
             _add_event(stack_id, stack_name, logical_id, resource_type,
                        "IMPORT_FAILED" if logical_id in imports else f"{status_prefix}_FAILED",
-                       str(exc))
+                       str(exc), properties=resolved_props)
             failed = True
             fail_reason = f"Resource {logical_id} failed: {exc}"
             failed_logical_id = logical_id
@@ -961,7 +1052,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
         if logical_id not in imports:
             _add_event(stack_id, stack_name, logical_id, resource_type,
-                       f"{status_prefix}_COMPLETE", physical_id=physical_id)
+                       f"{status_prefix}_COMPLETE", physical_id=physical_id,
+                       properties=resolved_props)
 
     resolved_outputs: list = []
     new_exports: dict = {}

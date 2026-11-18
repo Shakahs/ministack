@@ -15,7 +15,8 @@ trailing ``*`` single-level wildcard. Connection-scoped authorization is
 declared via a second ``header-<base64url(json)>`` Sec-WebSocket-Protocol
 entry. Set ``APPSYNC_EVENTS_ENFORCE_AUTH=1`` for strict mode (registered
 x-api-key required, or AWS_LAMBDA authorizer Lambda invoked when configured
-in the API ``eventConfig``).
+in the API ``eventConfig``). Under ``AUTH=true`` the check is on and follows the
+authorization modes of the API and the channel namespace.
 """
 
 import asyncio
@@ -30,13 +31,16 @@ import time
 
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
+    REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("appsync_events")
@@ -61,6 +65,19 @@ _connections: dict[str, dict] = {}
 _connections_lock: asyncio.Lock | None = None
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
+
 def _get_connections_lock() -> asyncio.Lock:
     global _connections_lock
     if _connections_lock is None:
@@ -69,11 +86,10 @@ def _get_connections_lock() -> asyncio.Lock:
 
 
 def _discover_api_scope(api_id: str, account_id: str) -> tuple[str, str] | None:
-    """Return the API's account/region scope without crossing tenants."""
-    for (scoped_account_id, region, scoped_api_id), _api in _apis.all_items():
-        if scoped_account_id == account_id and scoped_api_id == api_id:
-            return scoped_account_id, region
-    return None
+    """Return the API's account/region scope, *account_id* first: API-key requests carry no signed scope."""
+    matches = [(scoped_account_id, region) for (scoped_account_id, region, scoped_api_id), _api in _apis.all_items()
+               if scoped_api_id == api_id]
+    return next((m for m in matches if m[0] == account_id), matches[0] if matches else None)
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +129,6 @@ def _restore_api_child_store(
         store.set_scoped(account_id, region, api_id, value)
 
 
-def load_persisted_state(data):
-    return _restore_state(data)
-
-
 def _restore_state(data):
     if not data:
         return
@@ -127,8 +139,8 @@ def _restore_state(data):
     _restore_api_child_store(_api_keys, data.get("api_keys", {}))
 
 
-# Same contract as apigateway.py (used by app.py persistence loader)
-load_persisted_state = _restore_state
+def load_persisted_state(data):
+    return _restore_state(data)
 
 
 
@@ -301,6 +313,17 @@ def _not_found(msg: str):
     return error_response_json("NotFoundException", msg, 404)
 
 
+def _publish_error(status: int, error_type: str, message: str | None = None):
+    """An HTTP publish refusal in the data plane's ``errors`` envelope."""
+    error = {"errorType": error_type, **({"message": message} if message else {})}
+    headers = {"Content-Type": REST_JSON_CONTENT_TYPE, "x-amzn-errortype": error_type}
+    return status, headers, json.dumps({"errors": [error]}).encode("utf-8")
+
+
+def _publish_api_not_found():
+    return _publish_error(404, "ResourceNotFoundException", "Unable to find the Api.")
+
+
 # ---------------------------------------------------------------------------
 # Channel validation + matching (subscribe pattern -> publish channel)
 # ---------------------------------------------------------------------------
@@ -420,6 +443,34 @@ def _auth_has_known_api_key(api_id: str, auth: dict | None) -> bool:
     if not provided:
         return False
     return provided in _api_keys.get(api_id, {})
+
+
+def _operation_auth_modes(api_id: str, channel: str | None, operation: str) -> set:
+    """The authorization types the API, or the channel's namespace, accepts for ``operation``."""
+    if operation == EVENT_CONNECT:
+        modes = ((_apis.get(api_id) or {}).get("eventConfig") or {}).get("connectionAuthModes")
+    else:
+        namespace = _channel_namespaces.get(api_id, {}).get(_channel_namespace_for(channel or "")) or {}
+        modes = namespace.get("publishAuthModes" if operation == EVENT_PUBLISH else "subscribeAuthModes")
+    return {mode.get("authType") for mode in modes or [] if isinstance(mode, dict)}
+
+
+def _modes_accept(api_id: str, modes: set, auth: dict | None) -> tuple[bool, str | None]:
+    """Whether ``auth`` satisfies one of ``modes``, and AppSync's message when an API key is refused."""
+    auth = auth if isinstance(auth, dict) else {}
+    authorization = str(auth.get("Authorization") or auth.get("authorization") or "")
+    refused = None
+    if "API_KEY" in modes and (auth.get("x-api-key") or auth.get("X-Api-Key")):
+        if _auth_has_known_api_key(api_id, auth):
+            return True, None
+        refused = "You are not authorized to make this call."
+    # The gateway has checked an HTTP request's signature by now; a WebSocket's is taken as sent.
+    if "AWS_IAM" in modes and authorization.startswith("AWS4-HMAC-SHA256"):
+        return True, None
+    if {"AMAZON_COGNITO_USER_POOLS", "OPENID_CONNECT"} & modes and authorization and not authorization.startswith(
+            "AWS4-"):
+        return True, None
+    return False, refused
 
 
 def _find_lambda_authorizer_arn(api_id: str) -> str | None:
@@ -559,6 +610,9 @@ async def _authorize_event_op(
             return False, f"{operation} rejected: AppSync authorizer denied"
         return True, None
 
+    from ministack.app import AUTH
+    if AUTH:
+        return _modes_accept(api_id, _operation_auth_modes(api_id, channel, operation), auth)
     if _strict_auth_enabled() and not _auth_has_known_api_key(api_id, auth):
         return False, f"{operation} rejected: no valid x-api-key"
 
@@ -596,6 +650,9 @@ async def handle_request(method, path, headers, body, query_params):
 
     if path.startswith("/v2/apis"):
         return await _handle_mgmt(method, path, headers, body, query_params)
+
+    if host_match:
+        return _publish_error(404, "UnknownOperationException", "Unknown Operation Request.")
 
     return error_response_json("BadRequestException", f"Unsupported AppSync Events path: {path}", 400)
 
@@ -902,67 +959,63 @@ async def _publish_from_host(
 
     api_scope = _discover_api_scope(api_id, get_account_id())
     if api_scope is None:
-        return _not_found(f"Api {api_id} not found")
+        return _publish_api_not_found()
 
-    from ministack.core.responses import _request_region
+    from ministack.core.responses import _request_account_id, _request_region
 
-    region_token = _request_region.set(api_scope[1])
+    account_token, region_token = _request_account_id.set(api_scope[0]), _request_region.set(api_scope[1])
     try:
         if (
             not _is_advertised_dns_host(api_id, host, "HTTP")
             and host_region is not None
             and api_scope[1] != host_region
         ):
-            return _not_found(f"Api {api_id} not found")
+            return _publish_api_not_found()
         return await _publish(api_id, headers, body)
     finally:
         _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
 
 
 async def _publish(api_id: str, headers: dict, body: bytes):
     if api_id not in _apis:
-        return _not_found(f"Api {api_id} not found")
+        return _publish_api_not_found()
 
-    data, err = _parse_json_body(body)
-    if err:
-        return err
+    try:
+        data = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _publish_error(400, "SerializationException", "Unable to parse request body")
+    if not isinstance(data, dict):
+        return _publish_error(400, "BadRequestException", "Request body must be a JSON object")
 
     channel = data.get("channel")
     events = data.get("events")
-    if not channel or not isinstance(events, list):
-        return error_response_json(
-            "BadRequestException",
-            "Request body must include 'channel' and 'events' (array)",
-            400,
-        )
+    if events is not None and not isinstance(events, list):
+        return _publish_error(400, "SerializationException", "Expected list or null")
+    if not channel:
+        return _publish_error(400, "BadRequestException", "Missing channel")
+    if events is None:
+        return _publish_error(400, "BadRequestException", "Missing events")
     # AWS spec: max 5 events per publish.
     if len(events) > _MAX_EVENTS_PER_BATCH:
-        return error_response_json(
-            "BadRequestException",
-            f"events array may contain at most {_MAX_EVENTS_PER_BATCH} entries",
-            400,
-        )
+        return _publish_error(
+            400, "BadRequestException", f"Input exceeded {_MAX_EVENTS_PER_BATCH} event limit")
 
-    channel_err = _validate_channel(channel, allow_wildcard=False)
-    if channel_err:
-        return error_response_json("BadRequestException", channel_err, 400)
+    if not isinstance(channel, str) or _validate_channel(channel, allow_wildcard=False):
+        return _publish_error(400, "BadRequestException", "Invalid Channel Format")
 
     ns_name = _channel_namespace_for(channel)
     if ns_name is None or ns_name not in _channel_namespaces.get(api_id, {}):
-        return error_response_json(
-            "UnauthorizedException",
-            f"No channel namespace matches '{channel}'",
-            401,
-        )
+        return _publish_error(401, "UnauthorizedException")
 
     ok, message = await _authorize_event_op(
         api_id, str(channel), EVENT_PUBLISH, _auth_from_headers(headers), headers
     )
     if not ok:
-        return error_response_json("UnauthorizedException", message or "Unauthorized", 401)
+        return _publish_error(401, "UnauthorizedException", message)
 
     successful, failed = await _fanout_publish(api_id, channel, events)
-    return json_response({"successful": successful, "failed": failed})
+    return json_response({"successful": successful, "failed": failed}, content_type=REST_JSON_CONTENT_TYPE)
 
 
 async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list, list]:
@@ -1102,6 +1155,8 @@ async def _handle_websocket_in_api_scope(
             chosen = proto
             break
 
+    from ministack.app import AUTH
+
     conn_auth, auth_error = _decode_header_subprotocol(requested)
     strict = _strict_auth_enabled()
     lambda_auth_arn = _find_lambda_authorizer_arn(api_id)
@@ -1159,6 +1214,9 @@ async def _handle_websocket_in_api_scope(
                 "connect rejected: AppSync authorizer returned deny or error",
             ):
                 return
+    elif AUTH and not _modes_accept(api_id, _operation_auth_modes(api_id, None, EVENT_CONNECT), conn_auth)[0]:
+        if await _deny_websocket("Unauthorized: no authorization the API accepts for connections"):
+            return
     elif strict and (conn_auth is None or not _auth_has_known_api_key(api_id, conn_auth)):
         if await _deny_websocket(
             "Unauthorized: missing or invalid API key in header-<b64> subprotocol",

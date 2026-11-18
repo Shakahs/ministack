@@ -52,6 +52,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import unquote
 
+from ministack.core import container_reaper
 from ministack.core.responses import (
     AccountRegionScopedDict,
     StreamingResponse,
@@ -78,6 +79,14 @@ _memory_events = AccountRegionScopedDict()   # memoryId -> {actorId -> {sessionI
 _memory_records = AccountRegionScopedDict()  # memoryId -> {memoryRecordId -> record}
 _containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
+
+
+def _live_container_ids():
+    """Running runtimes; any other stopped agentcore container is the reaper's."""
+    return {getattr(c, "id", None) for c in list(_containers.values())} - {None}
+
+
+container_reaper.register_live_ids("agentcore", _live_container_ids)
 
 # AgentRuntimeName / EndpointName: start with a letter, then letters/digits/_,
 # up to 48 chars total (botocore pattern ^[a-zA-Z][a-zA-Z0-9_]{0,47}$).
@@ -1346,7 +1355,8 @@ def _create_agent_runtime(body):
     for opt in ("description", "protocolConfiguration", "environmentVariables",
                 "authorizerConfiguration", "requestHeaderConfiguration",
                 "lifecycleConfiguration", "metadataConfiguration",
-                "filesystemConfigurations"):
+                "filesystemConfigurations", "capacityProviderConfiguration",
+                "platformVersion"):
         if opt in data:
             record[opt] = data[opt]
     record["_versions"] = {version: _version_snapshot(record)}
@@ -1448,7 +1458,8 @@ def _update_agent_runtime(runtime_id, body):
     for opt in ("description", "protocolConfiguration", "environmentVariables",
                 "authorizerConfiguration", "requestHeaderConfiguration",
                 "lifecycleConfiguration", "metadataConfiguration",
-                "filesystemConfigurations"):
+                "filesystemConfigurations", "capacityProviderConfiguration",
+                "platformVersion"):
         if opt in data:
             record[opt] = data[opt]
 
@@ -1920,11 +1931,18 @@ def _container_invocations_url(runtime):
                     run_kwargs["network"] = network
                 else:
                     run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
+                from ministack.services import ecr
+                run_image = image
+                if ecr._held_image(image) is not None:
+                    # An image in this MiniStack's ECR is loaded from it, never pulled from the real registry.
+                    run_image = ecr.load_held_image(client, image)
+                    if run_image is None:
+                        raise RuntimeError("not found in this MiniStack's ECR for the host platform")
                 try:
-                    container = client.containers.create(image, **run_kwargs)
+                    container = client.containers.create(run_image, **run_kwargs)
                 except docker.errors.ImageNotFound:
-                    client.images.pull(image)
-                    container = client.containers.create(image, **run_kwargs)
+                    client.images.pull(run_image)
+                    container = client.containers.create(run_image, **run_kwargs)
                 container.start()
                 container.reload()
                 if network:

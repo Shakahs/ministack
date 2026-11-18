@@ -107,6 +107,57 @@ def sqs_policy_allow_sns(queue_arn, topic_arn):
             "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}}}]}
 
 
+def ses_events_to_log_group(*, account=None, region=REGION, suffix=None, default=True):
+    """The AWS setup that sends SES sending events to a CloudWatch Logs log group.
+
+    In an account of its own unless one is given: a log group with a resource
+    policy letting EventBridge write, a rule sending every ``aws.ses`` event to
+    it, a configuration set with an enabled EventBridge event destination for
+    Send, Delivery, Bounce and Complaint, and a domain identity whose default
+    set it is (unless ``default`` is False). ``published()`` reads back the
+    events in the log group, one per line; ``configuration_set()`` adds a set.
+    """
+    account = account or f"{uuid.uuid4().int % 10**12:012d}"
+    suffix = suffix or uuid.uuid4().hex[:8]
+
+    def client(service):
+        return boto3.client(service, endpoint_url=ENDPOINT, aws_access_key_id=account,
+                            aws_secret_access_key="test", region_name=region,
+                            config=Config(region_name=region, retries={"mode": "standard"}))
+
+    sesv2, logs, events = client("sesv2"), client("logs"), client("events")
+
+    def configuration_set(name, matching=("SEND", "DELIVERY", "BOUNCE", "COMPLAINT"), enabled=True):
+        sesv2.create_configuration_set(ConfigurationSetName=name)
+        sesv2.create_configuration_set_event_destination(
+            ConfigurationSetName=name, EventDestinationName="eventbridge",
+            EventDestination={"Enabled": enabled, "MatchingEventTypes": list(matching), "EventBridgeDestination": {
+                "EventBusArn": f"arn:aws:events:{region}:{account}:event-bus/default"}})
+        return name
+
+    group, domain = f"/aws/events/ses-{suffix}", f"ses-{suffix}.example.com"
+    logs.create_log_group(logGroupName=group)
+    group_arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    logs.put_resource_policy(policyName=f"ses-events-{suffix}", policyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow",
+                       "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+                       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"], "Resource": group_arn}]}))
+    events.put_rule(Name=f"ses-events-{suffix}", EventPattern=json.dumps({"source": ["aws.ses"]}))
+    events.put_targets(Rule=f"ses-events-{suffix}", Targets=[{"Id": "logs", "Arn": group_arn.removesuffix(":*")}])
+    config_set = configuration_set(f"ses-events-{suffix}")
+    sesv2.create_email_identity(EmailIdentity=domain)
+    if default:
+        sesv2.put_email_identity_configuration_set_attributes(EmailIdentity=domain, ConfigurationSetName=config_set)
+
+    def published():
+        return [json.loads(e["message"]) for e in logs.filter_log_events(logGroupName=group)["events"]]
+
+    return SimpleNamespace(account=account, region=region, suffix=suffix, ses=client("ses"), sesv2=sesv2, logs=logs,
+                           group=group, config_set=config_set, domain=domain, sender=f"sender@{domain}",
+                           configuration_set=configuration_set, published=published)
+
+
 def iot_test_ca(registration_code, common_name="ministack-test-ca"):
     """A fresh CA as ``(ca_pem, ca_key_pem, verification_pem)``, the verification certificate carrying ``registration_code`` as its CN."""
     from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
@@ -187,6 +238,17 @@ def iam_user(auth_enabled):
         yield create
 
 
+@contextlib.contextmanager
+def second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
 def inprocess_iam_user(identity_policy=None):
     """An in-process IAM user with an access key in the default account: ``((key id, secret), arn)``."""
     from ministack.core.responses import get_account_id, request_scope
@@ -242,6 +304,9 @@ def routed_request(key, service, method, path, body=b"", headers=None, host="loc
 
 
 _SERIAL_TESTS = {
+    "tests/test_rds.py::test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster",
+    "tests/test_rds.py::test_rds_cluster_password_reset_is_visible_before_it_settles",
+    "tests/test_rds.py::test_rds_cluster_password_reset_on_stopped_cluster_is_rejected",
     "tests/test_athena.py::test_athena_queries_glue_backed_parquet",
     "tests/test_rds.py::test_rds_pg_two_replicating_readers_provision_source_once",
     "tests/test_athena.py::test_athena_engine_mock_via_config",
@@ -259,6 +324,7 @@ _SERIAL_TESTS = {
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
+    "tests/test_ses.py::test_ses_events_setup_is_cleared_by_a_reset",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
@@ -431,7 +497,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mqtt5_property_block_truncated_at_the_packet_end_is_refused",
     "tests/test_iot_data.py::test_mqtt5_malformed_connect_is_refused_with_a_connack_reason_code",
     "tests/test_iot_data.py::test_mqtt5_property_block_longer_than_127_bytes_round_trips",
-    "tests/test_iot_data.py::test_mqtt5_no_local_withholds_a_publisher_its_own_message",
+    "tests/test_iot_data.py::test_mqtt5_no_local_still_delivers_a_publisher_its_own_message",
     "tests/test_iot_data.py::test_mqtt5_retain_as_published_keeps_the_publishers_retain_flag",
     "tests/test_iot_data.py::test_mqtt5_retain_handling_2_suppresses_the_retained_replay",
     "tests/test_iot_data.py::test_mqtt5_retain_handling_1_replays_only_for_a_new_subscription",

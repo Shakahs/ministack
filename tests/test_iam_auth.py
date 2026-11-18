@@ -1810,7 +1810,7 @@ def _capture_enforced_arn(monkeypatch) -> dict:
     seen: dict[str, str] = {}
 
     def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*",
-                 service_context=None, auth_error_response=None):
+                 service_context=None, auth_error_response=None, denied_response=None):
         seen["action"] = iam_action
         seen["arn"] = resource_arn
         seen["context"] = service_context
@@ -1827,6 +1827,14 @@ class _NoApiModule:
     @staticmethod
     def find_api_scope(api_id):
         return None
+
+    find_api_owner = find_api_scope
+
+    @staticmethod
+    def method_authorization_type(api_id, stage, method, path):
+        return None
+
+    route_authorization_type = method_authorization_type
 
     @staticmethod
     async def handle_connections_api(method, api_id, stage, connection_id, body, headers):
@@ -2215,6 +2223,24 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
 
+    @pytest.mark.parametrize("method,path,body,resource", [
+        ("GET", "/v2/email/account", b"", "*"),
+        ("POST", "/v2/email/list-identities", b"{}", "*"),
+        ("POST", "/v2/email/configuration-sets", b'{"ConfigurationSetName": "cs"}', "configuration-set/cs"),
+        ("DELETE", "/v2/email/configuration-sets/cs", b"", "configuration-set/cs"),
+        ("PUT", "/v2/email/configuration-sets/cs/event-destinations/d", b"{}", "configuration-set/cs"),
+        ("POST", "/v2/email/templates", b'{"TemplateName": "t"}', "template/t"),
+        ("GET", "/v2/email/templates/t", b"", "template/t"),
+        ("POST", "/v2/email/contact-lists", b'{"ContactListName": "c"}', "contact-list/c"),
+        ("GET", "/v2/email/identities/a.example.com", b"", "identity/a.example.com"),
+        ("GET", "/v2/email/custom-verification-email-templates/v", b"", "custom-verification-email-template/v"),
+        ("GET", "/v2/email/dedicated-ip-pools/p", b"", "dedicated-ip-pool/p"),
+        ("POST", "/v2/email/outbound-emails", b"{}", "*"),
+    ])
+    def test_ses_v2_resource(self, method, path, body, resource):
+        arn = extract_resource_arn("ses", method, path, {}, body, {}, "us-east-1", "123")
+        assert arn == (resource if resource == "*" else f"arn:aws:ses:us-east-1:123:{resource}")
+
     def test_signer_profile_and_job(self):
         from ministack.core.iam_actions import extract_resource_arn
         job_body = b'{"profileName": "fleet", "source": {"s3": {}}}'
@@ -2244,6 +2270,17 @@ class TestResourceArn:
     def test_cloudfront_distribution(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/distribution/E123ABC", {}, b"", {}, "us-east-1", "123") == "arn:aws:cloudfront::123:distribution/E123ABC"
+
+    def test_cloudfront_vpc_origin(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        for method, action in (("GET", "GetVpcOrigin"), ("PUT", "UpdateVpcOrigin"), ("DELETE", "DeleteVpcOrigin")):
+            assert extract_resource_arn("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {},
+                                        "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/vo_abc"
+            assert extract_iam_action("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {}) == f"cloudfront:{action}"
+        # R2 U17/p1-create-on-A: CreateVpcOrigin authorizes on vpcorigin/*.
+        assert extract_resource_arn("cloudfront", "POST", "/2020-05-31/vpc-origin", {}, b"", {},
+                                    "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/*"
+        assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/vpc-origin", {}, b"", {}, "us-east-1", "123") == "*"
 
     def test_route53_hostedzone(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2385,6 +2422,46 @@ class TestResourceArn:
     def test_iot_collection_call_has_no_resource(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/jobs", {}, b"", {}, "us-east-1", "123") == "*"
+
+    def test_iot_tagging_calls_authorize_on_the_named_resource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        group = "arn:aws:iot:us-east-1:123:thinggroup/fleet"
+        tag = json.dumps({"resourceArn": group, "tags": [{"Key": "k", "Value": "v"}]}).encode()
+        untag = json.dumps({"resourceArn": group, "tagKeys": ["k"]}).encode()
+        assert extract_resource_arn("iot", "POST", "/tags", {}, tag, {}, "us-east-1", "123") == group
+        assert extract_resource_arn("iot", "POST", "/untag", {}, untag, {}, "us-east-1", "123") == group
+        assert extract_resource_arn(
+            "iot", "GET", "/tags", {}, b"", {"resourceArn": [group]}, "us-east-1", "123"
+        ) == group
+        assert extract_resource_arn("iot", "GET", "/tags", {}, b"", {}, "us-east-1", "123") == "*"
+        # Only where the handler reads it: a second resourceArn elsewhere is not the target.
+        other = {"resourceArn": ["arn:aws:iot:us-east-1:123:thinggroup/other"]}
+        assert extract_resource_arn("iot", "POST", "/tags", {}, tag, other, "us-east-1", "123") == group
+        assert extract_resource_arn(
+            "iot", "GET", "/tags", {}, tag, other, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:thinggroup/other"
+        bad = json.dumps({"resourceArn": [group]}).encode()
+        assert extract_resource_arn("iot", "POST", "/untag", {}, bad, {}, "us-east-1", "123") == "*"
+
+    def test_iot_thing_group_membership_names_the_group_then_the_thing(self):
+        from ministack.core.iam_actions import extract_resource_arn, iot_resource_arns
+        head = "arn:aws:iot:us-east-1:123"
+        group, thing = f"{head}:thinggroup/fleet", f"{head}:thing/dev-1"
+        for path in ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup"):
+            for body in ({"thingGroupName": "fleet", "thingName": "dev-1"},
+                         {"thingGroupArn": group, "thingArn": thing},
+                         {"thingGroupArn": group.replace("us-east-1", "eu-west-3"), "thingArn": thing},
+                         {"thingGroupName": "fleet", "thingGroupArn": f"{head}:thinggroup/x", "thingName": "dev-1"}):
+                raw = json.dumps(body).encode()
+                assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == [group, thing]
+                assert extract_resource_arn("iot", "PUT", path, {}, raw, {}, "us-east-1", "123") == group
+            for raw in (b"{}", b"[]", b"not json", json.dumps({"thingGroupName": 1, "thingName": ["x"]}).encode()):
+                assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == ["*", "*"]
+        # DescribeThingGroup of a group with that name keeps its own resource.
+        assert iot_resource_arns("GET", "/thing-groups/addThingToThingGroup", b"", "us-east-1", "123") == []
+        assert extract_resource_arn(
+            "iot", "GET", "/thing-groups/addThingToThingGroup", {}, b"", {}, "us-east-1", "123"
+        ) == f"{head}:thinggroup/addThingToThingGroup"
 
     def test_iot_job_policy_from_the_cdk_actually_allows_the_call(self):
         """The two halves together, which is where this showed up. The CDK's
@@ -2753,14 +2830,24 @@ class TestResourceArn:
             async def send(message):
                 sent.append(message)
 
-            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(), "headers": [],
+            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(),
+                     "headers": [(b"host", b"d9506af4.execute-api.localhost")],
                      "extensions": {"websocket.http.response": {}}}
             asyncio.run(apigw_svc.handle_websocket(scope, receive, send, "d9506af4"))
             return sent[0].get("status"), json.loads(sent[1]["body"])["message"] if len(sent) > 1 else None
 
+        def presigned_query():
+            from botocore.auth import SigV4QueryAuth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+
+            request = AWSRequest(method="GET", url="https://d9506af4.execute-api.localhost/prod")
+            SigV4QueryAuth(Credentials(fake_key, "s"), "execute-api", "eu-central-1", 300).add_auth(request)
+            return request.url.split("?", 1)[1]
+
         try:
             unsigned = handshake("")
-            signed = handshake(f"X-Amz-Credential={fake_key}%2F20260101%2Feu-central-1%2Fexecute-api%2Faws4_request")
+            signed = handshake(presigned_query())
         finally:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("ws-user", None)
@@ -2957,6 +3044,25 @@ class TestActionExtraction:
         assert extract_iam_action("lambda", "POST", path, {}, b"", {}) == "lambda:TagResource"
         assert extract_iam_action("lambda", "DELETE", path, {}, b"", {"tagKeys": ["a"]}) == "lambda:UntagResource"
         assert extract_iam_action("lambda", "GET", path, {}, b"", {}) == "lambda:ListTags"
+
+    def test_ses_v2_rest(self):
+        assert extract_iam_action("ses", "GET", "/v2/email/account", {}, b"", {}) == "ses:GetAccount"
+        assert extract_iam_action("ses", "POST", "/v2/email/list-identities", {}, b"{}", {}) == (
+            "ses:ListEmailIdentities")
+        assert extract_iam_action("ses", "DELETE", "/v2/email/configuration-sets/cs", {}, b"", {}) == (
+            "ses:DeleteConfigurationSet")
+        assert extract_iam_action("ses", "GET", "/v2/email/templates/t", {}, b"", {}) == "ses:GetEmailTemplate"
+        assert extract_iam_action("ses", "POST", "/", {}, b"", {"Action": ["ListIdentities"]}) == "ses:ListIdentities"
+        # older SDK models list with GET on the collection
+        assert extract_iam_action("ses", "GET", "/v2/email/identities", {}, b"", {}) == "ses:ListEmailIdentities"
+        assert extract_iam_action("ses", "GET", "/v2/email/configuration-sets", {}, b"", {}) == (
+            "ses:ListConfigurationSets")
+
+    def test_rds_data_rest(self):
+        for path, action in (("/Execute", "ExecuteStatement"), ("/BatchExecute", "BatchExecuteStatement"),
+                             ("/BeginTransaction", "BeginTransaction"), ("/CommitTransaction", "CommitTransaction"),
+                             ("/RollbackTransaction", "RollbackTransaction")):
+            assert extract_iam_action("rds-data", "POST", path, {}, b"{}", {}) == f"rds-data:{action}"
 
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
@@ -4868,11 +4974,12 @@ class TestCredentialErrors:
 def user_key(monkeypatch):
     """An IAM user allowed everything, created through the app under AUTH=true."""
     from ministack import app as app_mod
+    from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
     iam = _local_client("iam")
     name = f"signer-{time.time_ns()}"
-    iam.create_user(UserName=name)
+    user = iam.create_user(UserName=name)["User"]
     iam.put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps(
         {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
     key = iam.create_access_key(UserName=name)["AccessKey"]
@@ -4880,6 +4987,8 @@ def user_key(monkeypatch):
     iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
     iam.delete_user_policy(UserName=name, PolicyName="all")
     iam.delete_user(UserName=name)
+    # DeleteUserPolicy leaves an empty map after its last policy is deleted.
+    iam_svc._user_inline_policies.pop_scoped(user["Arn"].split(":")[4], None, name, None)
 
 
 def _chunked_put(key, secret, url, data, *, bad_chunk=False):
@@ -4917,6 +5026,254 @@ def _chunked_put(key, secret, url, data, *, bad_chunk=False):
         signature = "0" * 64 if bad_chunk and chunk else previous
         body += f"{len(chunk):x};chunk-signature={signature}\r\n".encode() + chunk + b"\r\n"
     return _asgi_send(AWSRequest(method="PUT", url=url, headers=headers, data=body).prepare())
+
+
+class TestS3UploadErrorParity:
+    """HTTP observations from AWS.Tools.S3 5.0.318, Osaka, 2026-10-16.
+
+    Fixed messages, statuses and XML child order were captured on real AWS
+    using path addressing and MaxErrorRetry=0, with Tokyo as the wrong region.
+    These tests replay the observations locally; they do not contact AWS.
+    Live identifiers are omitted; signing diagnostics use synthetic credentials.
+    """
+
+    @pytest.fixture
+    def upload_bucket(self, user_key):
+        bucket = f"upload-errors-{time.time_ns()}"
+        root = _local_client("s3")
+        root.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "ap-northeast-3"})
+        yield bucket
+        root.delete_bucket(Bucket=bucket)
+
+    @staticmethod
+    def upload(bucket, credentials, *, endpoint_region="ap-northeast-3", region="ap-northeast-3",
+               virtual=False, host=None):
+        from urllib.parse import quote
+
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        host = host or f"s3.{endpoint_region}.localhost:4566"
+        path = "/probe.txt" if virtual else f"/{quote(bucket)}/probe.txt"
+        host = f"{bucket}.{host}" if virtual else host
+        request = AWSRequest(method="PUT", url=f"http://{host}{path}", data=b"probe")
+        S3SigV4Auth(Credentials(*credentials), "s3", region).add_auth(request)
+        return _asgi_send(request.prepare())
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    @pytest.mark.parametrize("case,status,code,message,children", [
+        (
+            "invalid-bucket-name", 400, "InvalidBucketName", "The specified bucket is not valid.",
+            ["Code", "Message", "BucketName", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-regional-endpoint", 301, "PermanentRedirect",
+            "The bucket you are attempting to access must be addressed using the specified endpoint. "
+            "Please send all future requests to this endpoint.",
+            ["Code", "Message", "Endpoint", "Bucket", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-signing-region", 400, "AuthorizationHeaderMalformed",
+            "The authorization header is malformed; the region 'ap-northeast-1' is wrong; expecting 'ap-northeast-3'",
+            ["Code", "Message", "Region", "RequestId", "HostId"],
+        ),
+        (
+            "unknown-access-key", 403, "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            ["Code", "Message", "AWSAccessKeyId", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-secret", 403, "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature you provided. "
+            "Check your key and signing method.",
+            ["Code", "Message", "AWSAccessKeyId", "StringToSign", "SignatureProvided", "StringToSignBytes",
+             "CanonicalRequest", "CanonicalRequestBytes", "RequestId", "HostId"],
+        ),
+        (
+            "missing-bucket", 404, "NoSuchBucket", "The specified bucket does not exist",
+            ["Code", "Message", "BucketName", "RequestId", "HostId"],
+        ),
+    ])
+    def test_observed_error_envelopes(self, user_key, upload_bucket, case, status, code, message, children, virtual):
+        import base64
+        import re
+        from xml.etree.ElementTree import fromstring
+
+        if case == "invalid-bucket-name" and virtual:
+            pytest.skip("Invalid bucket syntax was observed using path addressing")
+        bucket, credentials, options = upload_bucket, user_key, {"virtual": virtual}
+        if case == "invalid-bucket-name":
+            bucket, credentials = "invalid bucket", ("AKIAUNKNOWNKEY000001", "wrong")
+        elif case == "wrong-regional-endpoint":
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            options.update(endpoint_region="ap-northeast-1", region="ap-northeast-1")
+        elif case == "wrong-signing-region":
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            options["region"] = "ap-northeast-1"
+        elif case == "unknown-access-key":
+            bucket, credentials = "missing-upload-bucket", ("AKIAUNKNOWNKEY000001", "wrong")
+        elif case == "wrong-secret":
+            bucket, credentials = "missing-upload-bucket", (user_key[0], "wrong")
+        elif case == "missing-bucket":
+            bucket = "missing-upload-bucket"
+        response = self.upload(bucket, credentials, **options)
+        error = fromstring(response.content)
+        assert response.status_code == status
+        assert error.findtext("Code") == code
+        assert error.findtext("Message") == message
+        assert [child.tag for child in error] == children
+        assert response.headers["content-type"] == "application/xml"
+        assert error.findtext("RequestId") == response.headers["x-amz-request-id"]
+        assert re.fullmatch(r"[A-Z0-9]{16}", error.findtext("RequestId"))
+        assert error.findtext("HostId") == response.headers["x-amz-id-2"]
+        assert len(base64.b64decode(error.findtext("HostId"), validate=True)) >= 48
+        assert "location" not in response.headers
+        if case == "wrong-regional-endpoint":
+            assert response.headers["x-amz-bucket-region"] == "ap-northeast-3"
+            assert error.findtext("Endpoint") == f"{bucket}.s3.ap-northeast-3.localhost:4566"
+            assert error.findtext("Bucket") == bucket
+        else:
+            assert "x-amz-bucket-region" not in response.headers
+        if case in {"invalid-bucket-name", "missing-bucket"}:
+            assert error.findtext("BucketName") == bucket
+        if case == "wrong-signing-region":
+            assert error.findtext("Region") == "ap-northeast-3"
+        if case in {"unknown-access-key", "wrong-secret"}:
+            assert error.findtext("AWSAccessKeyId") == credentials[0]
+        if case == "wrong-secret":
+            import hashlib
+
+            from botocore.auth import S3SigV4Auth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+
+            for name in ("CanonicalRequest", "StringToSign"):
+                assert bytes.fromhex(error.findtext(name + "Bytes")).decode() == error.findtext(name)
+            signed_path = "/probe.txt" if virtual else f"/{bucket}/probe.txt"
+            assert error.findtext("CanonicalRequest").startswith(f"PUT\n{signed_path}\n")
+            document = error.findtext("StringToSign")
+            assert document.splitlines()[-1] == hashlib.sha256(error.findtext("CanonicalRequest").encode()).hexdigest()
+            request = AWSRequest()
+            request.context["timestamp"] = document.splitlines()[1]
+            signer = S3SigV4Auth(Credentials(*credentials), "s3", "ap-northeast-3")
+            assert signer.signature(document, request) == error.findtext("SignatureProvided")
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    @pytest.mark.parametrize("missing", [False, True])
+    @pytest.mark.parametrize("credential_kind", ["unknown", "wrong-secret", "valid"])
+    @pytest.mark.parametrize("endpoint_region,region", [
+        ("ap-northeast-3", "ap-northeast-3"),
+        ("ap-northeast-1", "ap-northeast-1"),
+        ("ap-northeast-3", "ap-northeast-1"),
+        ("ap-northeast-1", "ap-northeast-3"),
+    ])
+    def test_combined_failures(self, user_key, upload_bucket, virtual, missing, credential_kind,
+                               endpoint_region, region):
+        from xml.etree.ElementTree import fromstring
+
+        bucket = "missing-upload-bucket" if missing else upload_bucket
+        credentials = {"unknown": ("AKIAUNKNOWNKEY000001", "wrong"),
+                       "wrong-secret": (user_key[0], "wrong"), "valid": user_key}[credential_kind]
+        if not missing and endpoint_region != "ap-northeast-3":
+            expected = (301, "PermanentRedirect")
+        elif region != endpoint_region:
+            expected = (400, "AuthorizationHeaderMalformed")
+        elif credential_kind == "unknown":
+            expected = (403, "InvalidAccessKeyId")
+        elif credential_kind == "wrong-secret":
+            expected = (403, "SignatureDoesNotMatch")
+        elif missing:
+            expected = (404, "NoSuchBucket")
+        else:
+            expected = (200, None)
+        response = self.upload(bucket, credentials, virtual=virtual, endpoint_region=endpoint_region, region=region)
+        try:
+            code = fromstring(response.content).findtext("Code") if response.status_code != 200 else None
+            assert (response.status_code, code) == expected
+        finally:
+            if response.status_code == 200:
+                _local_client("s3").delete_object(Bucket=bucket, Key="probe.txt")
+
+    def test_invalid_name_precedes_scope_and_credentials(self, user_key):
+        from xml.etree.ElementTree import fromstring
+
+        response = self.upload("invalid bucket", ("AKIAUNKNOWNKEY000001", "wrong"), region="ap-northeast-1")
+        assert response.status_code == 400
+        assert fromstring(response.content).findtext("Code") == "InvalidBucketName"
+
+    @pytest.mark.parametrize("mode", [
+        "auth-disabled", "auth-disabled-wrong-region", "reserved-root", "bare-endpoint-wrong-region",
+    ])
+    def test_auth_modes_and_bare_endpoint(self, monkeypatch, user_key, upload_bucket, mode):
+        from ministack import app as app_mod
+
+        credentials, options = user_key, {}
+        if mode in {"auth-disabled", "auth-disabled-wrong-region"}:
+            monkeypatch.setattr(app_mod, "AUTH", False)
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            if mode == "auth-disabled-wrong-region":
+                options.update(endpoint_region="ap-northeast-1", region="ap-northeast-1")
+        elif mode == "reserved-root":
+            credentials = ("test", "any-secret")
+        else:
+            options.update(host="localhost:4566", region="ap-northeast-1")
+        response = self.upload(upload_bucket, credentials, **options)
+        try:
+            if mode in {"auth-disabled-wrong-region", "bare-endpoint-wrong-region"}:
+                from xml.etree.ElementTree import fromstring
+
+                assert response.status_code == 301
+                assert fromstring(response.content).findtext("Code") == "PermanentRedirect"
+                assert response.headers["x-amz-bucket-region"] == "ap-northeast-3"
+            else:
+                assert response.status_code == 200
+        finally:
+            _local_client("s3").delete_object(Bucket=upload_bucket, Key="probe.txt")
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    def test_policy_denial_still_applies(self, user_key, upload_bucket, virtual):
+        from ministack.services import iam as iam_svc
+
+        name = iam_svc._access_keys[user_key[0]]["UserName"]
+        iam = _local_client("iam")
+        iam.put_user_policy(UserName=name, PolicyName="deny-upload", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*"}],
+        }))
+        try:
+            assert self.upload(upload_bucket, user_key, virtual=virtual).status_code == 403
+        finally:
+            iam.delete_user_policy(UserName=name, PolicyName="deny-upload")
+
+    def test_missing_bucket_after_authentication_before_policy(self, user_key, upload_bucket):
+        from xml.etree.ElementTree import fromstring
+
+        from ministack.services import iam as iam_svc
+
+        name = iam_svc._access_keys[user_key[0]]["UserName"]
+        _local_client("iam").put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:PutObject",
+                "Resource": f"arn:aws:s3:::{upload_bucket}/*"}],
+        }))
+        response = self.upload("missing-upload-bucket", user_key)
+        assert response.status_code == 404
+        assert fromstring(response.content).findtext("Code") == "NoSuchBucket"
+
+    def test_foreign_bucket_routing_does_not_grant_access(self, user_key):
+        from xml.etree.ElementTree import fromstring
+
+        owner = _local_client("s3", "333333333333", "root-secret")
+        bucket = f"foreign-upload-{time.time_ns()}"
+        owner.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "ap-northeast-3"})
+        try:
+            response = self.upload(bucket, ("AKIAUNKNOWNKEY000001", "wrong"), endpoint_region="ap-northeast-1")
+            assert response.status_code == 301
+            assert fromstring(response.content).findtext("Code") == "PermanentRedirect"
+            response = self.upload(bucket, user_key)
+            assert response.status_code == 403
+            assert fromstring(response.content).findtext("Code") == "AccessDenied"
+        finally:
+            owner.delete_bucket(Bucket=bucket)
 
 
 class TestHeaderSignatures:
@@ -5152,6 +5509,13 @@ class TestQuerySignatures:
         assert (code, status) == ("IncompleteSignature", 400)
         assert "Credential must have exactly 5 slash-delimited elements" in body
 
+    @pytest.mark.parametrize("query,service", [(_LIST_USERS, "iam"), (_LIST_QUEUES, "sqs")])
+    def test_s3_scoped_signature_is_refused_by_another_service(self, user_key, query, service):
+        """Only S3 takes a query signed for s3; a correct one is refused anywhere else (#2338)."""
+        code, status, body = _presigned(*user_key, "s3", query)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert f"Credential should be scoped to correct service: '{service}'. " in body
+
     def test_root_key_signs_with_any_secret(self, user_key):
         assert _presigned("test", "anything", "iam", _LIST_USERS)[:2] == (None, 200)
 
@@ -5160,6 +5524,77 @@ class TestQuerySignatures:
 
         monkeypatch.setattr(app_mod, "AUTH", False)
         assert _presigned(user_key[0], "wrong-secret", "iam", _LIST_USERS)[:2] == (None, 200)
+
+
+# SES v2 is authorized in its own handler; RDS Data, S3 Control and X-Ray (no
+# MiniStack service) map to no IAM action. All of them check credentials.
+_NO_ACTION_CALLS = {
+    "sesv2": lambda c: c.get_account(),
+    "xray": lambda c: c.get_sampling_rules(),
+    "rds-data": lambda c: c.execute_statement(
+        resourceArn="arn:aws:rds:us-east-1:000000000000:cluster:none",
+        secretArn="arn:aws:secretsmanager:us-east-1:000000000000:secret:none", sql="select 1"),
+    "s3control": lambda c: c.list_tags_for_resource(AccountId="000000000000", ResourceArn="arn:aws:s3:::none"),
+}
+
+
+def _contract_client(service, key, secret, token=None):
+    """A client of the running server with the given credentials and no retries."""
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, REGION
+
+    return boto3.client(service, endpoint_url=ENDPOINT, region_name=REGION, aws_access_key_id=key,
+                        aws_secret_access_key=secret, aws_session_token=token,
+                        config=Config(retries={"total_max_attempts": 1}, inject_host_prefix=False))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service,wrong_secret,unknown_key,expired,content_type", [
+    ("sesv2", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/x-amz-json-1.1"),
+    ("xray", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/json"),
+    ("rds-data", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/json"),
+    ("s3control", "SignatureDoesNotMatch", "InvalidAccessKeyId", "RequestTimeTooSkewed", "application/xml"),
+], ids=["sesv2", "xray", "rds-data", "s3control"])
+def test_credentials_without_an_iam_action_contract(auth_enabled, iam_user, service, wrong_secret, unknown_key,
+                                                    expired, content_type):
+    """A wrong secret, an unknown key, a session key without its token and a stale signature are refused."""
+    from botocore.config import Config
+    from conftest import make_client
+
+    user = iam_user(policy={"Version": "2012-10-17",
+                            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    key_id = make_client("iam").list_access_keys(UserName=user.name)["AccessKeyMetadata"][0]["AccessKeyId"]
+    session = user.client("sts").get_session_token()["Credentials"]
+    call = _NO_ACTION_CALLS[service]
+
+    def answer(client):
+        try:
+            call(client)
+        except ClientError as e:
+            return e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"], (
+                e.response["ResponseMetadata"]["HTTPHeaders"].get("content-type"))
+        return None, 200, None
+
+    with _signing_clock(-960):
+        stale = answer(user.client(service, config=Config(inject_host_prefix=False)))
+    answers = [
+        answer(_contract_client(service, key_id, "wrong-secret")),
+        answer(_contract_client(service, "AKIAUNKNOWNKEY000001", "secret")),
+        answer(_contract_client(service, session["AccessKeyId"], session["SecretAccessKey"])),
+        stale,
+    ]
+    control = answer(user.client(service, config=Config(inject_host_prefix=False)))
+    assert control[1] != 403
+    if auth_enabled:
+        assert [a[:2] for a in answers] == [(wrong_secret, 403), (unknown_key, 403), (unknown_key, 403),
+                                            (expired, 403)]
+        assert answers[0][2] == content_type
+    else:
+        assert answers == [control] * 4
 
 
 class TestSessionTokens:
@@ -5691,6 +6126,16 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
      "s3:GetMultiRegionAccessPointRoutes"),
     ("PATCH", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
      "s3:SubmitMultiRegionAccessPointRoutes"),
+    ("GET", "/v20180820/mrap/instances/policy", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/routes", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policystatus", "s3:GetMultiRegionAccessPointPolicyStatus"),
+    ("GET", "/v20180820/mrap/instances/", None),
+    ("GET", "/v20180820/mrap/instances/m1/", None),
+    ("GET", "/v20180820/mrap/instances/m1/policy/", None),
+    ("GET", "/v20180820/mrap/instances/m1/x", None),
+    ("POST", "/v20180820/mrap/instances/m1/policy", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes/", None),
 ])
 def test_s3control_mrap_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
@@ -5780,6 +6225,16 @@ def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
     ("PUT", "/v20180820/accesspoint/ap1/policy", "s3:PutAccessPointPolicy"),
     ("GET", "/v20180820/accesspoint/ap1/policy", "s3:GetAccessPointPolicy"),
     ("DELETE", "/v20180820/accesspoint/ap1/policy", "s3:DeleteAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/policy", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/policy", "s3:DeleteAccessPoint"),
+    ("POST", "/v20180820/accesspoint/ap1/policy", None),
+    ("POST", "/v20180820/accesspoint", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/x", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy/x", None),
+    ("PUT", "/v20180820/accesspoint//ap1/policy", None),
+    ("GET", "/v20180820/accesspoint/ap1/", None),
+    ("GET", "/v20180820/accesspoint/ap1/policyStatus", "s3:GetAccessPointPolicyStatus"),
+    ("PUT", "/v20180820/accesspoint/ap1/scope", "s3express:PutAccessPointScope"),
 ])
 def test_s3control_access_point_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
@@ -5814,6 +6269,13 @@ def test_s3control_access_point_denied_without_the_action(monkeypatch):
     ("PUT", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:PutAccessPointPolicyForObjectLambda"),
     ("GET", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:GetAccessPointPolicyForObjectLambda"),
     ("DELETE", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:DeleteAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/policy", "s3:GetAccessPointForObjectLambda"),
+    ("POST", "/v20180820/accesspointforobjectlambda/ol/policy", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/configuration", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/x", None),
+    ("PUT", "/v20180820/accesspointforobjectlambda//ol/policy", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policyStatus", "s3:GetAccessPointPolicyStatusForObjectLambda"),
 ])
 def test_s3control_object_lambda_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
@@ -5846,3 +6308,393 @@ def test_write_get_object_response_needs_its_iam_action(monkeypatch):
         "POST", "/WriteGetObjectResponse", headers, b"", {}, "rid"))[0]
     assert seen["action"] == "s3-object-lambda:WriteGetObjectResponse"
     assert status == 400
+
+
+@pytest.mark.auth_contract
+def test_unverifiable_credentials_are_refused_contract(auth_enabled, iam_user):
+    """A credential this server cannot verify never acts as its key's user: another algorithm, SigV2, no Credential."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    from conftest import ENDPOINT, second_access_key
+
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*"}]})
+
+    def create_queue(authorization, query=""):
+        body = f"Action=CreateQueue&QueueName=unverifiable-{uuid.uuid4().hex[:8]}&Version=2012-11-05".encode()
+        request = urllib.request.Request(f"{ENDPOINT}/{query}", data=body, method="POST", headers={
+            "Content-Type": "application/x-www-form-urlencoded", "Authorization": authorization})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    with second_access_key(user) as (key, _secret):
+        scope = f"{key}/20261019/us-east-1/sqs/aws4_request"
+        for authorization, query in (
+            (f"AWS4-HMAC-SHA512 Credential={scope}, SignedHeaders=host, Signature=00", ""),
+            (f"AWS {key}:bogus", ""),
+            ("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00", ""),
+            ("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00", f"?X-Amz-Credential={scope.replace('/', '%2F')}"),
+        ):
+            status = create_queue(authorization, query)
+            assert status >= 400 if auth_enabled else status == 200, (authorization, query)
+
+
+# A call per protocol family, and the code and status AWS answers it without credentials.
+_ANONYMOUS_CALLS = {
+    "sts": (lambda c: c.get_caller_identity(), "MissingAuthenticationToken", 403),
+    "sns": (lambda c: c.list_topics(), "MissingAuthenticationToken", 403),
+    "sqs": (lambda c: c.list_queues(), "AccessDenied", 403),
+    "dynamodb": (lambda c: c.list_tables(), "MissingAuthenticationTokenException", 400),
+    "kms": (lambda c: c.list_keys(), "MissingAuthenticationTokenException", 400),
+    "lambda": (lambda c: c.list_functions(), "MissingAuthenticationTokenException", 403),
+    "secretsmanager": (lambda c: c.list_secrets(), "UnrecognizedClientException", 400),
+}
+
+
+def _anonymous_client(service):
+    from botocore import UNSIGNED
+    from conftest import make_client
+
+    return make_client(service, {"signature_version": UNSIGNED})
+
+
+def _refusal(call):
+    """The error code and status a call answers, or None when it succeeds."""
+    try:
+        call()
+    except ClientError as e:
+        return e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"]
+    return None
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service", sorted(_ANONYMOUS_CALLS))
+def test_request_without_credentials_is_anonymous_contract(auth_enabled, iam_user, service):
+    """A request without credentials is refused in the service's own error; signed, the same call is served."""
+    call, code, status = _ANONYMOUS_CALLS[service]
+    signed = iam_user(policy={"Version": "2012-10-17",
+                              "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}).client(service)
+    assert _refusal(lambda: call(signed)) is None
+    assert _refusal(lambda: call(_anonymous_client(service))) == ((code, status) if auth_enabled else None)
+
+
+@pytest.mark.auth_contract
+def test_resource_policy_for_everyone_does_not_admit_anonymous_contract(auth_enabled):
+    """A queue or topic policy that allows "*" still needs a signed request."""
+    import uuid
+
+    from conftest import make_client
+
+    name = f"anonymous-{uuid.uuid4().hex[:8]}"
+    sqs, sns = make_client("sqs"), make_client("sns")
+    queue = sqs.create_queue(QueueName=name)["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    topic = sns.create_topic(Name=name)["TopicArn"]
+    try:
+        sqs.set_queue_attributes(QueueUrl=queue, Attributes={"Policy": json.dumps({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": "*", "Action": "sqs:SendMessage", "Resource": queue_arn}]})})
+        sns.set_topic_attributes(TopicArn=topic, AttributeName="Policy", AttributeValue=json.dumps({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": "*", "Action": "SNS:Publish", "Resource": topic}]}))
+        sent = _refusal(lambda: _anonymous_client("sqs").send_message(QueueUrl=queue, MessageBody="m"))
+        published = _refusal(lambda: _anonymous_client("sns").publish(TopicArn=topic, Message="m"))
+        if auth_enabled:
+            assert (sent, published) == (("AccessDenied", 403), ("MissingAuthenticationToken", 403))
+            assert "Messages" not in sqs.receive_message(QueueUrl=queue)
+        else:
+            assert (sent, published) == (None, None)
+    finally:
+        sqs.delete_queue(QueueUrl=queue)
+        sns.delete_topic(TopicArn=topic)
+
+
+@pytest.mark.auth_contract
+def test_query_credentials_without_an_algorithm_are_anonymous_contract(auth_enabled, iam_user):
+    """X-Amz-Credential and X-Amz-Signature without X-Amz-Algorithm count as no credentials, not as that key's user."""
+    import urllib.error
+    import urllib.request
+    from urllib.parse import parse_qsl, urlsplit
+
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import ENDPOINT, REGION, second_access_key
+
+    user = iam_user(policy={"Version": "2012-10-17",
+                            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    with second_access_key(user) as (key, secret):
+        request = AWSRequest(method="GET", url=f"{ENDPOINT}/?Action=GetCallerIdentity&Version=2011-06-15")
+        SigV4QueryAuth(Credentials(key, secret), "sts", REGION, expires=300).add_auth(request)
+        query = [(k, v) for k, v in parse_qsl(urlsplit(request.url).query) if k != "X-Amz-Algorithm"]
+        try:
+            with urllib.request.urlopen(f"{ENDPOINT}/?{urlencode(query)}", timeout=10) as resp:
+                answer = resp.status, resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            answer = exc.code, exc.read().decode()
+    if auth_enabled:
+        assert answer[0] == 403 and "<Code>MissingAuthenticationToken</Code>" in answer[1]
+    else:
+        assert answer[0] == 200
+
+
+@pytest.mark.auth_contract
+def test_operations_aws_serves_without_credentials_contract(auth_enabled):
+    """Operations the SDKs send unsigned, the SNS subscription links and the health endpoint are still served."""
+    import urllib.request
+    import uuid
+
+    from conftest import ENDPOINT, make_client
+
+    with urllib.request.urlopen(f"{ENDPOINT}/_ministack/health", timeout=10) as resp:
+        assert resp.status == 200
+    idp, identity = _anonymous_client("cognito-idp"), _anonymous_client("cognito-identity")
+    assert _refusal(lambda: idp.initiate_auth(
+        ClientId="noclient", AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": "u", "PASSWORD": "p"},
+    )) == ("ResourceNotFoundException", 400)
+    pool = make_client("cognito-identity").create_identity_pool(
+        IdentityPoolName=f"anonymous{uuid.uuid4().hex[:8]}", AllowUnauthenticatedIdentities=True)["IdentityPoolId"]
+    try:
+        assert identity.get_id(IdentityPoolId=pool)["IdentityId"]
+    finally:
+        make_client("cognito-identity").delete_identity_pool(IdentityPoolId=pool)
+    assumed = _refusal(lambda: _anonymous_client("sts").assume_role_with_web_identity(
+        RoleArn="arn:aws:iam::000000000000:role/none", RoleSessionName="session", WebIdentityToken="not-a-token"))
+    assert assumed is None or assumed[0] != "MissingAuthenticationToken"
+    sns = make_client("sns")
+    topic = sns.create_topic(Name=f"anonymous-{uuid.uuid4().hex[:8]}")["TopicArn"]
+    try:
+        assert _refusal(lambda: _anonymous_client("sns").confirm_subscription(TopicArn=topic, Token="0" * 64))[0] in (
+            "InvalidParameter", "InvalidParameterException")
+    finally:
+        sns.delete_topic(TopicArn=topic)
+    assert _refusal(lambda: idp.list_user_pools(MaxResults=1)) == (
+        ("MissingAuthenticationTokenException", 400) if auth_enabled else None)
+
+
+@pytest.mark.auth_contract
+def test_s3_sigv2_signatures_are_verified_contract(auth_enabled, iam_user):
+    """SigV2 header and query signatures are checked for an IAM user, and still work when they are right."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    bucket = f"sigv2-{uuid.uuid4().hex[:8]}"
+    admin = make_client("s3")
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key="k", Body=b"v")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]})
+    try:
+        with second_access_key(user) as (key, secret):
+            v2 = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=key,
+                              aws_secret_access_key=secret, config=Config(signature_version="s3"))
+            assert v2.get_object(Bucket=bucket, Key="k")["Body"].read() == b"v"
+            url = v2.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "k"})
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                assert resp.status == 200
+            try:
+                with urllib.request.urlopen(url.replace("Signature=", "Signature=AA"), timeout=10) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            assert status == (403 if auth_enabled else 200)
+    finally:
+        admin.delete_object(Bucket=bucket, Key="k")
+        admin.delete_bucket(Bucket=bucket)
+
+
+def _sigv4a_request(credentials, method, url, service, region_set, *, host=None, body=b"", headers=None,
+                    presign=False, signed_at=None):
+    """Send a SigV4a-signed request: botocore builds the canonical request, the key is the one SigV4a derives."""
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import quote
+
+    import requests
+    from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from ministack.core.sigv4 import SIGV4A, sigv4a_signing_key
+
+    base = (S3SigV4QueryAuth if presign else S3SigV4Auth) if service == "s3" else SigV4Auth
+
+    class SigV4aAuth(base):
+        def _modify_request_before_signing(self, request):
+            if not presign:
+                request.headers["X-Amz-Region-Set"] = region_set
+            super()._modify_request_before_signing(request)
+            if presign:
+                request.url = (request.url.replace("X-Amz-Algorithm=AWS4-HMAC-SHA256", f"X-Amz-Algorithm={SIGV4A}")
+                               + f"&X-Amz-Region-Set={quote(region_set, safe='')}")
+
+        def scope(self, request):
+            return f"{self.credentials.access_key}/{self.credential_scope(request)}"
+
+        def credential_scope(self, request):
+            return f"{request.context['timestamp'][:8]}/{self._service_name}/aws4_request"
+
+        def string_to_sign(self, request, canonical_request):
+            return SIGV4A + super().string_to_sign(request, canonical_request).removeprefix("AWS4-HMAC-SHA256")
+
+        def signature(self, string_to_sign, request):
+            key = sigv4a_signing_key(self.credentials.access_key, self.credentials.secret_key)
+            return key.sign(string_to_sign.encode(), ec.ECDSA(hashes.SHA256())).hex()
+
+        def _inject_signature_to_request(self, request, signature):
+            super()._inject_signature_to_request(request, signature)
+            if not presign:
+                authorization = request.headers["Authorization"].replace("AWS4-HMAC-SHA256", SIGV4A, 1)
+                del request.headers["Authorization"]
+                request.headers["Authorization"] = authorization
+
+    request = AWSRequest(method, url, data=body, headers={**({"host": host} if host else {}), **(headers or {})})
+    signer = SigV4aAuth(Credentials(*credentials), service, region_set, **({"expires": 60} if presign else {}))
+    with mock.patch("botocore.auth.get_current_datetime", lambda: signed_at or dt.datetime.now(dt.timezone.utc)):
+        signer.add_auth(request)
+    response = requests.request(method, request.url, data=body or None, headers=dict(request.headers.items()),
+                                timeout=30)
+    code = re.search(r"<Code>([^<]*)</Code>", response.text)
+    return response.status_code, code.group(1) if code else ""
+
+
+def test_sigv4a_put_events_runs_as_the_signing_account():
+    """A SigV4a PutEvents (as botocore sends one with EndpointId) is delivered in the signing account.
+
+    Region set ``*`` runs in MINISTACK_REGION, so the bus and queue are made there."""
+    import os
+    import uuid
+
+    import boto3
+    from conftest import ENDPOINT
+
+    account = "111122223333"
+
+    def client(service):
+        return boto3.client(service, endpoint_url=ENDPOINT, region_name=os.environ.get("MINISTACK_REGION", "us-east-1"),
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    events, sqs = client("events"), client("sqs")
+    bus, source = f"sigv4a-{uuid.uuid4().hex[:8]}", "ministack.sigv4a"
+    with contextlib.ExitStack() as cleanup:
+        events.create_event_bus(Name=bus)
+        cleanup.callback(events.delete_event_bus, Name=bus)
+        queue = sqs.create_queue(QueueName=bus)["QueueUrl"]
+        cleanup.callback(sqs.delete_queue, QueueUrl=queue)
+        queue_arn = sqs.get_queue_attributes(QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        events.put_rule(Name=bus, EventBusName=bus, EventPattern=json.dumps({"source": [source]}))
+        cleanup.callback(events.delete_rule, Name=bus, EventBusName=bus)
+        events.put_targets(Rule=bus, EventBusName=bus, Targets=[{"Id": "q", "Arn": queue_arn}])
+        cleanup.callback(events.remove_targets, Rule=bus, EventBusName=bus, Ids=["q"])
+        body = json.dumps({"Entries": [{"EventBusName": bus, "Source": source, "DetailType": "sigv4a",
+                                        "Detail": "{}"}]}).encode()
+        headers = {"Content-Type": "application/x-amz-json-1.1", "X-Amz-Target": "AWSEvents.PutEvents"}
+        status, _ = _sigv4a_request((account, "test"), "POST", f"{ENDPOINT.rstrip('/')}/", "events", "*",
+                                    body=body, headers=headers)
+        assert status == 200
+        messages = sqs.receive_message(QueueUrl=queue, MaxNumberOfMessages=10, WaitTimeSeconds=5).get("Messages", [])
+        assert [json.loads(m["Body"])["account"] for m in messages] == [account]
+
+
+def test_sigv4a_mrap_get_runs_as_the_signing_account():
+    """The owner's SigV4a GetObject through its Multi-Region Access Point, header-signed and presigned, returns the object."""
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT
+
+    account, endpoint = "111122223333", ENDPOINT.rstrip("/")
+    s3 = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=account,
+                      aws_secret_access_key="test")
+    control = boto3.client("s3control", endpoint_url=ENDPOINT, region_name="us-west-2", aws_access_key_id=account,
+                           aws_secret_access_key="test", config=Config(inject_host_prefix=False))
+    bucket, name = f"sigv4a-{uuid.uuid4().hex[:8]}", f"sigv4a-{uuid.uuid4().hex[:8]}"
+    with contextlib.ExitStack() as cleanup:
+        s3.create_bucket(Bucket=bucket)
+        cleanup.callback(s3.delete_bucket, Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="k", Body=b"v")
+        cleanup.callback(s3.delete_object, Bucket=bucket, Key="k")
+        control.create_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                                 Details={"Name": name, "Regions": [{"Bucket": bucket}]})
+        cleanup.callback(control.delete_multi_region_access_point, AccountId=account, ClientToken=uuid.uuid4().hex,
+                         Details={"Name": name})
+        alias = control.get_multi_region_access_point(AccountId=account, Name=name)["AccessPoint"]["Alias"]
+        mrap = f"{alias}.accesspoint.s3-global.amazonaws.com"
+        results = [_sigv4a_request((account, "test"), "GET", f"{endpoint}/k", "s3", "*", host=mrap, presign=presign)
+                   for presign in (False, True)]
+        assert results == [(200, ""), (200, "")]
+
+
+@pytest.mark.auth_contract
+def test_sigv4a_signatures_are_verified_contract(auth_enabled, iam_user):
+    """SigV4a header and presigned signatures are checked for an IAM user, with their date and region set."""
+    import datetime as dt
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    endpoint = ENDPOINT.rstrip("/")
+    bucket, name = f"sigv4a-{uuid.uuid4().hex[:8]}", f"sigv4a-{uuid.uuid4().hex[:8]}"
+    admin, account = make_client("s3"), make_client("sts").get_caller_identity()["Account"]
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key="k", Body=b"v")
+    control = boto3.client("s3control", endpoint_url=ENDPOINT, region_name="us-west-2", aws_access_key_id="test",
+                           aws_secret_access_key="test", config=Config(inject_host_prefix=False))
+    control.create_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                             Details={"Name": name, "Regions": [{"Bucket": bucket}]})
+    alias = control.get_multi_region_access_point(AccountId=account, Name=name)["AccessPoint"]["Alias"]
+    mrap = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "*"}]})
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=20)
+    sts_call = {"body": b"Action=GetCallerIdentity&Version=2011-06-15",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}}
+    try:
+        with second_access_key(user) as (key, secret):
+            cases = [
+                # (service, method, url, host, region set, extra, refused under AUTH=true as)
+                ("sts", "POST", f"{endpoint}/", None, "*", sts_call, None),
+                ("sts", "POST", f"{endpoint}/", None, "*", {**sts_call, "wrong": True},
+                 (403, "SignatureDoesNotMatch")),
+                ("sts", "POST", f"{endpoint}/", None, "ap-south-1,ap-east-1", sts_call, (403, "InvalidClientTokenId")),
+                ("sts", "POST", f"{endpoint}/", None, "*", {**sts_call, "signed_at": old},
+                 (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {}, None),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"wrong": True}, (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "ap-south-1", {}, (400, "RegionSetMismatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"signed_at": old}, (403, "RequestTimeTooSkewed")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True}, None),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True, "wrong": True},
+                 (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True, "signed_at": old},
+                 (403, "AccessDenied")),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {}, None),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {"presign": True}, None),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {"wrong": True}, (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/k", mrap, "ap-south-1", {}, (400, "RegionSetMismatch")),
+            ]
+            for service, method, url, host, region_set, extra, refused in cases:
+                extra = dict(extra)
+                credentials = (key, "wrong" + secret if extra.pop("wrong", False) else secret)
+                result = _sigv4a_request(credentials, method, url, service, region_set, host=host, **extra)
+                expected = refused if auth_enabled and refused else (200, "")
+                assert result == expected, (service, url, host, region_set, extra)
+    finally:
+        control.delete_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                                 Details={"Name": name})
+        admin.delete_object(Bucket=bucket, Key="k")
+        admin.delete_bucket(Bucket=bucket)

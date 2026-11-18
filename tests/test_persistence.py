@@ -639,6 +639,36 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_route53_private_zone_vpcs_round_trip():
+    vpc = {"VPCRegion": "us-west-2", "VPCId": "vpc-0123456789abcdef0"}
+    body = (
+        '<CreateHostedZoneRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">'
+        "<Name>persisted.example.internal</Name><CallerReference>persist-1</CallerReference>"
+        f"<VPC><VPCRegion>{vpc['VPCRegion']}</VPCRegion><VPCId>{vpc['VPCId']}</VPCId></VPC>"
+        "</CreateHostedZoneRequest>"
+    ).encode()
+    zone_ids = []
+
+    def populate(mod):
+        status, _, _ = mod._create_hosted_zone(body, {})
+        assert status == 201
+        zone_ids.extend(mod._zones.keys())
+        # A zone persisted before VPC associations existed has no "vpcs" key.
+        mod._zones["ZLEGACYPRIVATE1"] = {
+            "id": "ZLEGACYPRIVATE1", "name": "legacy.example.internal.",
+            "caller_reference": "legacy", "comment": "", "private": True,
+        }
+
+    def observe(mod):
+        assert mod._zones[zone_ids[0]]["vpcs"] == [vpc]
+        status, _, out = mod._list_hosted_zones_by_vpc({"vpcid": vpc["VPCId"], "vpcregion": vpc["VPCRegion"]})
+        assert status == 200 and zone_ids[0].encode() in out
+        status, _, out = mod._get_hosted_zone("ZLEGACYPRIVATE1")
+        assert status == 200 and b"<VPCs />" in out
+
+    _round_trip("route53", "route53", populate, observe)
+
+
 def test_s3_mrap_round_trip():
     """A multi-region access point outlives a restart. Its alias is baked into
     client configuration, so member buckets coming back without the alias
@@ -689,6 +719,29 @@ def test_s3_object_lambda_access_points_round_trip_without_pending_requests():
         assert "olap_requests" not in mod.get_state()
 
     _round_trip("s3", "s3", populate, observe)
+
+
+def test_cloudfront_vpc_origins_round_trip_every_account():
+    """CloudFront VPC origins are account-scoped; a restart keeps every account's."""
+    def record(account, vo_id, version):
+        return {"Id": vo_id, "Arn": f"arn:aws:cloudfront::{account}:vpcorigin/{vo_id}", "AccountId": account,
+                "Status": "Deployed", "Version": version, "VpcOriginEndpointConfig": {"Name": "api"}}
+
+    def populate(mod):
+        mod._vpc_origins.set_scoped("111111111111", "us-east-1", "vo_a", record("111111111111", "vo_a", 4))
+        mod._vpc_origins.set_scoped("222222222222", "us-east-1", "vo_b", record("222222222222", "vo_b", 6))
+        # A deleted origin had reached version 8: its ETags must stay valid too (R1 U10/delete-C-after-gone).
+        for version in range(1, 9):
+            mod._vpc_origin_etag(version)
+
+    def observe(mod):
+        assert mod._vpc_origins.get_scoped("111111111111", "us-east-1", "vo_a")["AccountId"] == "111111111111"
+        assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["Version"] == 6
+        assert not mod._vpc_origins.contains_scoped("111111111111", "us-east-1", "vo_b")
+        # Every version's ETag issued before the restart is valid again for If-Match.
+        assert sorted(set(mod._vpc_origin_etags_issued.values())) == list(range(1, 9))
+
+    _round_trip("cloudfront", "cloudfront", populate, observe)
 
 
 def test_transcribe_round_trip():
@@ -2008,6 +2061,55 @@ def test_secretsmanager_resource_policies_survive_warm_boot():
         "_resource_policies must be in both."
     )
     mod.reset()
+
+
+def test_secretsmanager_replication_changes_survive_warm_boot():
+    """RemoveRegionsFromReplication and StopReplicationToReplica change a primary and its replica in two
+    regions. Both must come back from disk as they were left, not as the replication they replaced."""
+    import json as _json
+
+    from ministack.core.responses import get_region, set_request_region
+
+    mod = _get_module("secretsmanager")
+    original_region = get_region()
+
+    def call(region, fn, **data):
+        set_request_region(region)
+        status, _, body = fn(data)
+        return status, _json.loads(body)
+
+    mod.reset()
+    try:
+        for name in ("kept", "removed", "stopped"):
+            call("us-east-1", mod._create_secret, Name=name, SecretString="v1")
+            call("us-east-1", mod._replicate_secret_to_regions, SecretId=name,
+                 AddReplicaRegions=[{"Region": "us-west-2"}])
+        call("us-east-1", mod._remove_regions_from_replication, SecretId="removed",
+             RemoveReplicaRegions=["us-west-2"])
+        call("us-west-2", mod._stop_replication_to_replica, SecretId="stopped")
+
+        _round_trip_dict(mod, "secretsmanager")
+
+        _, kept = call("us-east-1", mod._describe_secret, SecretId="kept")
+        assert [s["Region"] for s in kept["ReplicationStatus"]] == ["us-west-2"]
+        assert call("us-west-2", mod._describe_secret, SecretId="kept")[1]["PrimaryRegion"] == "us-east-1"
+
+        _, removed = call("us-east-1", mod._describe_secret, SecretId="removed")
+        assert "ReplicationStatus" not in removed
+        assert call("us-west-2", mod._describe_secret, SecretId="removed")[0] == 400
+
+        _, stopped = call("us-east-1", mod._describe_secret, SecretId="stopped")
+        assert "ReplicationStatus" not in stopped
+        status, west = call("us-west-2", mod._describe_secret, SecretId="stopped")
+        assert status == 200 and "PrimaryRegion" not in west
+        # The restored replica is standalone and writable, and the restored link still holds for the other.
+        assert call("us-west-2", mod._put_secret_value, SecretId="stopped", SecretString="v2")[0] == 200
+        assert call("us-west-2", mod._put_secret_value, SecretId="kept", SecretString="v2")[0] == 400
+        assert call("us-east-1", mod._delete_secret, SecretId="kept", ForceDeleteWithoutRecovery=True)[0] == 400
+        assert call("us-east-1", mod._delete_secret, SecretId="removed", ForceDeleteWithoutRecovery=True)[0] == 200
+    finally:
+        mod.reset()
+        set_request_region(original_region)
 
 
 # ── kinesis._consumers ─────────────────────────────────────────────────
@@ -5733,3 +5835,104 @@ def test_signer_jobs_profiles_and_tokens_survive_warm_boot():
         }
     finally:
         mod.reset()
+
+
+def _ec2_va_populate(mod, account_id, region, label):
+    """Create one of each Verified Access resource through the handlers, in one scope."""
+    import json
+
+    from ministack.core.responses import request_scope
+    from ministack.services import acm
+
+    oidc = {"Issuer": "https://idp.example.com", "AuthorizationEndpoint": "https://idp.example.com/a",
+            "TokenEndpoint": "https://idp.example.com/t", "UserInfoEndpoint": "https://idp.example.com/u",
+            "ClientId": "c", "ClientSecret": "s", "Scope": "openid"}
+    with request_scope(account_id, region):
+        mod._ensure_defaults_initialized()
+        status, _, body = mod._create_verified_access_trust_provider({
+            "TrustProviderType": "user", "UserTrustProviderType": "oidc", "PolicyReferenceName": label,
+            **{f"OidcOptions.{k}": v for k, v in oidc.items()},
+            "TagSpecification.1.ResourceType": "verified-access-trust-provider",
+            "TagSpecification.1.Tag.1.Key": "owner", "TagSpecification.1.Tag.1.Value": label,
+        })
+        assert status == 200, body
+        tp_id = next(iter(mod._va_trust_providers))
+        status, _, body = mod._create_verified_access_instance({
+            "Description": label,
+            "TagSpecification.1.ResourceType": "verified-access-instance",
+            "TagSpecification.1.Tag.1.Key": "owner", "TagSpecification.1.Tag.1.Value": label,
+        })
+        assert status == 200, body
+        inst_id = next(iter(mod._va_instances))
+        assert mod._attach_verified_access_trust_provider({
+            "VerifiedAccessInstanceId": inst_id, "VerifiedAccessTrustProviderId": tp_id})[0] == 200
+        assert mod._modify_verified_access_instance_logging_configuration({
+            "VerifiedAccessInstanceId": inst_id, "AccessLogs.IncludeTrustContext": "true"})[0] == 200
+        assert mod._create_verified_access_group({
+            "VerifiedAccessInstanceId": inst_id, "PolicyDocument": f"permit-{label}"})[0] == 200
+        group_id = next(iter(mod._va_groups))
+        enis = set(mod._network_interfaces)
+        assert mod._create_network_interface({"SubnetId": mod._DEFAULT_SUBNET_ID})[0] == 200
+        eni_id = next(iter(set(mod._network_interfaces) - enis))
+        cert_arn = json.loads(acm._request_certificate({"DomainName": f"{label}.example.com"})[2])["CertificateArn"]
+        groups = set(mod._security_groups)
+        assert mod._create_security_group({"GroupName": f"va-{label}", "GroupDescription": "va",
+                                           "VpcId": mod._DEFAULT_VPC_ID})[0] == 200
+        sg_id = next(iter(set(mod._security_groups) - groups))
+        status, _, body = mod._create_verified_access_endpoint({
+            "VerifiedAccessGroupId": group_id, "EndpointType": "network-interface", "AttachmentType": "vpc",
+            "DomainCertificateArn": cert_arn, "ApplicationDomain": f"{label}.example.com", "EndpointDomainPrefix": label,
+            "NetworkInterfaceOptions.NetworkInterfaceId": eni_id, "NetworkInterfaceOptions.Port": "443",
+            "NetworkInterfaceOptions.Protocol": "https", "SecurityGroupId.1": sg_id,
+        })
+        assert status == 200, body
+        ep_id = next(iter(mod._va_endpoints))
+    return {"tp": tp_id, "inst": inst_id, "group": group_id, "ep": ep_id}
+
+
+def test_ec2_verified_access_round_trip_across_accounts():
+    from ministack.core.responses import request_scope
+
+    scopes = (("111111111111", "us-east-1", "a"), ("222222222222", "eu-west-1", "b"))
+    ids = {}
+
+    def populate(mod):
+        for account_id, region, label in scopes:
+            ids[label] = _ec2_va_populate(mod, account_id, region, label)
+
+    def observe(mod):
+        for account_id, region, label in scopes:
+            got = ids[label]
+            with request_scope(account_id, region):
+                tp = mod._va_trust_providers.get(got["tp"])
+                assert tp["PolicyReferenceName"] == label
+                assert tp["OidcOptions"]["ClientSecret"] == "s"
+                inst = mod._va_instances.get(got["inst"])
+                assert inst["Description"] == label
+                assert inst["TrustProviderIds"] == [got["tp"]]
+                assert inst["AccessLogs"]["IncludeTrustContext"] is True
+                assert mod._va_groups.get(got["group"])["PolicyDocument"] == f"permit-{label}"
+                assert mod._va_endpoints.get(got["ep"])["VerifiedAccessGroupId"] == got["group"]
+                for resource_id in (got["tp"], got["inst"]):
+                    assert mod._tags.get(resource_id) == [{"Key": "owner", "Value": label}]
+            # The other tenant's resources stay invisible from this scope.
+            other = ids["b" if label == "a" else "a"]
+            with request_scope(account_id, region):
+                assert other["inst"] not in mod._va_instances
+
+    _round_trip("ec2", "ec2", populate, observe)
+
+
+def test_ec2_verified_access_reset_clears_stores():
+    from ministack.core.responses import request_scope
+
+    mod = _module("ec2")
+    mod.reset()
+    got = _ec2_va_populate(mod, "111111111111", "us-east-1", "r")
+    mod.reset()
+    with request_scope("111111111111", "us-east-1"):
+        assert got["inst"] not in mod._va_instances
+        assert got["tp"] not in mod._va_trust_providers
+        assert got["group"] not in mod._va_groups
+        assert got["ep"] not in mod._va_endpoints
+        assert mod._tags.get(got["inst"]) is None

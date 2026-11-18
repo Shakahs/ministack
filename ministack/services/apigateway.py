@@ -44,6 +44,7 @@ Data plane:
 
 import asyncio
 import base64
+import codecs
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -364,7 +366,9 @@ async def handle_request(method, path, headers, body, query_params):
     """Route API Gateway v2 control plane requests."""
     # Dispatch v1 REST API requests first
     parts = [p for p in path.strip("/").split("/") if p]
-    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags", "account"):
+    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags", "account",
+                              "clientcertificates", "domainnameaccessassociations",
+                              "rejectdomainnameaccessassociations"):
         from ministack.services import apigateway_v1
         return await apigateway_v1.handle_request(method, path, headers, body, query_params)
 
@@ -433,7 +437,7 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "POST":
                 return _create_api(data)
             if method == "GET":
-                return _get_apis()
+                return _get_apis(query_params)
 
         # /v2/apis/{apiId}
         if api_id and not sub:
@@ -456,13 +460,13 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_route(api_id, data)
                 if method == "GET":
-                    return _get_routes(api_id)
+                    return _get_routes(api_id, query_params)
             elif rr_segment == "routeresponses":
                 if not rr_id:
                     if method == "POST":
                         return _create_route_response(api_id, sub_id, data)
                     if method == "GET":
-                        return _get_route_responses(api_id, sub_id)
+                        return _get_route_responses(api_id, sub_id, query_params)
                 else:
                     if method == "GET":
                         return _get_route_response(api_id, sub_id, rr_id)
@@ -486,13 +490,13 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_integration(api_id, data)
                 if method == "GET":
-                    return _get_integrations(api_id)
+                    return _get_integrations(api_id, query_params)
             elif ir_segment == "integrationresponses":
                 if not ir_id:
                     if method == "POST":
                         return _create_integration_response(api_id, sub_id, data)
                     if method == "GET":
-                        return _get_integration_responses(api_id, sub_id)
+                        return _get_integration_responses(api_id, sub_id, query_params)
                 else:
                     if method == "GET":
                         return _get_integration_response(api_id, sub_id, ir_id)
@@ -514,7 +518,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_stage(api_id, data)
                 if method == "GET":
-                    return _get_stages(api_id)
+                    return _get_stages(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_stage(api_id, sub_id)
@@ -529,7 +533,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_deployment(api_id, data)
                 if method == "GET":
-                    return _get_deployments(api_id)
+                    return _get_deployments(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_deployment(api_id, sub_id)
@@ -542,7 +546,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_authorizer(api_id, data)
                 if method == "GET":
-                    return _get_authorizers(api_id)
+                    return _get_authorizers(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_authorizer(api_id, sub_id)
@@ -999,10 +1003,23 @@ async def _invoke_request_authorizer_lambda(authorizer, event, account_id, regio
     return payload if isinstance(payload, dict) else None
 
 
+def _raw_query_string(query_params, raw_query_string=None):
+    """rawQueryString: the query string as the client sent it. Without one (an internal caller),
+    re-encode the URL-decoded parameters: a raw space breaks lambda_http (http::Uri rejects it ->
+    502), and a decoded '='/'&' inside a value would corrupt the query structure. safe="" encodes
+    everything except RFC-3986 unreserved (#1035)."""
+    if raw_query_string is not None:
+        return raw_query_string
+    return "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
+        for k, vals in (query_params or {}).items() for val in vals
+    )
+
+
 async def _authorize_request_v2(
     api_id, stage, route, method, path, resource_path,
     headers, query_params, path_params, stage_vars,
-    owner_account_id, owner_region,
+    owner_account_id, owner_region, raw_query_string=None,
 ):
     """Enforce a REQUEST-type Lambda authorizer before an HTTP API route's
     integration runs.
@@ -1077,10 +1094,7 @@ async def _authorize_request_v2(
         }
     else:
         qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
-        raw_qs = "&".join(
-            f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
-            for k, vals in (query_params or {}).items() for val in vals
-        )
+        raw_qs = _raw_query_string(query_params, raw_query_string)
         event = {
             "version": "2.0",
             "type": "REQUEST",
@@ -1314,7 +1328,7 @@ def _apply_request_parameter_mappings(
     return out_headers, out_query, out_path
 
 
-async def handle_execute(api_id, stage, path, method, headers, body, query_params):
+async def handle_execute(api_id, stage, path, method, headers, body, query_params, raw_query_string=None):
     """Execute an API request through a deployed API (data plane)."""
     scope = find_api_scope(api_id)
     if scope is None:
@@ -1328,7 +1342,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     try:
         return await _handle_execute_in_scope(
             api_id, stage, path, method, headers, body, query_params,
-            owner_account_id, owner_region,
+            owner_account_id, owner_region, raw_query_string,
         )
     finally:
         _request_account_id.reset(account_token)
@@ -1342,7 +1356,7 @@ def _http_api_not_found():
 
 async def _handle_execute_in_scope(
     api_id, stage, path, method, headers, body, query_params,
-    owner_account_id, owner_region,
+    owner_account_id, owner_region, raw_query_string=None,
 ):
     api = _apis.get(api_id)
     if not api:
@@ -1407,7 +1421,7 @@ async def _handle_execute_in_scope(
         auth_error, authorizer_lambda_ctx = await _authorize_request_v2(
             api_id, stage, route, method, path, (route_path or path),
             request_headers, query_params or {}, path_params, stage_vars,
-            owner_account_id, owner_region,
+            owner_account_id, owner_region, raw_query_string,
         )
         if auth_error is not None:
             return auth_error
@@ -1451,6 +1465,7 @@ async def _handle_execute_in_scope(
             authorizer_iam=authorizer_iam,
             owner_account_id=owner_account_id,
             owner_region=owner_region,
+            raw_query_string=raw_query_string,
         )
     elif integration_type == "HTTP_PROXY":
         mapped_headers, mapped_query, mapped_path = _apply_request_parameter_mappings(
@@ -1538,6 +1553,18 @@ def _match_route(api_id, method, path):
     return None
 
 
+def route_authorization_type(api_id, stage, method, path):
+    """The authorizationType of the route an HTTP API request reaches, or None."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return None
+    with request_scope(*scope):
+        if stage not in _stages.get(api_id, {}) and stage != "$default":
+            return None
+        route = _match_route(api_id, method, "/" + path.lstrip("/"))
+    return (route.get("authorizationType") or "NONE").upper() if route else None
+
+
 def _extract_path_params(route_path: str, request_path: str) -> dict | None:
     """
     Extract path parameter values from a request path using the route template.
@@ -1616,6 +1643,7 @@ async def _invoke_lambda_proxy(
     authorizer_iam=None,
     owner_account_id=None,
     owner_region=None,
+    raw_query_string=None,
 ):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
     from ministack.services import lambda_svc
@@ -1638,14 +1666,7 @@ async def _invoke_lambda_proxy(
     # Build API Gateway v2 proxy event (payload format 2.0)
     # AWS API Gateway v2 joins multi-value query params with commas
     qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
-    # rawQueryString must stay percent-encoded like real AWS. query_params here are
-    # already URL-decoded, so re-encode each key/value: a raw space breaks lambda_http
-    # (http::Uri rejects it -> 502), and a decoded '='/'&' inside a value would corrupt
-    # the query structure. safe="" encodes everything except RFC-3986 unreserved (#1035).
-    raw_qs = "&".join(
-        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
-        for k, vals in query_params.items() for val in vals
-    )
+    raw_qs = _raw_query_string(query_params, raw_query_string)
     # Binary request bodies are base64-encoded with isBase64Encoded=true; only
     # the text content types AWS recognizes are passed through as UTF-8 strings.
     if body:
@@ -1789,6 +1810,14 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 
 # ---- Control plane: APIs ----
 
+def find_api_owner(api_id):
+    """The account owning HTTP or WebSocket API ``api_id``, or None. Only for invoking it."""
+    for (stored_account, _region, stored_api_id), _api in _apis.all_items():
+        if stored_api_id == api_id:
+            return stored_account
+    return None
+
+
 def find_api_scope(api_id):
     """Return (account_id, region) owning api_id within the ambient account."""
     account_id = get_account_id()
@@ -1875,6 +1904,8 @@ def _create_api(data):
     }
     if data.get("corsConfiguration"):
         api["corsConfiguration"] = data["corsConfiguration"]
+    if data.get("ipAddressType"):
+        api["ipAddressType"] = data["ipAddressType"]
     _apis[api_id] = api
     _routes[api_id] = {}
     _integrations[api_id] = {}
@@ -1891,8 +1922,8 @@ def _get_api(api_id):
     return _apigw_response(api)
 
 
-def _get_apis():
-    return _apigw_response({"items": list(_apis.values())})
+def _get_apis(query_params=None):
+    return _page(list(_apis.values()), query_params)
 
 
 def _api_not_found(api_id):
@@ -1923,7 +1954,7 @@ def _update_api(api_id, data):
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
     for k in ("name", "routeSelectionExpression", "apiKeySelectionExpression",
               "disableSchemaValidation", "disableExecuteApiEndpoint", "version",
-              "description"):
+              "description", "ipAddressType"):
         if k in data:
             api[k] = data[k]
     # A CORS configuration is replaced wholesale, never removed here: the API
@@ -1975,6 +2006,10 @@ def _ws_route_authorization_error(api_id, route_key, authorization_type):
     return _apigw_error("BadRequestException", message, 400) if message else None
 
 
+_ROUTE_SELECTION_EXPRESSIONS = ("modelSelectionExpression", "routeResponseSelectionExpression")
+_STAGE_OPTIONAL_FIELDS = ("accessLogSettings", "clientCertificateId", "deploymentId")
+
+
 def _create_route(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
@@ -1997,14 +2032,17 @@ def _create_route(api_id, data):
         route["requestModels"] = data["requestModels"]
     if data.get("requestParameters"):
         route["requestParameters"] = data["requestParameters"]
+    for k in _ROUTE_SELECTION_EXPRESSIONS:
+        if data.get(k):
+            route[k] = data[k]
     _routes.setdefault(api_id, {})[route_id] = route
     return _apigw_response(route, 201)
 
 
-def _get_routes(api_id):
+def _get_routes(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_routes.get(api_id, {}).values())})
+    return _page(list(_routes.get(api_id, {}).values()), query_params)
 
 
 def _get_route(api_id, route_id):
@@ -2050,7 +2088,7 @@ def _update_route(api_id, route_id, data):
                 route.pop("authorizationScopes", None)
         else:
             route[k] = v
-    for rk in ("requestModels", "requestParameters"):
+    for rk in ("requestModels", "requestParameters", *_ROUTE_SELECTION_EXPRESSIONS):
         if rk not in data:
             continue
         v = data.get(rk)
@@ -2071,20 +2109,33 @@ def _delete_route(api_id, route_id):
 
 # ---- Control plane: Integrations ----
 
+_INTEGRATION_OPTIONAL_FIELDS = (
+    "connectionId", "credentialsArn", "integrationSubtype", "passthroughBehavior",
+    "templateSelectionExpression", "tlsConfig",
+)
+
+
 def _create_integration(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
     int_id = new_uuid()[:8]
+    websocket = _apis[api_id].get("protocolType") == "WEBSOCKET"
+    integration_type = data.get("integrationType", "AWS_PROXY")
+    # Lambda proxy on an HTTP API takes 1.0 or 2.0; every other integration only 1.0.
+    default_pfv = "2.0" if integration_type == "AWS_PROXY" and not websocket else "1.0"
     integration = {
         "integrationId": int_id,
-        "integrationType": data.get("integrationType", "AWS_PROXY"),
+        "integrationType": integration_type,
         "integrationUri": data.get("integrationUri", ""),
         "integrationMethod": data.get("integrationMethod", "POST"),
-        "payloadFormatVersion": data.get("payloadFormatVersion", "2.0"),
-        "timeoutInMillis": data.get("timeoutInMillis", 30000),
+        "payloadFormatVersion": data.get("payloadFormatVersion", default_pfv),
+        "timeoutInMillis": data.get("timeoutInMillis", 29000 if websocket else 30000),
         "connectionType": data.get("connectionType", "INTERNET"),
         "description": data.get("description", ""),
     }
+    for k in _INTEGRATION_OPTIONAL_FIELDS:
+        if data.get(k):
+            integration[k] = data[k]
     if data.get("requestParameters"):
         integration["requestParameters"] = data["requestParameters"]
     if data.get("requestTemplates"):
@@ -2100,10 +2151,10 @@ def _create_integration(api_id, data):
     return _apigw_response(integration, 201)
 
 
-def _get_integrations(api_id):
+def _get_integrations(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_integrations.get(api_id, {}).values())})
+    return _page(list(_integrations.get(api_id, {}).values()), query_params)
 
 
 def _get_integration(api_id, int_id):
@@ -2124,11 +2175,12 @@ def _update_integration(api_id, int_id, data):
     for k in ("integrationType", "integrationUri", "integrationMethod",
               "payloadFormatVersion", "timeoutInMillis", "connectionType",
               "description", "requestParameters", "requestTemplates", "responseParameters",
-              "contentHandlingStrategy"):
+              "contentHandlingStrategy", *_INTEGRATION_OPTIONAL_FIELDS):
         if k not in data:
             continue
         v = data[k]
-        if k in ("requestParameters", "requestTemplates", "responseParameters"):
+        if k in ("requestParameters", "requestTemplates", "responseParameters",
+                 *_INTEGRATION_OPTIONAL_FIELDS):
             if v:
                 integration[k] = v
             else:
@@ -2168,16 +2220,17 @@ def _create_stage(api_id, data):
         "routeSettings": data.get("routeSettings", {}),
         "tags": data.get("tags", {}),
     }
+    stage.update({k: data[k] for k in _STAGE_OPTIONAL_FIELDS if data.get(k)})
     _stages.setdefault(api_id, {})[stage_name] = stage
     if data.get("tags"):
         _api_tags[_api_resource_arn(api_id, "stages", stage_name)] = dict(data.get("tags", {}))
     return _apigw_response(stage, 201)
 
 
-def _get_stages(api_id):
+def _get_stages(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_stages.get(api_id, {}).values())})
+    return _page(list(_stages.get(api_id, {}).values()), query_params)
 
 
 def _get_stage(api_id, stage_name):
@@ -2199,6 +2252,13 @@ def _update_stage(api_id, stage_name, data):
               "defaultRouteSettings", "routeSettings"):
         if k in data:
             stage[k] = data[k]
+    for k in _STAGE_OPTIONAL_FIELDS:
+        if k not in data:
+            continue
+        if data[k]:
+            stage[k] = data[k]
+        else:
+            stage.pop(k, None)
     stage["lastUpdatedDate"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return _apigw_response(stage)
 
@@ -2227,10 +2287,10 @@ def _create_deployment(api_id, data):
     return _apigw_response(deployment, 201)
 
 
-def _get_deployments(api_id):
+def _get_deployments(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_deployments.get(api_id, {}).values())})
+    return _page(list(_deployments.get(api_id, {}).values()), query_params)
 
 
 def _get_deployment(api_id, deployment_id):
@@ -2626,14 +2686,16 @@ def _create_authorizer(api_id, data):
         "enableSimpleResponses": data.get("enableSimpleResponses", False),
         "authorizerCredentialsArn": data.get("authorizerCredentialsArn", ""),
     }
+    if data.get("identityValidationExpression"):
+        authorizer["identityValidationExpression"] = data["identityValidationExpression"]
     _authorizers.setdefault(api_id, {})[auth_id] = authorizer
     return _apigw_response(authorizer, 201)
 
 
-def _get_authorizers(api_id):
+def _get_authorizers(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_authorizers.get(api_id, {}).values())})
+    return _page(list(_authorizers.get(api_id, {}).values()), query_params)
 
 
 def _get_authorizer(api_id, auth_id):
@@ -2653,7 +2715,7 @@ def _update_authorizer(api_id, auth_id, data):
         return _apigw_error("NotFoundException", f"Authorizer {auth_id} not found", 404)
     for k in ("name", "identitySource", "jwtConfiguration", "authorizerUri",
               "authorizerPayloadFormatVersion", "authorizerResultTtlInSeconds",
-              "enableSimpleResponses", "authorizerCredentialsArn"):
+              "enableSimpleResponses", "authorizerCredentialsArn", "identityValidationExpression"):
         if k in data:
             authorizer[k] = data[k]
     return _apigw_response(authorizer)
@@ -2712,13 +2774,13 @@ def _create_route_response(api_id, route_id, data):
     return _apigw_response(rr, 201)
 
 
-def _get_route_responses(api_id, route_id):
+def _get_route_responses(api_id, route_id, query_params=None):
     if err := _require_api(api_id):
         return err
     if route_id not in _routes.get(api_id, {}):
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     items = list(_route_responses.get(api_id, {}).get(route_id, {}).values())
-    return _apigw_response({"items": items})
+    return _page(items, query_params)
 
 
 def _get_route_response(api_id, route_id, rr_id):
@@ -2779,13 +2841,13 @@ def _create_integration_response(api_id, integration_id, data):
     return _apigw_response(ir, 201)
 
 
-def _get_integration_responses(api_id, integration_id):
+def _get_integration_responses(api_id, integration_id, query_params=None):
     if err := _require_api(api_id):
         return err
     if integration_id not in _integrations.get(api_id, {}):
         return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     items = list(_integration_responses.get(api_id, {}).get(integration_id, {}).values())
-    return _apigw_response({"items": items})
+    return _page(items, query_params)
 
 
 def _get_integration_response(api_id, integration_id, ir_id):
@@ -3037,8 +3099,11 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         if result.get("status") == "error":
             return {"statusCode": 500, "body": result.get("error", "")}
         return result.get("result", {})
-    # Image/unsupported runtime stub — success without body.
-    return {"statusCode": 200, "body": ""}
+    # Image and other runtimes run through the central dispatcher, as HTTP API routes do.
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-ws-invoke")
+    return lambda_svc.lambda_execute_result_to_api_proxy_response(result)[0]
 
 
 _WS_DENY_REASONS = {
@@ -3047,16 +3112,18 @@ _WS_DENY_REASONS = {
 }
 
 
-def _authorize_ws_iam(connect_arn, headers, query_params, region):
-    """``(status, message)`` refusing an AWS_IAM $connect, or None; the policy check runs under AUTH=true."""
+def _authorize_ws_iam(scope, connect_arn, headers, query_params, region):
+    """``(status, message)`` refusing an AWS_IAM $connect, or None; signature and policy are checked under AUTH=true."""
     from ministack.app import AUTH
-    from ministack.core.iam_evaluator import AuthError, enforce
+    from ministack.core.iam_evaluator import AuthError, authenticate_handshake, enforce
     from ministack.core.router import extract_access_key_id
 
     access_key = extract_access_key_id(headers, query_params)
     if not access_key:
         return 403, "Missing Authentication Token"
-    denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
+    denied = AUTH and authenticate_handshake(scope, "execute-api")
+    if not isinstance(denied, AuthError):
+        denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
     if isinstance(denied, AuthError):
         return 403, denied.message
     if denied:
@@ -3195,7 +3262,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 )
             elif auth_type == "AWS_IAM":
                 refusal = _authorize_ws_iam(
-                    execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
+                    scope, execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
                     headers, query_params, owner_region,
                 )
             elif auth_type == "JWT":
@@ -3252,18 +3319,22 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     continue
                 if item is None:
                     return
-                if isinstance(item, bytes):
-                    await send({"type": "websocket.send", "bytes": item})
-                else:
-                    await send({"type": "websocket.send", "text": str(item)})
+                await send({"type": "websocket.send", "text": item})
 
         drain_task = asyncio.create_task(_drain_outbox())
 
         disconnect_code = 1005  # 1005 = "no status rcvd" per RFC 6455, matches AWS default
         disconnect_reason = ""
+        # DeleteConnection sets close_event; the server then closes the socket.
+        closed_by_delete = asyncio.ensure_future(close_event.wait())
         try:
             while True:
-                message = await receive()
+                receiving = asyncio.ensure_future(receive())
+                await asyncio.wait({receiving, closed_by_delete}, return_when=asyncio.FIRST_COMPLETED)
+                if not receiving.done():
+                    receiving.cancel()
+                    break
+                message = receiving.result()
                 mtype = message.get("type")
                 if mtype == "websocket.disconnect":
                     disconnect_code = int(message.get("code", 1005) or 1005)
@@ -3296,18 +3367,20 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 if body:
                     if isinstance(body, (dict, list)):
                         body = json.dumps(body)
-                    if isinstance(body, bytes):
-                        await send({"type": "websocket.send", "bytes": body})
-                    else:
-                        await send({"type": "websocket.send", "text": str(body)})
+                    await send({"type": "websocket.send", "text": str(body)})
         finally:
             close_event.set()
+            closed_by_delete.cancel()
             try:
                 await drain_task
             except Exception:
                 pass
             _ws_connections.pop(connection_id, None)
-            # Fire $disconnect route best-effort.
+            # "The $disconnect route is executed after the connection is closed."
+            try:
+                await send({"type": "websocket.close", "code": 1000})
+            except Exception:
+                pass
             disconnect_route = _match_ws_route(api_id, "$disconnect")
             if disconnect_route is not None:
                 try:
@@ -3320,10 +3393,6 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     )
                 except Exception:
                     logger.exception("error firing $disconnect")
-            try:
-                await send({"type": "websocket.close", "code": 1000})
-            except Exception:
-                pass
     finally:
         try:
             _request_region.reset(region_token)
@@ -3335,6 +3404,29 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
 # ==========================================================================
 # @connections management API
 # ==========================================================================
+
+def _replace_like_api_gateway(error: UnicodeDecodeError) -> tuple[str, int]:
+    """Replace one invalid UTF-8 sequence with U+FFFD, as API Gateway does for PostToConnection data.
+
+    API Gateway replaces the same bytes as Python's ``errors="replace"`` except for an encoded
+    surrogate: ED followed by A0-BF, plus one continuation byte if present, becomes a single
+    U+FFFD where Python emits one per byte.
+    """
+    data, start = error.object, error.start
+    if data[start] == 0xED and start + 1 < len(data) and 0xA0 <= data[start + 1] <= 0xBF:
+        end = start + 2
+        if end < len(data) and 0x80 <= data[end] <= 0xBF:
+            end += 1
+        return "\ufffd", end
+    return "\ufffd", error.end
+
+
+codecs.register_error("ministack-apigateway-replace", _replace_like_api_gateway)
+
+
+def _post_to_connection_text(data: bytes) -> str:
+    return data.decode("utf-8", errors="ministack-apigateway-replace")
+
 
 async def handle_connections_api(method: str, api_id: str, stage: str,
                                   connection_id: str, body: bytes, headers: dict):
@@ -3352,7 +3444,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
     """
     conn = _ws_connections.get(connection_id)
     if not conn or conn.get("apiId") != api_id:
-        return 410, {"Content-Type": "application/json"}, json.dumps(
+        return 410, {"Content-Type": "application/json", "x-amzn-ErrorType": "GoneException"}, json.dumps(
             {"message": "GoneException"}
         ).encode()
 
@@ -3360,7 +3452,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
         # Push the message into the connection outbox; drain_task will forward it.
         try:
             if body:
-                await conn["outbox"].put(body)
+                await conn["outbox"].put(_post_to_connection_text(body))
         except Exception as exc:
             return 500, {"Content-Type": "application/json"}, json.dumps(
                 {"message": str(exc)}
@@ -3376,6 +3468,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
         return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
 
     if method == "DELETE":
+        _ws_connections.pop(connection_id, None)
         ev = conn.get("close_event")
         if ev is not None:
             try:

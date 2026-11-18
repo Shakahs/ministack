@@ -40,7 +40,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import jsonata
@@ -56,12 +56,28 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
     now_iso,
 )
+from ministack.core.responses import (
+    json_response as _core_json_response,
+)
 
 logger = logging.getLogger("states")
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
 
 # Scale factor for Wait state durations and retry intervals.
 # 0 = skip all waits, 0.01 = 1% of normal, 1 = normal (default).
@@ -138,10 +154,12 @@ _executions = AccountRegionScopedDict()
 _HISTORY_TOKEN_TTL_SECONDS = 24 * 60 * 60
 _history_page_tokens = {}
 _history_page_tokens_lock = threading.Lock()
+_events_lock = threading.Lock()
 _task_tokens = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _activities = AccountRegionScopedDict()
 _activity_tasks = AccountRegionScopedDict()
+_map_runs = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
@@ -165,6 +183,7 @@ def get_state():
         "activities": copy.deepcopy(_activities),
         "state_machine_versions": copy.deepcopy(_state_machine_versions),
         "state_machine_aliases": copy.deepcopy(_state_machine_aliases),
+        "map_runs": copy.deepcopy(_map_runs),
     }
 
 
@@ -177,6 +196,7 @@ def _restore_state(data):
         return
     _state_machines.update(data.get("state_machines", {}))
     _executions.update(data.get("executions", {}))
+    _map_runs.update(data.get("map_runs", {}))
     _tags.update(data.get("tags", {}))
     _activities.update(data.get("activities", {}))
     _state_machine_versions.update(data.get("state_machine_versions", {}))
@@ -295,11 +315,16 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteStateMachineAlias": _delete_state_machine_alias,
         "DescribeStateMachineAlias": _describe_state_machine_alias,
         "ListStateMachineAliases": _list_state_machine_aliases,
+        "ListMapRuns": _list_map_runs,
+        "DescribeMapRun": _describe_map_run,
+        "UpdateMapRun": _update_map_run,
     }
 
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
+    if action in ("StartExecution", "StartSyncExecution") and headers.get("x-amzn-trace-id"):
+        data["traceHeader"] = headers["x-amzn-trace-id"]
     if action == "GetActivityTask":
         return _finalize_response(await _get_activity_task(data))
     if action in _OFF_LOOP_ACTIONS:
@@ -317,6 +342,82 @@ async def handle_request(method, path, headers, body, query_params):
 # ---------------------------------------------------------------------------
 # State machine CRUD
 # ---------------------------------------------------------------------------
+
+_NEXT_OR_END_TYPES = ("Pass", "Task", "Wait", "Parallel", "Map")
+
+
+def _pointer(name):
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+def _structure_diagnostics(definition_str) -> list:
+    """The top-level structure errors AWS reports (AWS capture, 2026-11-18): a state with both or neither of
+    Next and End, a StartAt or Next naming no state, a state StartAt never reaches, and no terminal state.
+    A definition that is not an object with a States map of objects is left to the other checks."""
+    if not isinstance(definition_str, str):
+        return []
+    try:
+        definition = json.loads(definition_str)
+    except (TypeError, ValueError):
+        return []
+    states = definition.get("States") if isinstance(definition, dict) else None
+    if not isinstance(states, dict) or not states or not all(isinstance(s, dict) for s in states.values()):
+        return []
+
+    def diag(code, message, location=None):
+        d = {"severity": "ERROR", "code": code, "message": message}
+        if location is not None:
+            d["location"] = location
+        return d
+
+    out = []
+    for name, state in states.items():
+        if state.get("Type") in _NEXT_OR_END_TYPES:
+            has_next, has_end = "Next" in state, "End" in state
+            if has_next and has_end:
+                out.append(diag("SCHEMA_VALIDATION_FAILED",
+                                "There should only be one of the following fields: [Next, End]",
+                                f"/States/{_pointer(name)}"))
+            elif not has_next and not has_end:
+                out.append(diag("SCHEMA_VALIDATION_FAILED",
+                                "This object should have only one of the following fields: [Next, End]",
+                                f"/States/{_pointer(name)}"))
+    start = definition.get("StartAt")
+    if isinstance(start, str) and start not in states:
+        out.append(diag("MISSING_TRANSITION_TARGET", f"Missing 'Next' target: {start}", "/StartAt"))
+    for name, state in states.items():
+        target = state.get("Next")
+        if isinstance(target, str) and target not in states:
+            out.append(diag("MISSING_TRANSITION_TARGET", f"Missing 'Next' target: {target}",
+                            f"/States/{_pointer(name)}/Next"))
+    reached, todo = set(), [start] if start in states else []
+    while todo:
+        name = todo.pop()
+        if name in reached or name not in states:
+            continue
+        reached.add(name)
+        state = states[name]
+        targets = [state.get("Next"), state.get("Default")]
+        targets += [c.get("Next") for c in state.get("Choices") or [] if isinstance(c, dict)]
+        targets += [c.get("Next") for c in state.get("Catch") or [] if isinstance(c, dict)]
+        todo += [t for t in targets if isinstance(t, str)]
+    for name in states:
+        if name not in reached:
+            out.append(diag("MISSING_TRANSITION_TARGET", f'State "{name}" is not reachable.',
+                            f"/States/{_pointer(name)}"))
+    if not any(s.get("Type") in ("Succeed", "Fail") or s.get("End") is True for s in states.values()):
+        out.append(diag("MISSING_END_STATE", "Workflow has no terminal state"))
+    return out
+
+
+def _structure_refusal(definition_str) -> str | None:
+    """CreateStateMachine / UpdateStateMachine's InvalidDefinition message for those errors, or None."""
+    found = _structure_diagnostics(definition_str)
+    if not found:
+        return None
+    return "Invalid State Machine Definition: '" + ", ".join(
+        f"{d['code']}: {d['message']} at {d.get('location', 'null')}" for d in found) + "'"
+
 
 def _validate_definition_jsonata(definition_str) -> str | None:
     """The first malformed ``{% ... %}`` expression's refusal, or None.
@@ -354,18 +455,181 @@ def _validate_definition_jsonata(definition_str) -> str | None:
     return walk(definition, "")
 
 
+_ENCRYPTION_TYPES = ("AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY")
+# What AWS stores when a CUSTOMER_MANAGED_KMS_KEY configuration has no reuse period.
+_DEFAULT_KMS_DATA_KEY_REUSE_PERIOD = 300
+
+
+def _default_encryption():
+    """The encryptionConfiguration a machine reports when no customer
+    managed key was set. A fresh dict each call, so no two records share one."""
+    return {"type": "AWS_OWNED_KEY"}
+
+
+# How AWS's JSON deserializer names a value of the wrong JSON type.
+def _json_token(value):
+    if isinstance(value, bool):
+        return "TRUE_VALUE" if value else "FALSE_VALUE"
+    if isinstance(value, (int, float)):
+        return "NUMBER_VALUE"
+    return "STRING_VALUE"
+
+
+def _wrong_json_type(value, expected):
+    """AWS's SerializationException message for a member of the wrong JSON
+    type, or None. expected is "Integer", "String" or "structure"."""
+    if isinstance(value, list):
+        return "Start of list found where not expected"
+    if isinstance(value, dict):
+        return None if expected == "structure" else "Start of structure or map found where not expected."
+    if expected == "structure":
+        return "Expected null"
+    if expected == "Integer":
+        if isinstance(value, (bool, str)):
+            return f"{_json_token(value)} can not be converted to an Integer"
+        return None
+    if isinstance(value, str):
+        return None
+    return f"{_json_token(value)} can not be converted to a String"
+
+
+def _encryption_serialization_error(cfg):
+    """The SerializationException AWS answers when encryptionConfiguration or
+    one of its members has the wrong JSON type. AWS reports one member,
+    checking them in the order reuse period, kmsKeyId, type whatever order
+    the request lists them in. A JSON null is not an error: AWS treats it as
+    an absent field. This exception's message member is "Message" on the
+    wire."""
+    if cfg is None:
+        return None
+    message = _wrong_json_type(cfg, "structure")
+    if message is None:
+        for member, expected in (("kmsDataKeyReusePeriodSeconds", "Integer"),
+                                 ("kmsKeyId", "String"), ("type", "String")):
+            if cfg.get(member) is not None:
+                message = _wrong_json_type(cfg[member], expected)
+                if message:
+                    break
+    if message is None:
+        return None
+    return error_response_json("SerializationException", message, 400, message_key="Message")
+
+
+def _with_integer_period(cfg):
+    """The configuration with a JSON number period read as an integer: AWS
+    accepts 300.5 and stores 300."""
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if isinstance(period, float):
+        return {**cfg, "kmsDataKeyReusePeriodSeconds": int(period)}
+    return cfg
+
+
+def _encryption_validation_error(cfg):
+    """The ValidationException for an encryptionConfiguration that breaks the
+    member constraints, or None. AWS reports every broken constraint in one
+    message, in the order reuse period, kmsKeyId, type."""
+    problems = []
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if isinstance(period, int) and not isinstance(period, bool):
+        if period < 60:
+            problems.append(
+                f"Value '{period}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+                "failed to satisfy constraint: Member must have value greater than or equal to 60")
+        elif period > 900:
+            problems.append(
+                f"Value '{period}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+                "failed to satisfy constraint: Member must have value less than or equal to 900")
+    key_id = cfg.get("kmsKeyId")
+    if isinstance(key_id, str):
+        if not key_id:
+            problems.append(
+                "Value '' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+                "constraint: Member must have length greater than or equal to 1")
+        elif len(key_id) > 2048:
+            problems.append(
+                f"Value '{key_id}' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+                "constraint: Member must have length less than or equal to 2048")
+    enc_type = cfg.get("type")
+    if enc_type is None:
+        problems.append(
+            "Value null at 'encryptionConfiguration.type' failed to satisfy "
+            "constraint: Member must not be null")
+    elif enc_type not in _ENCRYPTION_TYPES:
+        problems.append(
+            f"Value '{enc_type}' at 'encryptionConfiguration.type' failed to satisfy "
+            f"constraint: Member must satisfy enum value set: [{', '.join(_ENCRYPTION_TYPES)}]")
+    if not problems:
+        return None
+    count = (f"{len(problems)} validation error detected" if len(problems) == 1
+             else f"{len(problems)} validation errors detected")
+    return error_response_json("ValidationException", f"{count}: " + "; ".join(problems), 400)
+
+
+def _encryption_configuration_error(cfg):
+    """The InvalidEncryptionConfiguration for a well-formed configuration
+    whose members do not fit its type, or None. The key is not looked up in
+    KMS."""
+    if cfg["type"] == "CUSTOMER_MANAGED_KMS_KEY":
+        if cfg.get("kmsKeyId") is None:
+            return error_response_json(
+                "InvalidEncryptionConfiguration",
+                "Invalid Encryption Configuration: Must set a valid kmsKeyId.", 400)
+        return None
+    if cfg.get("kmsKeyId") is not None:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "Invalid Encryption Configuration: Custom kmsKeyId is not allowed when "
+            "selecting AWS_OWNED_KEY.", 400)
+    if cfg.get("kmsDataKeyReusePeriodSeconds") is not None:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "Invalid Encryption Configuration: Custom kmsDataKeyReusePeriodSeconds is not "
+            "allowed when selecting AWS_OWNED_KEY.", 400)
+    return None
+
+
+def _stored_encryption(cfg):
+    """The configuration a machine stores and describes for an accepted
+    request value: AWS_OWNED_KEY when absent, and a customer managed key with
+    the 300 second default when no reuse period was sent."""
+    if cfg is None or cfg["type"] == "AWS_OWNED_KEY":
+        return _default_encryption()
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    return {
+        "type": "CUSTOMER_MANAGED_KMS_KEY",
+        "kmsKeyId": cfg["kmsKeyId"],
+        "kmsDataKeyReusePeriodSeconds": (
+            _DEFAULT_KMS_DATA_KEY_REUSE_PERIOD if period is None else period),
+    }
+
+
 def _create_state_machine(data):
     name = data.get("name")
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
-    invalid = _validate_definition_jsonata(data.get("definition"))
+    # AWS checks the encryptionConfiguration's JSON types and member
+    # constraints before the definition, and whether its members fit its
+    # type after the definition and before the existing-machine check.
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption)
+    if invalid:
+        return invalid
+    invalid = _validate_definition_jsonata(data.get("definition")) or _structure_refusal(data.get("definition"))
     if invalid:
         return error_response_json("InvalidDefinition", invalid, 400)
+    if encryption is not None:
+        invalid = _encryption_configuration_error(encryption)
+        if invalid:
+            return invalid
+    encryption = _stored_encryption(encryption)
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     if arn in _state_machines:
         # Creating the same machine twice is idempotent on AWS and makes SDK retry safe
-        # It checks the sfn itself: definition, type, logging and whether the call publishes
+        # It checks the sfn itself: definition, type, logging, encryption and whether the call publishes
         existing = _state_machines[arn]
         publishes = bool(data.get("publish"))
         if (data.get("definition", "{}") == existing["definition"]
@@ -373,6 +637,7 @@ def _create_state_machine(data):
                 and data.get("loggingConfiguration",
                              {"level": "OFF", "includeExecutionData": False})
                 == existing["loggingConfiguration"]
+                and encryption == existing.get("encryptionConfiguration", _default_encryption())
                 and publishes == bool(existing.get("createVersionArn"))
                 # AWS's idempotency check also covers versionDescription: a
                 # publishing re-create carrying a different description is a
@@ -409,6 +674,10 @@ def _create_state_machine(data):
         "loggingConfiguration": data.get(
             "loggingConfiguration",
             {"level": "OFF", "includeExecutionData": False}),
+        # Machines without a customer managed key report AWS_OWNED_KEY.
+        "encryptionConfiguration": encryption,
+        **({"tracingConfiguration": data["tracingConfiguration"]}
+           if data.get("tracingConfiguration") else {}),
         # AWS rotates revisionId on every Create/Update. Callers use it
         # as an optimistic-concurrency precondition when publishing a
         # version (see _publish_state_machine_version).
@@ -444,6 +713,10 @@ def _create_state_machine(data):
             "type": _state_machines[arn]["type"],
             "loggingConfiguration": copy.deepcopy(
                 _state_machines[arn]["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                _state_machines[arn]["encryptionConfiguration"]),
+            **({"tracingConfiguration": copy.deepcopy(_state_machines[arn]["tracingConfiguration"])}
+               if _state_machines[arn].get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
     return json_response(response)
@@ -473,8 +746,10 @@ def _describe_state_machine(data):
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if sm:
-        return json_response({k: v for k, v in sm.items()
-                              if k not in _SM_INTERNAL_KEYS})
+        body = {k: v for k, v in sm.items() if k not in _SM_INTERNAL_KEYS}
+        # Machines persisted before encryptionConfiguration was stored.
+        body.setdefault("encryptionConfiguration", _default_encryption())
+        return json_response(body)
     # AWS's DescribeStateMachine also accepts a qualified version ARN
     # (arn:...:stateMachine:<name>:<N>) and returns the snapshot
     # captured at publish time, with stateMachineArn echoing the
@@ -493,6 +768,10 @@ def _describe_state_machine(data):
             "description": version.get("description", ""),
             "loggingConfiguration": version.get("loggingConfiguration")
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
+            "encryptionConfiguration": version.get("encryptionConfiguration")
+                or _default_encryption(),
+            **({"tracingConfiguration": version["tracingConfiguration"]}
+               if version.get("tracingConfiguration") else {}),
             "revisionId": version.get("stateMachineRevisionId", ""),
         })
     # DescribeStateMachine on an alias ARN: AWS accepts it and returns
@@ -521,14 +800,33 @@ def _describe_state_machine(data):
 
 
 def _update_state_machine(data):
+    # AWS checks the encryptionConfiguration's JSON types and member
+    # constraints before it looks the machine up, and whether its members fit
+    # its type before the definition. Everything is checked before anything
+    # is written, so a refused call changes nothing.
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption)
+    if invalid:
+        return invalid
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if not sm:
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {arn} not found", 400)
+    if encryption is not None:
+        invalid = _encryption_configuration_error(encryption)
+        if invalid:
+            return invalid
+        if "definition" not in data:
+            return error_response_json(
+                "MissingRequiredParameter",
+                "The definition must be specified when updating the EncryptionConfiguration", 400)
     if "definition" in data:
-        invalid = _validate_definition_jsonata(data["definition"])
+        invalid = _validate_definition_jsonata(data["definition"]) or _structure_refusal(data["definition"])
         if invalid:
             return error_response_json("InvalidDefinition", invalid, 400)
         sm["definition"] = data["definition"]
@@ -536,6 +834,10 @@ def _update_state_machine(data):
         sm["roleArn"] = data["roleArn"]
     if "loggingConfiguration" in data:
         sm["loggingConfiguration"] = data["loggingConfiguration"]
+    if data.get("tracingConfiguration"):
+        sm["tracingConfiguration"] = data["tracingConfiguration"]
+    if encryption is not None:
+        sm["encryptionConfiguration"] = _stored_encryption(encryption)
     # Rotate revisionId so subsequent PublishStateMachineVersion calls
     # with a stale caller-supplied revisionId raise ConflictException
     # (matches AWS optimistic-concurrency semantics).
@@ -559,6 +861,10 @@ def _update_state_machine(data):
             "roleArn": sm["roleArn"],
             "type": sm["type"],
             "loggingConfiguration": copy.deepcopy(sm["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                sm.get("encryptionConfiguration") or _default_encryption()),
+            **({"tracingConfiguration": copy.deepcopy(sm["tracingConfiguration"])}
+               if sm.get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
         response["revisionId"] = sm["revisionId"]
@@ -571,24 +877,41 @@ def _list_state_machines(data):
          "type": sm["type"], "creationDate": sm["creationDate"]}
         for sm in _state_machines.values()
     ]
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
+    return _offset_page(data, "stateMachines", all_machines)
+
+
+def _offset_page(data, key, items):
     start = 0
-    if next_token:
+    if data.get("nextToken"):
         try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_machines[start:start + max_results]
-    resp = {"stateMachines": page}
-    if start + max_results < len(all_machines):
-        resp["nextToken"] = str(start + max_results)
+            start = int(data["nextToken"])
+        except (TypeError, ValueError):
+            start = -1
+        if start < 0:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
+    end = start + (data.get("maxResults") or 100)
+    resp = {key: items[start:end]}
+    if end < len(items):
+        resp["nextToken"] = str(end)
     return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
 # Execution lifecycle
 # ---------------------------------------------------------------------------
+
+def _execution_version_arn(arn):
+    """The version ARN an execution of ``arn`` runs: the version itself, or
+    for an alias the version _resolve_state_machine_arn picks. None for a
+    base state machine."""
+    if arn in _state_machine_versions:
+        return arn
+    alias = _state_machine_aliases.get(arn)
+    routing = (alias or {}).get("routingConfiguration") or []
+    if routing:
+        return max(routing, key=lambda r: r.get("weight", 0)).get("stateMachineVersionArn")
+    return None
+
 
 def _resolve_state_machine_arn(arn):
     """Resolve a state-machine, version, or alias ARN to the base state-machine
@@ -638,6 +961,7 @@ def _start_execution(data):
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {sm_arn} not found", 400)
+    requested_arn = sm_arn
     sm_arn = base_arn
 
     sm = _state_machines[sm_arn]
@@ -667,6 +991,13 @@ def _start_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        **({"traceHeader": data["traceHeader"]} if data.get("traceHeader") else {}),
+        # DescribeStateMachineForExecution reports the encryption configuration
+        # the execution started with: the version's when a version or an alias
+        # was named.
+        "encryptionConfiguration": copy.deepcopy(
+            (_state_machine_versions.get(_execution_version_arn(requested_arn)) or sm)
+            .get("encryptionConfiguration") or _default_encryption()),
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -747,7 +1078,42 @@ def _describe_execution(data):
         result["error"] = execution["error"]
     if execution.get("cause"):
         result["cause"] = execution["cause"]
+    if execution.get("mapRunArn"):
+        result["mapRunArn"] = execution["mapRunArn"]
+    if execution.get("traceHeader"):
+        result["traceHeader"] = execution["traceHeader"]
     return json_response(result)
+
+
+def _map_run_view(run):
+    return {k: v for k, v in run.items() if not k.startswith("_")}
+
+
+def _list_map_runs(data):
+    exec_arn = data.get("executionArn")
+    if exec_arn not in _executions:
+        return error_response_json("ExecutionDoesNotExist", f"Execution Does Not Exist: '{exec_arn}'", 400)
+    runs = [{"executionArn": r["executionArn"], "mapRunArn": r["mapRunArn"], "stateMachineArn": r["_stateMachineArn"],
+             "startDate": r["startDate"], **({"stopDate": r["stopDate"]} if r.get("stopDate") else {})}
+            for r in _map_runs.values() if r["executionArn"] == exec_arn]
+    return _offset_page(data, "mapRuns", runs)
+
+
+def _describe_map_run(data):
+    run = _map_runs.get(data.get("mapRunArn"))
+    if run is None:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{data.get('mapRunArn')}'", 400)
+    return json_response(_map_run_view(run))
+
+
+def _update_map_run(data):
+    run = _map_runs.get(data.get("mapRunArn"))
+    if run is None:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{data.get('mapRunArn')}'", 400)
+    for field in ("maxConcurrency", "toleratedFailurePercentage", "toleratedFailureCount"):
+        if field in data:
+            run[field] = data[field]
+    return json_response({})
 
 
 def _execution_sort_key(execution):
@@ -780,21 +1146,29 @@ def _list_executions(data):
         if cursor is None:
             return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
     sm_arn = data.get("stateMachineArn")
+    map_run_arn = data.get("mapRunArn")
+    if map_run_arn and map_run_arn not in _map_runs:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{map_run_arn}'", 400)
     status_filter = data.get("statusFilter")
     all_execs = []
     for ex in _executions.values():
         if sm_arn and ex["stateMachineArn"] != sm_arn:
             continue
+        if map_run_arn and ex.get("mapRunArn") != map_run_arn:
+            continue
         if status_filter and ex["status"] != status_filter:
             continue
-        all_execs.append({
+        item = {
             "executionArn": ex["executionArn"],
             "stateMachineArn": ex["stateMachineArn"],
             "name": ex["name"],
             "status": ex["status"],
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
-        })
+        }
+        if ex.get("mapRunArn"):
+            item["mapRunArn"] = ex["mapRunArn"]
+        all_execs.append(item)
     all_execs.sort(key=_execution_sort_key, reverse=True)
     if cursor is not None:
         all_execs = [e for e in all_execs if _execution_sort_key(e) < cursor]
@@ -909,6 +1283,7 @@ def _start_sync_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        **({"traceHeader": data["traceHeader"]} if data.get("traceHeader") else {}),
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -934,6 +1309,8 @@ def _start_sync_execution(data):
         "output": execution.get("output") or "{}",
         "outputDetails": {"included": True},
     }
+    if execution.get("traceHeader"):
+        resp["traceHeader"] = execution["traceHeader"]
     # Include error/cause for failed executions (matches AWS SFN behaviour)
     if execution["status"] == "FAILED":
         failed_events = [
@@ -968,6 +1345,9 @@ def _describe_state_machine_for_execution(data):
         "definition": sm["definition"],
         "roleArn": sm["roleArn"],
         "updateDate": sm.get("creationDate", now_iso()),
+        "encryptionConfiguration": copy.deepcopy(
+            execution.get("encryptionConfiguration")
+            or sm.get("encryptionConfiguration") or _default_encryption()),
     })
 
 
@@ -1020,6 +1400,14 @@ def _create_activity(data):
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
 
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption) or _encryption_configuration_error(encryption)
+    if invalid:
+        return invalid
+
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:activity:{name}"
     if arn in _activities:
         return error_response_json(
@@ -1027,6 +1415,8 @@ def _create_activity(data):
 
     ts = now_iso()
     _activities[arn] = {"activityArn": arn, "name": name, "creationDate": ts}
+    if encryption is not None:
+        _activities[arn]["encryptionConfiguration"] = _stored_encryption(encryption)
     _activity_tasks[arn] = []
 
     tags = data.get("tags", [])
@@ -1061,7 +1451,7 @@ def _list_activities(data):
         {"activityArn": a["activityArn"], "name": a["name"], "creationDate": a["creationDate"]}
         for a in _activities.values()
     ]
-    return json_response({"activities": acts})
+    return _offset_page(data, "activities", acts)
 
 
 async def _get_activity_task(data):
@@ -1167,14 +1557,16 @@ def _invalid_tag_resource_arn(arn):
 # ---------------------------------------------------------------------------
 
 def _add_event(execution, event_type, details=None):
-    event = {
-        "id": len(execution["events"]) + 1,
-        "type": event_type,
-        "timestamp": now_iso(),
-    }
-    if details:
-        event.update(details)
-    execution["events"].append(event)
+    # Map items and Parallel branches add events from several threads
+    with _events_lock:
+        event = {
+            "id": len(execution["events"]) + 1,
+            "type": event_type,
+            "timestamp": now_iso(),
+        }
+        if details:
+            event.update(details)
+        execution["events"].append(event)
     return event
 
 
@@ -1399,7 +1791,8 @@ def _test_state(data):
 # ---------------------------------------------------------------------------
 
 def _validate_state_machine_definition(data):
-    return json_response({"result": "OK", "diagnostics": []})
+    found = _structure_diagnostics(data.get("definition"))
+    return json_response({"result": "FAIL" if found else "OK", "diagnostics": found, "truncated": False})
 
 
 # ===================================================================
@@ -1536,10 +1929,7 @@ def _run_execution(exec_arn):
             "Id": execution["stateMachineArn"],
             "Name": sm["name"],
         },
-        # JSONata workflow variables — bound via state `Assign` fields and
-        # referenced as `$name` in subsequent JSONata expressions. Scope is
-        # the whole execution (per AWS); Map/Parallel sub-branches share
-        # this dict with the parent, matching AWS semantics.
+        # Workflow variables set by `Assign`; Map items and Parallel branches get a copy
         "variables": {},
     }
 
@@ -1554,12 +1944,14 @@ def _run_execution(exec_arn):
             ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
-            _add_event(execution, f"{state_type}StateEntered", {
+            entered = _add_event(execution, f"{state_type}StateEntered", {
                 "stateEnteredEventDetails": {
                     "name": current_name,
                     "input": json.dumps(current_input),
                 },
             })
+            if state_type == "Map":
+                _check_inline_map_fields(state_def, current_name, entered["id"])
 
             if state_type == "Succeed":
                 current_input = _apply_input_path(state_def, current_input, ctx)
@@ -1592,9 +1984,16 @@ def _run_execution(exec_arn):
             if state_type in ("Task", "Parallel", "Map"):
                 current_input, next_name = handler_fn(
                     state_def, current_input, execution, ctx)
+            elif state_type == "Wait":
+                current_input, next_name = handler_fn(
+                    state_def, current_input, ctx, execution=execution)
             else:
                 current_input, next_name = handler_fn(
                     state_def, current_input, ctx)
+
+            # AWS writes no event after ExecutionAborted, so a stopped run skips the exit event.
+            if execution["status"] != "RUNNING":
+                break
 
             _add_event(execution, f"{state_type}StateExited", {
                 "stateExitedEventDetails": {
@@ -1622,6 +2021,8 @@ def _run_execution(exec_arn):
 
 
 def _fail_execution(execution, error, cause):
+    if execution["status"] != "RUNNING":  # stopped meanwhile: AWS writes nothing after ExecutionAborted
+        return
     execution["status"] = "FAILED"
     execution["error"] = error
     execution["cause"] = cause
@@ -1651,10 +2052,11 @@ def _execute_pass(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
-    result = state_def.get("Result", effective)
-    result = _apply_result_selector(state_def, result)
+    assignment_result = state_def.get("Result", effective)
+    result = _apply_result_selector(state_def, assignment_result)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, effective, ctx, result=assignment_result)
     return output, _next_or_end(state_def)
 
 
@@ -1699,6 +2101,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, raw_input, result)
                     output = _apply_output_path(state_def, output, ctx)
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
                 return output, _next_or_end(state_def)
 
     if is_callback:
@@ -1760,6 +2163,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
                 output = _apply_output_path(state_def, output, ctx)
+                _apply_state_assign(state_def, raw_input, ctx, result=task_result)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -1787,21 +2191,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            if query_language == "JSONata" and "Output" in catcher:
-                output = _apply_jsonata_output(
-                    catcher,
-                    raw_input,
-                    ctx,
-                    error_output=error_output,
-                    default=error_output,
-                )
-            else:
-                output = _apply_result_path_raw(
-                    catcher.get("ResultPath", "$"), raw_input, error_output)
-            if query_language == "JSONata":
-                # Catch handlers can also carry `Assign`. `$states.errorOutput`
-                # is available here; `$states.result` is not (per AWS).
-                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, query_language, error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -2000,6 +2390,10 @@ def _call_lambda(func_ref, event):
     exec_record = lambda_svc._execution_record_for_config(func, config)
     result = lambda_svc._execute_function_with_config_scope(exec_record, event)
 
+    if result.get("service_error"):
+        # Lambda itself failed (Invoke answered 500 ServiceException); Step Functions names it Lambda.<ErrorName>.
+        body = result.get("body") or {}
+        raise _ExecutionError("Lambda.ServiceException", body.get("message", "") if isinstance(body, dict) else str(body))
     if result.get("error"):
         body = result.get("body", {})
         if isinstance(body, dict):
@@ -2053,11 +2447,15 @@ def _execute_choice(state_def, raw_input, ctx=None):
 
     for choice in state_def.get("Choices", []):
         if _evaluate_rule(choice, effective, ctx):
-            return _apply_output_path(state_def, effective, ctx), choice["Next"]
+            output = _apply_output_path(state_def, effective, ctx)
+            _apply_state_assign(choice, effective, ctx)
+            return output, choice["Next"]
 
     default = state_def.get("Default")
     if default:
-        return _apply_output_path(state_def, effective, ctx), default
+        output = _apply_output_path(state_def, effective, ctx)
+        _apply_state_assign(state_def, effective, ctx)
+        return output, default
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
@@ -2080,6 +2478,14 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
 def _resolve_path_or_ctx(path, data, ctx):
     if path.startswith("$$."):
         return _resolve_ctx_path(path, ctx or {})
+    if path.startswith("$") and len(path) > 1 and path[1] not in ".[":
+        match = re.match(r"^\$([^.[\s]+)(.*)$", path)
+        if match:
+            name, suffix = match.groups()
+            variables = (ctx or {}).get("variables", {})
+            if name not in variables:
+                raise _ExecutionError("States.Runtime", f"Undefined workflow variable: {name}")
+            return _resolve_path("$" + suffix, variables[name])
     return _resolve_path(path, data)
 
 
@@ -2176,14 +2582,14 @@ def _evaluate_rule(rule, data, ctx=None):
 # Wait state
 # ---------------------------------------------------------------------------
 
-def _execute_wait(state_def, raw_input, ctx=None):
+def _execute_wait(state_def, raw_input, ctx=None, execution=None):
     if _state_query_language(state_def, ctx) == "JSONata":
         # JSONata Wait: Seconds and Timestamp may be expressions, and Output
         # and Assign replace the JSONPath chain, as for Pass.
         if "Seconds" in state_def:
-            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx))
+            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx), execution)
         elif "Timestamp" in state_def:
-            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx))
+            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx), execution)
         output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
         _apply_state_assign(state_def, raw_input, ctx)
         return output, _next_or_end(state_def)
@@ -2191,19 +2597,20 @@ def _execute_wait(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
-        _scaled_sleep(state_def["Seconds"])
+        _scaled_sleep(state_def["Seconds"], execution)
     elif "Timestamp" in state_def:
-        _sleep_until(state_def["Timestamp"])
+        _sleep_until(state_def["Timestamp"], execution)
     elif "SecondsPath" in state_def:
         secs = _resolve_path(state_def["SecondsPath"], effective)
         if isinstance(secs, (int, float)) and secs > 0:
-            _scaled_sleep(secs)
+            _scaled_sleep(secs, execution)
     elif "TimestampPath" in state_def:
         ts_str = _resolve_path(state_def["TimestampPath"], effective)
         if isinstance(ts_str, str):
-            _sleep_until(ts_str)
+            _sleep_until(ts_str, execution)
 
     output = _apply_output_path(state_def, effective, ctx)
+    _apply_state_assign(state_def, effective, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2230,18 +2637,25 @@ def _jsonata_wait_timestamp(state_def, raw_input, ctx):
     return timestamp
 
 
-def _scaled_sleep(seconds):
+def _scaled_sleep(seconds, execution=None):
     scaled = seconds * _SFN_WAIT_SCALE
-    if scaled > 0:
+    if scaled <= 0:
+        return
+    if execution is None:
         time.sleep(scaled)
+        return
+    # A stopped execution ends its Wait at once, as on AWS.
+    deadline = time.monotonic() + scaled
+    while execution["status"] == "RUNNING" and time.monotonic() < deadline:
+        time.sleep(max(0, min(0.1, deadline - time.monotonic())))
 
 
-def _sleep_until(iso_ts):
+def _sleep_until(iso_ts, execution=None):
     try:
         target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         delta = (target - datetime.now(timezone.utc)).total_seconds()
         if delta > 0:
-            _scaled_sleep(delta)
+            _scaled_sleep(delta, execution)
     except (ValueError, TypeError):
         pass
 
@@ -2300,7 +2714,7 @@ def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
             if catcher is None:
                 raise
             error_output = {"Error": err.error, "Cause": err.cause}
-            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, _state_query_language(state_def, ctx), error_output)
             return output, catcher["Next"]
 
 
@@ -2323,7 +2737,7 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
             results[idx] = _run_sub_machine(
                 branch.get("States", {}),
                 branch.get("StartAt"),
-                effective, execution, ctx)
+                effective, execution, copy.deepcopy(ctx))
         except Exception as exc:
             errors[idx] = exc
 
@@ -2353,12 +2767,31 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
 # ---------------------------------------------------------------------------
 # Map state
 # ---------------------------------------------------------------------------
+
+def _check_inline_map_fields(state_def, state_name, entered_event_id):
+    """Fail an Inline Map that has a field that only a Distributed Map supports.
+
+    AWS fails the execution when it enters such a Map, and a Catch or Retry on the Map does not handle the error.
+    So the state loops call this right after they write MapStateEntered, with that event's id for the cause text,
+    and not through the Map's _with_retry_and_catch.
+    """
+    processor = state_def.get("Iterator") or state_def.get("ItemProcessor", {})
+    if (processor.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return
+    if any(field in state_def for field in ("ItemReader", "ItemBatcher", "ResultWriter")):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"An error occurred while executing the state '{state_name}' (entered at the event id "
+            f"#{entered_event_id}). The ItemReader, ItemBatcher and ResultWriter fields are not supported for "
+            "INLINE maps")
+
 
 def _execute_map(state_def, raw_input, execution, ctx):
     return _with_retry_and_catch(
@@ -2370,9 +2803,12 @@ def _run_map_items(state_def, raw_input, execution, ctx):
     # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
     # is applied per item below -- and ItemsPath must resolve against the untransformed input
     effective = _apply_input_path(state_def, raw_input, ctx)
+    is_jsonata = _state_query_language(state_def, ctx) == "JSONata"
 
-    items_path = state_def.get("ItemsPath", "$")
-    items = _resolve_path_or_ctx(items_path, effective, ctx)
+    if is_jsonata and "Items" in state_def:
+        items = _jsonata_state_field(state_def, "Items", "array", raw_input, ctx)
+    else:
+        items = _resolve_path_or_ctx(state_def.get("ItemsPath", "$"), effective, ctx)
     if not isinstance(items, list):
         items = [items]
 
@@ -2380,6 +2816,10 @@ def _run_map_items(state_def, raw_input, execution, ctx):
     iter_states = iterator.get("States", {})
     iter_start = iterator.get("StartAt")
     max_conc = state_def.get("MaxConcurrency", 0)
+    if is_jsonata and "MaxConcurrency" in state_def:
+        max_conc = _jsonata_state_field(state_def, "MaxConcurrency", "number", raw_input, ctx)
+    if (iterator.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return _run_distributed_map(state_def, raw_input, effective, items, int(max_conc), iterator, execution, ctx)
 
     results = [None] * len(items)
     errors = [None] * len(items)
@@ -2389,10 +2829,15 @@ def _run_map_items(state_def, raw_input, execution, ctx):
             item_ctx = copy.deepcopy(ctx)
             item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
             item_params = state_def.get("ItemSelector") or state_def.get("Parameters")
-            # ItemSelector $ paths resolve against the Map state's effective input,
-            # not the individual item. $$.Map.Item.Value provides the item.
-            item_input = (_resolve_params_obj(item_params, effective, item_ctx)
-                          if item_params else item)
+            if not item_params:
+                item_input = item
+            elif is_jsonata:
+                # $states.context.Map.Item.Value provides the item.
+                item_input = _apply_jsonata_template(item_params, raw_input, item_ctx)
+            else:
+                # ItemSelector $ paths resolve against the Map state's effective input,
+                # not the individual item. $$.Map.Item.Value provides the item.
+                item_input = _resolve_params_obj(item_params, effective, item_ctx)
             results[idx] = _run_sub_machine(
                 iter_states, iter_start, item_input, execution, item_ctx)
         except Exception as exc:
@@ -2416,10 +2861,242 @@ def _run_map_items(state_def, raw_input, execution, ctx):
             raise err if isinstance(err, _ExecutionError) else _ExecutionError(
                 "States.MapFailed", str(err))
 
+    if is_jsonata:
+        output = _apply_jsonata_output(state_def, raw_input, ctx, result=results, default=results)
+        _apply_state_assign(state_def, raw_input, ctx, result=results)
+        return output, _next_or_end(state_def)
+
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
+
+
+_CSV_DELIMITERS = {"COMMA": ",", "PIPE": "|", "SEMICOLON": ";", "SPACE": " ", "TAB": "\t"}
+
+
+def _s3_object_text(bucket, key):
+    from ministack.services import s3
+
+    status, _headers, body = s3._get_object(bucket, key, {}, {})
+    if status != 200:
+        raise _ExecutionError("States.ItemReaderFailed", f"The specified key does not exist. (Bucket: {bucket}, Key: {key})")
+    return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+
+
+def _parse_reader_items(text, config):
+    """Items of a JSON, JSONL or CSV dataset, as the Distributed Map reads them."""
+    import csv
+    import io
+
+    input_type = config.get("InputType", "JSON")
+    if input_type == "JSONL":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    if input_type == "CSV":
+        rows = list(csv.reader(io.StringIO(text), delimiter=_CSV_DELIMITERS.get(config.get("CSVDelimiter", "COMMA"), ",")))
+        if config.get("CSVHeaderLocation") == "GIVEN":
+            headers = list(config.get("CSVHeaders") or [])
+        else:
+            headers, rows = (rows[0], rows[1:]) if rows else ([], [])
+        # Missing fields are empty strings and extra fields are dropped.
+        return [{h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)} for row in rows if row]
+    data = json.loads(text)
+    pointer = config.get("ItemsPointer")
+    if pointer:
+        for part in pointer.strip("/").split("/"):
+            data = data[int(part)] if isinstance(data, list) else data[part]
+    return data
+
+
+def _read_map_items(reader, effective, ctx):
+    from ministack.services import s3
+
+    params = _resolve_params_obj(reader.get("Parameters") or reader.get("Arguments") or {}, effective, ctx)
+    config = reader.get("ReaderConfig") or {}
+    resource = reader.get("Resource", "")
+    if resource.endswith("s3:listObjectsV2"):
+        bucket = s3._buckets.get(params.get("Bucket"))
+        if bucket is None:
+            raise _ExecutionError("States.ItemReaderFailed", f"The specified bucket does not exist. (Bucket: {params.get('Bucket')})")
+        prefix = params.get("Prefix", "")
+        items = []
+        for key in sorted(k for k in bucket["objects"] if k.startswith(prefix)):
+            obj = bucket["objects"][key]
+            if config.get("Transformation") == "LOAD_AND_FLATTEN":
+                items.extend(_parse_reader_items(_s3_object_text(params["Bucket"], key), config))
+                continue
+            items.append({"Etag": obj.get("etag", ""), "Key": key, "LastModified": _epoch_seconds(obj.get("last_modified")),
+                          "Size": obj.get("size", 0), "StorageClass": obj.get("storage_class") or "STANDARD"})
+    else:
+        items = _parse_reader_items(_s3_object_text(params.get("Bucket"), params.get("Key")), config)
+    max_items = config.get("MaxItems")
+    if config.get("MaxItemsPath"):
+        max_items = _resolve_path_or_ctx(config["MaxItemsPath"], effective, ctx)
+    return items[:int(max_items)] if max_items else items
+
+
+def _epoch_seconds(stamp):
+    from datetime import datetime
+
+    if isinstance(stamp, (int, float)):
+        return int(stamp)
+    try:
+        return int(datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def _run_distributed_map(state_def, raw_input, effective, items, max_conc, iterator, execution, ctx):
+    """Each item runs as a child workflow execution of a Map Run, which ListMapRuns, DescribeMapRun and
+    ListExecutions(mapRunArn) report."""
+    if state_def.get("ItemReader"):
+        items = _read_map_items(state_def["ItemReader"], effective, ctx)
+    if not isinstance(items, list):
+        items = [items]
+    is_jsonata = _state_query_language(state_def, ctx) == "JSONata"
+
+    parent_sm = execution["stateMachineArn"].split(":")
+    sm_name, region, account = parent_sm[6], parent_sm[3], parent_sm[4]
+    label = state_def.get("Label") or new_uuid()
+    child_sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{sm_name}/{label}"
+    map_run_arn = f"arn:aws:states:{region}:{account}:mapRun:{sm_name}/{label}:{new_uuid()}"
+    batcher = state_def.get("ItemBatcher")
+    item_selector = state_def.get("ItemSelector") or state_def.get("Parameters")
+    if batcher:
+        units = _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_jsonata)
+    else:
+        units = [(item, 1) for item in items]
+    tolerated_pct = float(state_def.get("ToleratedFailurePercentage") or 0)
+    tolerated_count = int(state_def.get("ToleratedFailureCount") or 0)
+    zero = {k: 0 for k in ("pending", "running", "succeeded", "failed", "timedOut", "aborted", "total", "resultsWritten",
+                          "failuresNotRedrivable", "pendingRedrive")}
+    run = {
+        "mapRunArn": map_run_arn, "executionArn": execution["executionArn"], "status": "RUNNING",
+        "startDate": now_iso(), "maxConcurrency": max_conc, "toleratedFailurePercentage": tolerated_pct,
+        "toleratedFailureCount": tolerated_count, "itemCounts": dict(zero, total=len(items), pending=len(items)),
+        "executionCounts": dict(zero, total=len(units), pending=len(units)), "redriveCount": 0,
+        "_stateMachineArn": child_sm_arn,
+    }
+    _map_runs[map_run_arn] = run
+    results = [None] * len(units)
+    failures = [None] * len(units)
+    lock = threading.Lock()
+
+    def run_child(idx, item, n_items):
+        if batcher:
+            # The item is a batch. A batched child's context has no Map key, as on AWS.
+            child_input, item_ctx = item, copy.deepcopy(ctx)
+        else:
+            child_input, item_ctx = _select_map_item(item_selector, idx, item, raw_input, effective, ctx, is_jsonata)
+        name = new_uuid()
+        child = {
+            "executionArn": f"arn:aws:states:{region}:{account}:execution:{sm_name}/{label}:{name}",
+            "stateMachineArn": child_sm_arn, "name": name, "status": "RUNNING", "startDate": now_iso(),
+            "stopDate": None, "input": json.dumps(child_input), "inputDetails": {"included": True}, "output": None,
+            "outputDetails": {"included": True}, "mapRunArn": map_run_arn, "events": [],
+            "testCase": execution.get("testCase"), "mockAttempts": {},
+        }
+        _executions[child["executionArn"]] = child
+        with lock:
+            for counts, n in ((run["itemCounts"], n_items), (run["executionCounts"], 1)):
+                counts["pending"] -= n
+                counts["running"] += n
+        try:
+            results[idx] = _run_sub_machine(iterator.get("States", {}), iterator.get("StartAt"),
+                                            child_input, child, item_ctx)
+            child.update(status="SUCCEEDED", output=json.dumps(results[idx]))
+            outcome = "succeeded"
+        except Exception as exc:
+            err = exc if isinstance(exc, _ExecutionError) else _ExecutionError("States.TaskFailed", str(exc))
+            failures[idx] = err
+            child.update(status="FAILED", error=err.error, cause=err.cause)
+            outcome = "failed"
+        child["stopDate"] = now_iso()
+        with lock:
+            for counts, n in ((run["itemCounts"], n_items), (run["executionCounts"], 1)):
+                counts["running"] -= n
+                counts[outcome] += n
+
+    workers = max_conc if max_conc > 0 else (min(len(units), 64) or 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures_wait([pool.submit(contextvars.copy_context().run, run_child, i, unit, n)
+                      for i, (unit, n) in enumerate(units)])
+
+    # A failed batch counts all of its items as failed, as on AWS.
+    failed = sum(units[i][1] for i, f in enumerate(failures) if f is not None)
+    limits = []
+    if "ToleratedFailureCount" in state_def:
+        limits.append(failed > tolerated_count)
+    if "ToleratedFailurePercentage" in state_def:
+        limits.append(failed * 100 > tolerated_pct * len(items))
+    # With no threshold set, any failed item fails the Map Run.
+    exceeded = bool(failed) and (any(limits) if limits else True)
+    run["status"] = "FAILED" if exceeded else "SUCCEEDED"
+    run["stopDate"] = now_iso()
+    if exceeded:
+        raise _ExecutionError("States.ExceedToleratedFailureThreshold",
+                              "The specified tolerated failure threshold was exceeded")
+    if is_jsonata:
+        output = _apply_jsonata_output(state_def, raw_input, ctx, result=results, default=results)
+        _apply_state_assign(state_def, raw_input, ctx, result=results)
+        return output, _next_or_end(state_def)
+    result = _apply_result_selector(state_def, results)
+    output = _apply_result_path(state_def, raw_input, result)
+    output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
+    return output, _next_or_end(state_def)
+
+
+def _select_map_item(item_selector, idx, item, raw_input, effective, ctx, is_jsonata):
+    """The child input for one Map item, and the context with $$.Map.Item that the ItemSelector reads."""
+    item_ctx = copy.deepcopy(ctx)
+    item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
+    if not item_selector:
+        return item, item_ctx
+    if is_jsonata:
+        return _apply_jsonata_template(item_selector, raw_input, item_ctx), item_ctx
+    return _resolve_params_obj(item_selector, effective, item_ctx), item_ctx
+
+
+def _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_jsonata):
+    """The ItemBatcher batches in item order, each as (child input, number of items). A batch ends at
+    MaxItemsPerBatch items, or before the compact UTF-8 JSON of the child input passes MaxInputBytesPerBatch."""
+    selected = [_select_map_item(item_selector, i, item, raw_input, effective, ctx, is_jsonata)[0]
+                for i, item in enumerate(items)]
+    max_items = _item_batcher_limit(batcher, "MaxItemsPerBatch", raw_input, effective, ctx, is_jsonata)
+    # Without a byte limit a batch still stops at 256 KiB (AWS ItemBatcher doc).
+    max_bytes = _item_batcher_limit(batcher, "MaxInputBytesPerBatch", raw_input, effective, ctx, is_jsonata) or 262144
+    envelope = {}
+    if "BatchInput" in batcher:
+        envelope["BatchInput"] = (_apply_jsonata_template(batcher["BatchInput"], raw_input, ctx) if is_jsonata
+                                  else _resolve_params_obj(batcher["BatchInput"], effective, ctx))
+    base = _json_bytes({**envelope, "Items": []})
+    batches, current, size = [], [], base
+    for item in selected:
+        item_size = _json_bytes(item)
+        new_size = size + item_size + (1 if current else 0)
+        if current and ((max_items and len(current) == max_items) or (max_bytes and new_size > max_bytes)):
+            batches.append(current)
+            current, new_size = [], base + item_size
+        current.append(item)
+        size = new_size
+    if current:
+        batches.append(current)
+    return [({**envelope, "Items": batch}, len(batch)) for batch in batches]
+
+
+def _item_batcher_limit(batcher, field, raw_input, effective, ctx, is_jsonata):
+    """An ItemBatcher limit from a JSONata expression, a <field>Path, or a value. None when it is not set."""
+    if is_jsonata and field in batcher:
+        return _jsonata_state_field(batcher, field, "number", raw_input, ctx)
+    if f"{field}Path" in batcher:
+        return _resolve_path_or_ctx(batcher[f"{field}Path"], effective, ctx)
+    return batcher.get(field)
+
+
+def _json_bytes(value):
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -2430,7 +3107,8 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
     current_name = start_at
     current_input = copy.deepcopy(input_data)
 
-    while current_name:
+    # A stopped execution starts no more states in a Map or Parallel branch, as on AWS.
+    while current_name and execution["status"] == "RUNNING":
         state_def = states.get(current_name)
         if not state_def:
             raise _ExecutionError(
@@ -2439,9 +3117,25 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
         state_type = state_def.get("Type")
         ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
+        entered = _add_event(execution, f"{state_type}StateEntered", {
+            "stateEnteredEventDetails": {
+                "name": current_name,
+                "input": json.dumps(current_input),
+            },
+        })
+        if state_type == "Map":
+            _check_inline_map_fields(state_def, current_name, entered["id"])
+
         if state_type == "Succeed":
-            return _apply_output_path(state_def,
-                                      _apply_input_path(state_def, current_input, ctx), ctx)
+            current_input = _apply_input_path(state_def, current_input, ctx)
+            current_input = _apply_output_path(state_def, current_input, ctx)
+            _add_event(execution, "SucceedStateExited", {
+                "stateExitedEventDetails": {
+                    "name": current_name,
+                    "output": json.dumps(current_input),
+                },
+            })
+            return current_input
         if state_type == "Fail":
             raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
@@ -2459,11 +3153,25 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"Unknown state type: {state_type}")
 
         if state_type in ("Task", "Parallel", "Map"):
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, execution, ctx)
+        elif state_type == "Wait":
+            current_input, next_name = handler_fn(
+                state_def, current_input, ctx, execution=execution)
         else:
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, ctx)
+
+        if execution["status"] != "RUNNING":
+            break
+
+        _add_event(execution, f"{state_type}StateExited", {
+            "stateExitedEventDetails": {
+                "name": current_name,
+                "output": json.dumps(current_input),
+            },
+        })
+        current_name = next_name
 
     return current_input
 
@@ -2549,7 +3257,7 @@ def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_out
 
 
 def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=None):
-    """Evaluate a state's `Assign` field (JSONata only) and merge results
+    """Evaluate a state's JSONPath or JSONata `Assign` field and merge results
     into ``ctx['variables']`` so later JSONata expressions can reference them
     as ``$name``. Variables are execution-scoped per AWS.
 
@@ -2558,17 +3266,23 @@ def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=Non
     """
     if ctx is None:
         return
-    if _state_query_language(state_def, ctx) != "JSONata":
-        return
     assign = state_def.get("Assign")
     if not isinstance(assign, dict):
         return
     variables = ctx.setdefault("variables", {})
-    for name, template in assign.items():
-        variables[name] = _apply_jsonata_template(
-            template, raw_input, ctx,
-            result=result, error_output=error_output,
-        )
+    if _state_query_language(state_def, ctx) == "JSONata":
+        assigned = {
+            name: _apply_jsonata_template(template, raw_input, ctx,
+                                          result=result, error_output=error_output)
+            for name, template in assign.items()
+        }
+    else:
+        data = result if state_def.get("Type") in ("Task", "Pass", "Map", "Parallel") else raw_input
+        if error_output is not None:
+            data = error_output
+        assigned = _resolve_params_obj(assign, data, ctx)
+    # All expressions see state-entry values, including assignments to peers.
+    variables.update(copy.deepcopy(assigned))
 
 
 def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
@@ -2642,13 +3356,17 @@ def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output
     # is the reserved variable. The document is left unset (None) so bare paths
     # do not resolve against the state input, which AWS reaches only via
     # `$states.input`.
-    bindings = dict(ctx.get("variables", {}))
-    bindings["states"] = states
     if jsonata is None:
         raise _ExecutionError(
             "States.QueryEvaluationError",
             "JSONata support requires the jsonata-python package, which is "
             "not installed in this build")
+    # jsonata-python reads a None binding as undefined, so a null variable uses its NULL_VALUE sentinel.
+    bindings = {
+        name: jsonata.utils.Utils.NULL_VALUE if value is None else value
+        for name, value in ctx.get("variables", {}).items()
+    }
+    bindings["states"] = states
     try:
         expr = jsonata.Jsonata.jsonata(expression, timeout=1000)
         _register_sfn_jsonata_functions(expr)
@@ -3027,7 +3745,7 @@ def _eval_intrinsic_arg(arg, data, ctx):
         path = arg[1]
         if path.startswith("$$."):
             return _resolve_ctx_path(path, ctx or {})
-        return _resolve_path(path, data)
+        return _resolve_path_or_ctx(path, data, ctx)
     elif kind == "call":
         return _exec_intrinsic(arg, data, ctx)
     return None
@@ -3166,7 +3884,7 @@ def _resolve_params_obj(template, data, ctx=None):
                 elif value.startswith("$$."):
                     result[real_key] = _resolve_ctx_path(value, ctx or {})
                 else:
-                    result[real_key] = _resolve_path(value, data)
+                    result[real_key] = _resolve_path_or_ctx(value, data, ctx)
             else:
                 result[real_key] = value
         elif isinstance(value, dict):
@@ -3217,6 +3935,19 @@ def _find_matching_catcher(catchers, error):
         if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
+
+
+def _apply_catcher(catcher, raw_input, ctx, query_language, error_output):
+    """Build a caught error's output and apply the catcher's Assign."""
+    if query_language == "JSONata" and "Output" in catcher:
+        output = _apply_jsonata_output(catcher, raw_input, ctx, error_output=error_output, default=error_output)
+    else:
+        output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+    if query_language == "JSONata":
+        # Catch handlers can also carry `Assign`. `$states.errorOutput`
+        # is available here; `$states.result` is not (per AWS).
+        _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+    return output
 
 
 # ===================================================================
@@ -3391,8 +4122,9 @@ def _invoke_nested_start_execution_sync(resource, input_data):
         )
 
     if payload.get("status") != "SUCCEEDED":
-        error, cause = _nested_execution_failure(payload)
-        raise _ExecutionError(error, cause)
+        # The response has no error or cause for a stopped child, so read its record.
+        child = _executions.get(payload.get("executionArn")) or payload
+        raise _ExecutionError(*_nested_execution_failure(child))
 
     output_value = payload.get("output") or "{}"
     if resource.endswith(".sync:2") and isinstance(output_value, str):
@@ -3436,19 +4168,31 @@ def _nested_start_execution_request(input_data):
     return request
 
 
-def _nested_execution_failure(payload):
-    output = payload.get("output")
-    if isinstance(output, str):
-        try:
-            decoded = json.loads(output)
-        except json.JSONDecodeError:
-            decoded = None
-        if isinstance(decoded, dict) and decoded.get("Error"):
-            return decoded["Error"], decoded.get("Cause", "")
+def _nested_execution_failure(child):
+    """Return the error and cause that a .sync parent Task fails with when its child doesn't succeed.
 
-    execution_arn = payload.get("executionArn", "")
-    status = payload.get("status", "FAILED")
-    return "States.TaskFailed", f"Nested execution {execution_arn} ended with status {status}"
+    AWS always uses States.TaskFailed. The cause is the child's DescribeExecution
+    response as compact JSON with sorted keys.
+    """
+    describe = {
+        "ExecutionArn": child.get("executionArn"),
+        "Input": child.get("input", "{}"),
+        "InputDetails": {"Included": True},
+        "Name": child.get("name"),
+        "RedriveCount": 0,
+        # AWS reported REDRIVABLE for a FAILED, TIMED_OUT and ABORTED child.
+        "RedriveStatus": "REDRIVABLE",
+        "StartDate": _iso_to_epoch_ms(child.get("startDate")),
+        "StateMachineArn": child.get("stateMachineArn"),
+        "Status": child.get("status"),
+        "StopDate": _iso_to_epoch_ms(child.get("stopDate")),
+    }
+    # AWS leaves out both keys for a timed-out child, which has no error or cause.
+    if child.get("error"):
+        describe["Error"] = child["error"]
+    if child.get("cause"):
+        describe["Cause"] = child["cause"]
+    return "States.TaskFailed", json.dumps(describe, separators=(",", ":"), sort_keys=True)
 
 
 def _invoke_sqs_send_message(resource, input_data):
@@ -3537,9 +4281,45 @@ def _invoke_ecs_run_task(resource, input_data):
     if is_sync and result.get("tasks"):
         task_arns = [t["taskArn"] for t in result["tasks"]]
         cluster = ecs_data.get("cluster", "default")
-        result = _poll_ecs_tasks(cluster, task_arns)
+        task = _poll_ecs_tasks(cluster, task_arns)["tasks"][0]
+        # As on AWS, the state's result (or its failure's cause) is the stopped task itself.
+        document = _ecs_task_document(task)
+        if _ecs_task_failed(cluster, task):
+            raise _ExecutionError("States.TaskFailed", json.dumps(document))
+        return document
 
     return result
+
+
+def _ecs_task_failed(cluster, task):
+    """Whether a stopped task failed: an essential container exited non-zero, or none exited (it never started)."""
+    from ministack.services import ecs
+
+    stored = ecs._resolve_task(task.get("taskArn", ""), ecs._resolve_cluster_name(cluster) or cluster) or {}
+    essentials = stored.get("_container_essentials") or []
+    exits = [c.get("exitCode") for i, c in enumerate(task.get("containers", []))
+             if (essentials[i] if i < len(essentials) else True)]
+    return not any(code is not None for code in exits) or any(code not in (None, 0) for code in exits)
+
+
+def _ecs_task_document(task):
+    """An ECS task as the optimized integration reports it: PascalCase keys, epoch-millisecond timestamps."""
+    from ministack.services import ecs
+
+    def millis(value):
+        if isinstance(value, str):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+        return int(value * 1000) if isinstance(value, (int, float)) else value
+
+    def convert(value):
+        if isinstance(value, list):
+            return [convert(v) for v in value]
+        if not isinstance(value, dict):
+            return value
+        return {(k[:1].upper() + k[1:]): (millis(v) if k in ecs._ECS_TIMESTAMP_FIELDS else convert(v))
+                for k, v in value.items()}
+
+    return convert(task)
 
 
 def _poll_ecs_tasks(cluster, task_arns):
@@ -3558,6 +4338,32 @@ def _poll_ecs_tasks(cluster, task_arns):
         if tasks and all(t.get("lastStatus") == "STOPPED" for t in tasks):
             return result
     raise _ExecutionError("States.Timeout", "ECS tasks did not complete in time")
+
+
+def _invoke_glue_start_job_run(resource, input_data):
+    """arn:aws:states:::glue:startJobRun[.sync]"""
+    result = _dispatch_aws_sdk_json(_AWS_SDK_SERVICE_MAP["glue"], "glue", "startJobRun", input_data)
+    if resource.rstrip("/").endswith(".sync"):
+        return _poll_glue_job_run(input_data["JobName"], result["JobRunId"])
+    # Step Functions adds the request's JobName to the StartJobRun response.
+    return {"JobName": input_data["JobName"], **result}
+
+
+def _poll_glue_job_run(job_name, run_id):
+    """Poll GetJobRun until the run ends. A run that does not succeed fails the task."""
+    while True:
+        # Not scaled: SFN_WAIT_SCALE=0 would turn the poll into a busy loop.
+        time.sleep(1)
+        job_run = _dispatch_aws_sdk_json(
+            _AWS_SDK_SERVICE_MAP["glue"], "glue", "getJobRun", {"JobName": job_name, "RunId": run_id})["JobRun"]
+        # The optimized integration gives timestamps as epoch milliseconds, not the aws-sdk ISO strings.
+        for field in ("StartedOn", "LastModifiedOn", "CompletedOn"):
+            if field in job_run:
+                job_run[field] = int(datetime.fromisoformat(job_run[field].replace("Z", "+00:00")).timestamp() * 1000)
+        if job_run["JobRunState"] == "SUCCEEDED":
+            return job_run
+        if job_run["JobRunState"] in ("FAILED", "ERROR", "TIMEOUT", "STOPPED"):
+            raise _ExecutionError("States.TaskFailed", json.dumps(job_run))
 
 
 def _pascal_to_camel(d):
@@ -3616,6 +4422,7 @@ _AWS_SDK_SERVICE_MAP = {
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
     "route53": {"protocol": "rest-xml", "service_key": "route53"},
     "lambda": {"protocol": "rest"},
+    "scheduler": {"protocol": "rest"},
 }
 
 # Map lowercase service names used in aws-sdk ARNs to the PascalCase prefix
@@ -3646,6 +4453,7 @@ _AWS_SDK_ERROR_PREFIX = {
     "rdsdata": "RdsData",
     "s3": "S3",
     "lambda": "Lambda",
+    "scheduler": "Scheduler",
 }
 
 _AWS_SDK_ERROR_CODE_OVERRIDES = {
@@ -4222,12 +5030,14 @@ _EC2_FIELDS_BY_PARENT = {
     ("ipPermissionsEgress", "groups"): "UserIdGroupPairs",
     ("productCodes", "productCode"): "ProductCodeId",
     ("productCodes", "type"): "ProductCodeType",
+    ("snapshotSet", "status"): "State",
     ("volumeSet", "status"): "State",
 }
 
 # EC2 reuses some names depending on action. Special case for flattening
 _EC2_FIELDS_BY_ACTION = {
     ("AttachVolume", "status"): "State",
+    ("CreateSnapshot", "status"): "State",
     ("CreateVolume", "status"): "State",
     ("DetachVolume", "status"): "State",
     ("StartInstances", "instancesSet"): "StartingInstances",
@@ -4634,6 +5444,147 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         if "Variables" in environment:
             output["Configuration"]["Environment"]["Variables"] = environment["Variables"]
     return output
+
+
+# EventBridge Scheduler REST routes: action -> (method, path, {member: querystring}).
+# The other members go in the JSON body for POST/PUT. Task output keeps the
+# Scheduler member names unchanged.
+_SCHEDULER_ROUTES = {
+    "CreateSchedule": ("POST", "/schedules/{Name}", {}),
+    "GetSchedule": ("GET", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "UpdateSchedule": ("PUT", "/schedules/{Name}", {}),
+    "DeleteSchedule": ("DELETE", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "ListSchedules": ("GET", "/schedules", {
+        "GroupName": "ScheduleGroup", "NamePrefix": "NamePrefix", "State": "State"}),
+    "CreateScheduleGroup": ("POST", "/schedule-groups/{Name}", {}),
+    "GetScheduleGroup": ("GET", "/schedule-groups/{Name}", {}),
+    "DeleteScheduleGroup": ("DELETE", "/schedule-groups/{Name}", {}),
+    "ListScheduleGroups": ("GET", "/schedule-groups", {"NamePrefix": "NamePrefix"}),
+}
+
+_SCHEDULER_TIMESTAMPS = ("CreationDate", "LastModificationDate", "StartDate", "EndDate")
+
+
+def _scheduler_timestamp_out(value):
+    """Epoch seconds as the ISO-8601 UTC string a task outputs (milliseconds only when non-zero)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    try:
+        millis = int(round(value * 1000))
+        text = datetime.fromtimestamp(millis // 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        # A number from Parameters outside the datetime range is shown as it was stored.
+        return value
+    if millis % 1000:
+        text += f".{millis % 1000:03d}"
+    return text + "Z"
+
+
+_SCHEDULER_TIMESTAMP_IN = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:[0-5]\d)")
+
+
+def _scheduler_timestamp_in(value):
+    """An ISO-8601 timestamp string from Parameters as epoch seconds, cut to milliseconds."""
+    match = _SCHEDULER_TIMESTAMP_IN.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        return value
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    offset = timedelta(0)
+    if zone != "Z":
+        offset = timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6])) * (1 if zone[0] == "+" else -1)
+    try:
+        # An impossible date, an offset of a day or more, or an instant outside
+        # years 1-9999 in UTC is left for Scheduler.
+        parsed = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second),
+                          tzinfo=timezone(offset)).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return value
+    millis = int((fraction or "").ljust(3, "0")[:3])
+    return int(parsed.timestamp()) + millis / 1000
+
+
+def _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data):
+    """Dispatch the EventBridge Scheduler REST aws-sdk calls."""
+    from urllib.parse import quote
+
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+    route = _SCHEDULER_ROUTES.get(pascal_action)
+    if route is None:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
+            "(scheduler dispatcher covers createSchedule, getSchedule, updateSchedule, "
+            "deleteSchedule, listSchedules, createScheduleGroup, getScheduleGroup, "
+            "deleteScheduleGroup, and listScheduleGroups)",
+        )
+    method, path, query_members = route
+
+    members = dict(input_data or {})
+    if "{Name}" in path:
+        path = path.replace("{Name}", quote(str(members.pop("Name", "")), safe=""))
+    query_params = {
+        wire: str(members.pop(member))
+        for member, wire in query_members.items()
+        if member in members
+    }
+    for member in ("StartDate", "EndDate"):
+        if member in members:
+            members[member] = _scheduler_timestamp_in(members[member])
+    target = members.get("Target")
+    if isinstance(target, dict) and isinstance(target.get("Input"), (dict, list)):
+        # Target.Input is a string member; a JSON object or array is sent as compact JSON text.
+        members["Target"] = {**target, "Input": json.dumps(
+            target["Input"], separators=(",", ":"), ensure_ascii=False)}
+    body = json.dumps(members).encode("utf-8") if method in ("POST", "PUT") else b""
+
+    # Same account and region as the execution; see _dispatch_aws_sdk_lambda_rest.
+    caller_account = get_account_id()
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential={caller_account}/20260101/"
+            f"{get_region()}/{service_key}/aws4_request"
+        ),
+    }
+
+    status, _resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_params)
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("__type") or "ServiceException"
+            msg = err_data.get("Message") or decoded
+        except Exception:
+            code, msg = "ServiceException", decoded
+        raise _ExecutionError(
+            _prefix_sdk_error(service_name, code),
+            f"{msg} (Service: Scheduler, Status Code: {status}, Request ID: {new_uuid()}) "
+            "(SDK Attempt Count: 1)",
+        )
+
+    result = json.loads(decoded) if decoded else {}
+    records = [result]
+    for list_key in ("Schedules", "ScheduleGroups"):
+        records.extend(result.get(list_key) or [])
+    for record in records:
+        for member in _SCHEDULER_TIMESTAMPS:
+            if member in record:
+                record[member] = _scheduler_timestamp_out(record[member])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -5051,6 +6002,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data)
     elif protocol == "rest" and service_name == "lambda":
         return _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data)
+    elif protocol == "rest" and service_name == "scheduler":
+        return _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",
@@ -5095,6 +6048,7 @@ _SERVICE_DISPATCH = {
         "updateItem", d
     ),
     "arn:aws:states:::ecs:runTask": _invoke_ecs_run_task,
+    "arn:aws:states:::glue:startJobRun": _invoke_glue_start_job_run,
 }
 
 
@@ -5109,6 +6063,7 @@ def reset():
     _activity_tasks.clear()
     _state_machine_versions.clear()
     _state_machine_aliases.clear()
+    _map_runs.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -5169,6 +6124,8 @@ def _publish_state_machine_version(data):
         "type": sm.get("type", "STANDARD"),
         "loggingConfiguration": copy.deepcopy(
             sm.get("loggingConfiguration", {"level": "OFF"})),
+        "encryptionConfiguration": copy.deepcopy(
+            sm.get("encryptionConfiguration") or _default_encryption()),
     }
     return json_response({
         "stateMachineVersionArn": version_arn,
@@ -5217,10 +6174,7 @@ def _list_state_machine_versions(data):
     # AWS returns versions in descending creationDate order (newest first).
     matching.sort(key=lambda v: v["creationDate"], reverse=True)
 
-    max_results = data.get("maxResults") or len(matching)
-    return json_response({
-        "stateMachineVersions": matching[:max_results],
-    })
+    return _offset_page(data, "stateMachineVersions", matching)
 
 
 # ---------------------------------------------------------------------------
@@ -5416,7 +6370,4 @@ def _list_state_machine_aliases(data):
         })
     matching.sort(key=lambda a: a["creationDate"], reverse=True)
 
-    max_results = data.get("maxResults") or len(matching)
-    return json_response({
-        "stateMachineAliases": matching[:max_results],
-    })
+    return _offset_page(data, "stateMachineAliases", matching)

@@ -17,6 +17,11 @@ IAM actions:
   AttachUserPolicy, DetachUserPolicy, ListAttachedUserPolicies,
   PutUserPolicy, GetUserPolicy, DeleteUserPolicy, ListUserPolicies,
   CreateAccessKey, ListAccessKeys, DeleteAccessKey, UpdateAccessKey, GetAccessKeyLastUsed,
+  CreateServiceSpecificCredential, ListServiceSpecificCredentials,
+  UpdateServiceSpecificCredential, ResetServiceSpecificCredential,
+  DeleteServiceSpecificCredential,
+  UploadServerCertificate, ListServerCertificates, GetServerCertificate,
+  UpdateServerCertificate, DeleteServerCertificate, ListServerCertificateTags,
   CreateInstanceProfile, DeleteInstanceProfile, GetInstanceProfile,
   AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile,
   ListInstanceProfiles, ListInstanceProfilesForRole,
@@ -35,6 +40,7 @@ IAM actions:
 """
 
 import base64
+import binascii
 import copy
 import json
 import logging
@@ -47,6 +53,7 @@ from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.router import extract_access_key_id
 
 logger = logging.getLogger("iam")
 
@@ -73,6 +80,8 @@ _login_profiles = AccountScopedDict()
 _credential_reports = AccountScopedDict()
 _account_password_policy = AccountScopedDict()
 _account_aliases = AccountScopedDict()
+_service_specific_credentials = AccountScopedDict()
+_server_certificates = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -224,6 +233,9 @@ def _seed_aws_managed_policies() -> None:
         # A path-less spelling of them does not exist on AWS and answers
         # NoSuchEntity here too; the one-line fix for a template written
         # against the old seeds is to attach the real service-role/ ARN.
+        ('aws-service-role/AWSECRPullThroughCache_ServiceRolePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"ECR","Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:InitiateLayerUpload","ecr:UploadLayerPart","ecr:CompleteLayerUpload","ecr:PutImage","ecr:BatchGetImage","ecr:BatchImportUpstreamImage","ecr:GetDownloadUrlForLayer","ecr:GetImageCopyStatus"],"Resource":"*","Condition":{"StringEquals":{"aws:ResourceAccount":"${aws:PrincipalAccount}"}}},{"Sid":"SecretsManager","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:*:*:secret:ecr-pullthroughcache/*","Condition":{"StringEquals":{"aws:ResourceAccount":"${aws:PrincipalAccount}"}}}]}',
+         "Enables access to AWS services and resources used or managed by AWS ECR pull through cache"),
         ('service-role/AWSLambdaBasicExecutionRole',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
          "Provides write permissions to CloudWatch Logs."),
@@ -360,6 +372,8 @@ def get_state():
         "credential_reports": copy.deepcopy(_credential_reports),
         "account_password_policy": copy.deepcopy(_account_password_policy),
         "account_aliases": copy.deepcopy(_account_aliases),
+        "service_specific_credentials": copy.deepcopy(_service_specific_credentials),
+        "server_certificates": copy.deepcopy(_server_certificates),
     }
 
 
@@ -387,6 +401,8 @@ def _restore_state(data):
         _credential_reports.update(data.get("credential_reports", {}))
         _account_password_policy.update(data.get("account_password_policy", {}))
         _account_aliases.update(data.get("account_aliases", {}))
+        _service_specific_credentials.update(data.get("service_specific_credentials", {}))
+        _server_certificates.update(data.get("server_certificates", {}))
 
 
 
@@ -413,6 +429,13 @@ async def handle_request(method, path, headers, body, query_params):
     elif method == "POST" and body:
         for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
             params[k] = v
+
+    # Some ops (the ServiceSpecificCredential family) let an IAM user omit
+    # UserName, which AWS then takes from the caller. The caller's access key
+    # resolves it here; non-user callers get AWS's InvalidInput at the op.
+    access_key = extract_access_key_id(headers, query_params)
+    # Always set, so a request cannot supply its own _caller_user.
+    params["_caller_user"] = _access_keys.get(access_key, {}).get("UserName", "") if access_key else ""
 
     action = _p(params, "Action")
     handler = _IAM_HANDLERS.get(action)
@@ -472,14 +495,15 @@ def _get_user(p):
 
 def _list_users(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
+    members = list(
         f"<member>{_user_xml(n, boundary=False)}</member>"
         for n, u in _users.items()
         if u.get("Path", "/").startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListUsersResponse",
                 f"<ListUsersResult><Users>{members}</Users>"
-                "<IsTruncated>false</IsTruncated></ListUsersResult>",
+                f"{tail}</ListUsersResult>",
                 ns="iam")
 
 
@@ -557,6 +581,26 @@ def _validate_role_description(description):
     return None
 
 
+def _trust_policy_not_principal_error(doc):
+    """IAM's message refusing a role trust policy that carries NotPrincipal, or None."""
+    if isinstance(doc, str):
+        try:
+            doc = json.loads(doc)
+        except ValueError:
+            return None
+    statements = doc.get("Statement") if isinstance(doc, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return None
+    flagged = [s for s in statements if isinstance(s, dict) and "NotPrincipal" in s]
+    if any(s.get("Effect") == "Allow" for s in flagged):
+        return "Allow with NotPrincipal is not allowed."
+    if flagged:
+        return "AssumeRole policy must not contain NotPrincipal field."
+    return None
+
+
 def _create_role(p):
     name = _p(p, "RoleName")
     description = _p(p, "Description")
@@ -566,6 +610,9 @@ def _create_role(p):
     if name in _roles:
         return _error(409, "EntityAlreadyExists",
                       f"Role with name {name} already exists.", ns="iam")
+    trust_err = _trust_policy_not_principal_error(_p(p, "AssumeRolePolicyDocument"))
+    if trust_err:
+        return _error(400, "MalformedPolicyDocument", trust_err, ns="iam")
     boundary_err = _p(p, "PermissionsBoundary") and _boundary_policy_error(_p(p, "PermissionsBoundary"))
     if boundary_err:
         return boundary_err
@@ -604,14 +651,15 @@ def _get_role(p):
 
 def _list_roles(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
+    members = list(
         f"<member>{_role_xml(n, boundary=False)}</member>"
         for n, r in _roles.items()
         if r.get("Path", "/").startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListRolesResponse",
                 f"<ListRolesResult><Roles>{members}</Roles>"
-                "<IsTruncated>false</IsTruncated></ListRolesResult>",
+                f"{tail}</ListRolesResult>",
                 ns="iam")
 
 
@@ -656,6 +704,9 @@ def _update_assume_role_policy(p):
     if name not in _roles:
         return _error(404, "NoSuchEntity",
                       f"Role {name} not found.", ns="iam")
+    trust_err = _trust_policy_not_principal_error(_p(p, "PolicyDocument"))
+    if trust_err:
+        return _error(400, "MalformedPolicyDocument", trust_err, ns="iam")
     _roles[name]["AssumeRolePolicyDocument"] = _p(p, "PolicyDocument")
     return _xml(200, "UpdateAssumeRolePolicyResponse", "", ns="iam")
 
@@ -837,15 +888,16 @@ def _list_policy_versions(p):
     pol = _lookup_policy(arn)
     if not pol:
         return _error(404, "NoSuchEntity", "Policy not found.", ns="iam")
-    members = ""
+    members = []
     for vid, ver in pol["Versions"].items():
         is_default = "true" if ver.get("IsDefaultVersion") else "false"
-        members += (f"<member><VersionId>{vid}</VersionId>"
+        members.append(f"<member><VersionId>{vid}</VersionId>"
                     f"<IsDefaultVersion>{is_default}</IsDefaultVersion>"
                     f"<CreateDate>{ver['CreateDate']}</CreateDate></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListPolicyVersionsResponse",
                 f"<ListPolicyVersionsResult><Versions>{members}</Versions>"
-                "<IsTruncated>false</IsTruncated></ListPolicyVersionsResult>",
+                f"{tail}</ListPolicyVersionsResult>",
                 ns="iam")
 
 
@@ -914,23 +966,24 @@ def _delete_policy_version(p):
 def _list_policies(p):
     scope = _p(p, "Scope") or "All"
     prefix = _p(p, "PathPrefix") or "/"
-    members = ""
+    members = []
     usage_counts = _boundary_usage_counts()
     # Customer-managed policies — always returned unless scope == "AWS".
     if scope != "AWS":
         for arn, pol in _policies.items():
             if not pol.get("Path", "/").startswith(prefix):
                 continue
-            members += f"<member>{_managed_policy_xml(arn, usage_counts)}</member>"
+            members.append(f"<member>{_managed_policy_xml(arn, usage_counts)}</member>")
     # AWS-managed policies — returned for scope "All" or "AWS".
     if scope != "Local":
         for arn, pol in _aws_managed_policies.items():
             if not pol.get("Path", "/").startswith(prefix):
                 continue
-            members += f"<member>{_managed_policy_xml(arn, usage_counts)}</member>"
+            members.append(f"<member>{_managed_policy_xml(arn, usage_counts)}</member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListPoliciesResponse",
                 f"<ListPoliciesResult><Policies>{members}</Policies>"
-                "<IsTruncated>false</IsTruncated></ListPoliciesResult>",
+                f"{tail}</ListPoliciesResult>",
                 ns="iam")
 
 
@@ -964,44 +1017,51 @@ def _list_entities_for_policy(p):
         return ((usage_filter != "PermissionsBoundary" and arn in entity.get("AttachedPolicies", []))
                 or (usage_filter != "PermissionsPolicy" and entity.get("PermissionsBoundary") == arn))
 
-    groups_xml = ""
+    groups_xml = []
     if entity_filter in ("", "Group"):
         for g in _groups.values():
             if not g.get("Path", "/").startswith(path_prefix):
                 continue
             if uses(g):
-                groups_xml += (f"<member><GroupName>{g['GroupName']}</GroupName>"
+                groups_xml.append(f"<member><GroupName>{g['GroupName']}</GroupName>"
                                f"<GroupId>{g['GroupId']}</GroupId></member>")
 
-    roles_xml = ""
+    roles_xml = []
     if entity_filter in ("", "Role"):
         for r in _roles.values():
             if not r.get("Path", "/").startswith(path_prefix):
                 continue
             if uses(r):
-                roles_xml += (f"<member><RoleName>{r['RoleName']}</RoleName>"
+                roles_xml.append(f"<member><RoleName>{r['RoleName']}</RoleName>"
                               f"<RoleId>{r['RoleId']}</RoleId></member>")
 
-    users_xml = ""
+    users_xml = []
     if entity_filter in ("", "User"):
         for u in _users.values():
             if not u.get("Path", "/").startswith(path_prefix):
                 continue
             if uses(u):
-                users_xml += (f"<member><UserName>{u['UserName']}</UserName>"
+                users_xml.append(f"<member><UserName>{u['UserName']}</UserName>"
                               f"<UserId>{u['UserId']}</UserId></member>")
 
+    groups_xml, roles_xml, users_xml, tail = _iam_page(p, groups_xml, roles_xml, users_xml)
     return _xml(200, "ListEntitiesForPolicyResponse",
                 f"<ListEntitiesForPolicyResult>"
                 f"<PolicyGroups>{groups_xml}</PolicyGroups>"
                 f"<PolicyRoles>{roles_xml}</PolicyRoles>"
                 f"<PolicyUsers>{users_xml}</PolicyUsers>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</ListEntitiesForPolicyResult>",
                 ns="iam")
 
 
 # -------------------- Attached role policies --------------------
+
+def _unattachable_policy_error(policy_arn: str):
+    if _is_aws_managed_arn(policy_arn) or policy_arn in _policies:
+        return None
+    return _error(404, "NoSuchEntity", f"Policy {policy_arn} does not exist or is not attachable.", ns="iam")
+
 
 def attach_managed_policy(entity: dict, policy_arn: str) -> None:
     """Attach a managed policy to a role, user or group record.
@@ -1047,6 +1107,8 @@ def _attach_role_policy(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     attach_managed_policy(role, policy_arn)
     return _xml(200, "AttachRolePolicyResponse", "", ns="iam")
 
@@ -1077,15 +1139,16 @@ def _list_attached_role_policies(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = ""
+    members = []
     for arn in role["AttachedPolicies"]:
         pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
-        members += (f"<member><PolicyName>{pname}</PolicyName>"
+        members.append(f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAttachedRolePoliciesResponse",
                 f"<ListAttachedRolePoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
-                "<IsTruncated>false</IsTruncated></ListAttachedRolePoliciesResult>",
+                f"{tail}</ListAttachedRolePoliciesResult>",
                 ns="iam")
 
 
@@ -1157,13 +1220,14 @@ def _list_role_policies(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{name}</member>"
         for name in role["InlinePolicies"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListRolePoliciesResponse",
                 f"<ListRolePoliciesResult><PolicyNames>{members}</PolicyNames>"
-                "<IsTruncated>false</IsTruncated></ListRolePoliciesResult>",
+                f"{tail}</ListRolePoliciesResult>",
                 ns="iam")
 
 
@@ -1176,6 +1240,8 @@ def _attach_user_policy(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     if policy_arn not in user["AttachedPolicies"]:
         user["AttachedPolicies"].append(policy_arn)
         if _is_aws_managed_arn(policy_arn):
@@ -1213,15 +1279,16 @@ def _list_attached_user_policies(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = ""
+    members = []
     for arn in user["AttachedPolicies"]:
         pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
-        members += (f"<member><PolicyName>{pname}</PolicyName>"
+        members.append(f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAttachedUserPoliciesResponse",
                 f"<ListAttachedUserPoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
-                "<IsTruncated>false</IsTruncated></ListAttachedUserPoliciesResult>",
+                f"{tail}</ListAttachedUserPoliciesResult>",
                 ns="iam")
 
 
@@ -1256,17 +1323,18 @@ def _create_access_key(p):
 
 def _list_access_keys(p):
     user_name = _p(p, "UserName") or "default"
-    members = ""
+    members = []
     for kid, v in _access_keys.items():
         if v["UserName"] == user_name:
-            members += (f"<member><AccessKeyId>{kid}</AccessKeyId>"
+            members.append(f"<member><AccessKeyId>{kid}</AccessKeyId>"
                         f"<Status>{v['Status']}</Status>"
                         f"<UserName>{user_name}</UserName>"
                         f"<CreateDate>{v['CreateDate']}</CreateDate>"
                         f"</member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAccessKeysResponse",
                 f"<ListAccessKeysResult><AccessKeyMetadata>{members}</AccessKeyMetadata>"
-                "<IsTruncated>false</IsTruncated></ListAccessKeysResult>",
+                f"{tail}</ListAccessKeysResult>",
                 ns="iam")
 
 
@@ -1431,14 +1499,15 @@ def _remove_role_from_instance_profile(p):
 
 def _list_instance_profiles(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
+    members = list(
         f"<member>{_instance_profile_xml(name)}</member>"
         for name, ip in _instance_profiles.items()
         if ip["Path"].startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListInstanceProfilesResponse",
                 f"<ListInstanceProfilesResult><InstanceProfiles>{members}</InstanceProfiles>"
-                "<IsTruncated>false</IsTruncated></ListInstanceProfilesResult>",
+                f"{tail}</ListInstanceProfilesResult>",
                 ns="iam")
 
 
@@ -1447,14 +1516,15 @@ def _list_instance_profiles_for_role(p):
     if role_name not in _roles:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{_instance_profile_xml(name)}</member>"
         for name, ip in _instance_profiles.items()
         if role_name in ip["Roles"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListInstanceProfilesForRoleResponse",
                 f"<ListInstanceProfilesForRoleResult><InstanceProfiles>{members}</InstanceProfiles>"
-                "<IsTruncated>false</IsTruncated></ListInstanceProfilesForRoleResult>",
+                f"{tail}</ListInstanceProfilesForRoleResult>",
                 ns="iam")
 
 
@@ -1491,13 +1561,14 @@ def _list_instance_profile_tags(p):
     if not ip:
         return _error(404, "NoSuchEntity",
                       f"Instance profile {ip_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in ip.get("Tags", [])
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListInstanceProfileTagsResponse",
                 f"<ListInstanceProfileTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListInstanceProfileTagsResult>",
+                f"{tail}</ListInstanceProfileTagsResult>",
                 ns="iam")
 
 
@@ -1536,13 +1607,14 @@ def _list_role_tags(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in role["Tags"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListRoleTagsResponse",
                 f"<ListRoleTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListRoleTagsResult>",
+                f"{tail}</ListRoleTagsResult>",
                 ns="iam")
 
 
@@ -1594,13 +1666,14 @@ def _list_user_tags(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in user["Tags"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListUserTagsResponse",
                 f"<ListUserTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListUserTagsResult>",
+                f"{tail}</ListUserTagsResult>",
                 ns="iam")
 
 
@@ -1628,10 +1701,11 @@ def _simulate_principal_policy(p):
             policies = _gather_role_policies(resource.split("/", 1)[1], account_id)
     results = _build_simulate_results_real(actions, resource_arn, principal_arn,
                                            account_id, policies)
+    results, tail = _iam_page(p, results)
     return _xml(200, "SimulatePrincipalPolicyResponse",
                 f"<SimulatePrincipalPolicyResult>"
                 f"<EvaluationResults>{results}</EvaluationResults>"
-                "<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</SimulatePrincipalPolicyResult>",
                 ns="iam")
 
@@ -1655,10 +1729,11 @@ def _simulate_custom_policy(p):
     results = _build_simulate_results_real(
         actions, resource_arn,
         f"arn:aws:iam::{account_id}:root", account_id, policies)
+    results, tail = _iam_page(p, results)
     return _xml(200, "SimulateCustomPolicyResponse",
                 f"<SimulateCustomPolicyResult>"
                 f"<EvaluationResults>{results}</EvaluationResults>"
-                "<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</SimulateCustomPolicyResult>",
                 ns="iam")
 
@@ -1681,7 +1756,7 @@ def _extract_simulate_params(p):
 def _build_simulate_results_real(actions, resource_arn, principal_arn,
                                  account_id, policies):
     from ministack.core.iam_evaluator import EvalContext, evaluate
-    members = ""
+    members = []
     for action in actions:
         if policies:
             ctx = EvalContext(
@@ -1704,7 +1779,7 @@ def _build_simulate_results_real(actions, resource_arn, principal_arn,
                 decision = "implicitDeny"
         else:
             decision = "implicitDeny"
-        members += (f"<member>"
+        members.append(f"<member>"
                     f"<EvalActionName>{action}</EvalActionName>"
                     f"<EvalResourceName>{resource_arn}</EvalResourceName>"
                     f"<EvalDecision>{decision}</EvalDecision>"
@@ -1742,15 +1817,16 @@ def _get_group(p):
         return _error(404, "NoSuchEntity",
                       f"The group with name {name} cannot be found.", ns="iam")
     g = _groups[name]
-    user_members = ""
+    user_members = []
     for uname in g["Users"]:
         if uname in _users:
-            user_members += f"<member>{_user_xml(uname)}</member>"
+            user_members.append(f"<member>{_user_xml(uname)}</member>")
+    user_members, tail = _iam_page(p, user_members)
     return _xml(200, "GetGroupResponse",
                 f"<GetGroupResult>"
                 f"<Group>{_group_xml(name)}</Group>"
                 f"<Users>{user_members}</Users>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</GetGroupResult>",
                 ns="iam")
 
@@ -1767,14 +1843,15 @@ def _delete_group(p):
 
 def _list_groups(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
+    members = list(
         f"<member>{_group_xml(n)}</member>"
         for n, g in _groups.items()
         if g.get("Path", "/").startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListGroupsResponse",
                 f"<ListGroupsResult><Groups>{members}</Groups>"
-                "<IsTruncated>false</IsTruncated></ListGroupsResult>",
+                f"{tail}</ListGroupsResult>",
                 ns="iam")
 
 
@@ -1812,14 +1889,15 @@ def _list_groups_for_user(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{_group_xml(n)}</member>"
         for n, g in _groups.items()
         if user_name in g["Users"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListGroupsForUserResponse",
                 f"<ListGroupsForUserResult><Groups>{members}</Groups>"
-                "<IsTruncated>false</IsTruncated></ListGroupsForUserResult>",
+                f"{tail}</ListGroupsForUserResult>",
                 ns="iam")
 
 
@@ -1832,6 +1910,8 @@ def _attach_group_policy(p):
     if not group:
         return _error(404, "NoSuchEntity",
                       f"The group with name {group_name} cannot be found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     attached = group.setdefault("AttachedPolicies", [])
     if policy_arn not in attached:
         attached.append(policy_arn)
@@ -1871,15 +1951,16 @@ def _list_attached_group_policies(p):
     if not group:
         return _error(404, "NoSuchEntity",
                       f"The group with name {group_name} cannot be found.", ns="iam")
-    members = ""
+    members = []
     for arn in group.get("AttachedPolicies", []):
         pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
-        members += (f"<member><PolicyName>{pname}</PolicyName>"
+        members.append(f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAttachedGroupPoliciesResponse",
                 f"<ListAttachedGroupPoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
-                "<IsTruncated>false</IsTruncated></ListAttachedGroupPoliciesResult>",
+                f"{tail}</ListAttachedGroupPoliciesResult>",
                 ns="iam")
 
 
@@ -1949,13 +2030,14 @@ def _list_group_policies(p):
     if group_name not in _groups:
         return _error(404, "NoSuchEntity",
                       f"The group with name {group_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{pname}</member>"
         for pname in (_group_inline_policies.get(group_name) or {})
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListGroupPoliciesResponse",
                 f"<ListGroupPoliciesResult><PolicyNames>{members}</PolicyNames>"
-                "<IsTruncated>false</IsTruncated></ListGroupPoliciesResult>",
+                f"{tail}</ListGroupPoliciesResult>",
                 ns="iam")
 
 
@@ -2025,13 +2107,14 @@ def _list_user_policies(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{pname}</member>"
         for pname in (_user_inline_policies.get(user_name) or {})
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListUserPoliciesResponse",
                 f"<ListUserPoliciesResult><PolicyNames>{members}</PolicyNames>"
-                "<IsTruncated>false</IsTruncated></ListUserPoliciesResult>",
+                f"{tail}</ListUserPoliciesResult>",
                 ns="iam")
 
 
@@ -2041,6 +2124,8 @@ def _create_service_linked_role(p):
     service_name = _p(p, "AWSServiceName")
     suffix = service_name.split(".")[0] if "." in service_name else service_name
     role_name = f"AWSServiceRoleFor{suffix.capitalize()}"
+    if _p(p, "CustomSuffix"):
+        role_name += f"_{_p(p, 'CustomSuffix')}"
     path = f"/aws-service-role/{service_name}/"
 
     if role_name in _roles:
@@ -2063,7 +2148,7 @@ def _create_service_linked_role(p):
         "CreateDate": _now(),
         "Path": path,
         "AssumeRolePolicyDocument": trust_policy,
-        "Description": f"Service-linked role for {service_name}",
+        "Description": _p(p, "Description"),
         "MaxSessionDuration": 3600,
         "AttachedPolicies": [],
         "InlinePolicies": {},
@@ -2072,6 +2157,28 @@ def _create_service_linked_role(p):
     return _xml(200, "CreateServiceLinkedRoleResponse",
                 f"<CreateServiceLinkedRoleResult><Role>{_role_xml(role_name)}</Role></CreateServiceLinkedRoleResult>",
                 ns="iam")
+
+
+def ensure_service_linked_role(service_name, role_name, policy_arn):
+    """Create *role_name*, the service-linked role of *service_name*, in the caller's account unless it exists."""
+    if role_name in _roles:
+        return
+    path = f"/aws-service-role/{service_name}/"
+    _roles[role_name] = {
+        "RoleName": role_name,
+        "Arn": f"arn:aws:iam::{get_account_id()}:role{path}{role_name}",
+        "RoleId": _gen_id("AROA"),
+        "CreateDate": _now(),
+        "Path": path,
+        "AssumeRolePolicyDocument": json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Principal": {"Service": service_name}, "Action": "sts:AssumeRole"}]}),
+        "Description": "",
+        "MaxSessionDuration": 3600,
+        "AttachedPolicies": [],
+        "InlinePolicies": {},
+        "Tags": [],
+    }
+    attach_managed_policy(_roles[role_name], policy_arn)
 
 
 def _delete_service_linked_role(p):
@@ -2131,7 +2238,7 @@ def _get_account_authorization_details(p):
     include_all = not filters
 
     # ---- UserDetailList ----
-    user_detail_xml = ""
+    user_detail_xml = []
     if include_all or "User" in filters:
         for name, user in _users.items():
             # Inline user policies
@@ -2167,7 +2274,7 @@ def _get_account_authorization_details(p):
                 f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
                 for t in user.get("Tags", [])
             )
-            user_detail_xml += (
+            user_detail_xml.append(
                 f"<member>"
                 f"<UserName>{user['UserName']}</UserName>"
                 f"<UserId>{user['UserId']}</UserId>"
@@ -2182,7 +2289,7 @@ def _get_account_authorization_details(p):
             )
 
     # ---- GroupDetailList ----
-    group_detail_xml = ""
+    group_detail_xml = []
     if include_all or "Group" in filters:
         for name, g in _groups.items():
             # Inline group policies
@@ -2207,7 +2314,7 @@ def _get_account_authorization_details(p):
                                  f"<PolicyName>{pname}</PolicyName>"
                                  f"<PolicyArn>{arn}</PolicyArn>"
                                  f"</member>")
-            group_detail_xml += (
+            group_detail_xml.append(
                 f"<member>"
                 f"<GroupName>{g['GroupName']}</GroupName>"
                 f"<GroupId>{g['GroupId']}</GroupId>"
@@ -2220,7 +2327,7 @@ def _get_account_authorization_details(p):
             )
 
     # ---- RoleDetailList ----
-    role_detail_xml = ""
+    role_detail_xml = []
     if include_all or "Role" in filters:
         for name, role in _roles.items():
             assume_doc = _url_quote(role.get("AssumeRolePolicyDocument") or "{}", safe="")
@@ -2256,7 +2363,7 @@ def _get_account_authorization_details(p):
                 f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
                 for t in role.get("Tags", [])
             )
-            role_detail_xml += (
+            role_detail_xml.append(
                 f"<member>"
                 f"<RoleName>{role['RoleName']}</RoleName>"
                 f"<RoleId>{role['RoleId']}</RoleId>"
@@ -2272,7 +2379,7 @@ def _get_account_authorization_details(p):
             )
 
     # ---- Policies (customer-managed) ----
-    policies_xml = ""
+    policies_xml = []
     if include_all or "LocalManagedPolicy" in filters:
         for arn, pol in _policies.items():
             default_vid = pol.get("DefaultVersionId", "v1")
@@ -2284,7 +2391,7 @@ def _get_account_authorization_details(p):
                 f"</member>"
                 for v in pol.get("Versions", {}).values()
             )
-            policies_xml += (
+            policies_xml.append(
                 f"<member>"
                 f"<PolicyName>{pol['PolicyName']}</PolicyName>"
                 f"<PolicyId>{pol['PolicyId']}</PolicyId>"
@@ -2295,13 +2402,15 @@ def _get_account_authorization_details(p):
                 f"</member>"
             )
 
+    user_detail_xml, group_detail_xml, role_detail_xml, policies_xml, tail = _iam_page(
+        p, user_detail_xml, group_detail_xml, role_detail_xml, policies_xml)
     return _xml(200, "GetAccountAuthorizationDetailsResponse",
                 f"<GetAccountAuthorizationDetailsResult>"
                 f"<UserDetailList>{user_detail_xml}</UserDetailList>"
                 f"<GroupDetailList>{group_detail_xml}</GroupDetailList>"
                 f"<RoleDetailList>{role_detail_xml}</RoleDetailList>"
                 f"<Policies>{policies_xml}</Policies>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</GetAccountAuthorizationDetailsResult>",
                 ns="iam")
 
@@ -2395,25 +2504,26 @@ def _resync_mfa_device(p):
 
 def _list_mfa_devices(p):
     user_name = _p(p, "UserName")
-    members = ""
+    members = []
     for serial, dev in _mfa_devices.items():
         if dev.get("User") == user_name:
-            members += (f"<member>"
+            members.append(f"<member>"
                         f"<UserName>{dev['User']}</UserName>"
                         f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
                         f"<EnableDate>{dev['EnableDate']}</EnableDate>"
                         f"</member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListMFADevicesResponse",
                 f"<ListMFADevicesResult>"
                 f"<MFADevices>{members}</MFADevices>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</ListMFADevicesResult>",
                 ns="iam")
 
 
 def _list_virtual_mfa_devices(p):
     status = _p(p, "AssignmentStatus") or "Assigned"
-    members = ""
+    members = []
     for serial, dev in _mfa_devices.items():
         is_assigned = dev.get("User") is not None
         if status == "Assigned" and not is_assigned:
@@ -2426,11 +2536,12 @@ def _list_virtual_mfa_devices(p):
             if user_name in _users:
                 member_xml += f"<User>{_user_xml(user_name)}</User>"
             member_xml += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
-        members += f"<member>{member_xml}</member>"
+        members.append(f"<member>{member_xml}</member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListVirtualMFADevicesResponse",
                 f"<ListVirtualMFADevicesResult>"
                 f"<VirtualMFADevices>{members}</VirtualMFADevices>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</ListVirtualMFADevicesResult>",
                 ns="iam")
 
@@ -2733,6 +2844,7 @@ def _create_saml_provider(p):
         "Arn": arn,
         "Name": name,
         "SAMLMetadataDocument": metadata,
+        "AssertionEncryptionMode": _p(p, "AssertionEncryptionMode") or None,
         "CreateDate": _now(),
         "ValidUntil": _future(365 * 24 * 3600),
         "Tags": _extract_tags(p),
@@ -2760,7 +2872,9 @@ def _get_saml_provider(p):
                 f"<CreateDate>{prov['CreateDate']}</CreateDate>"
                 f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
                 f"<Tags>{tag_members}</Tags>"
-                f"</GetSAMLProviderResult>",
+                + (f"<AssertionEncryptionMode>{prov['AssertionEncryptionMode']}</AssertionEncryptionMode>"
+                   if prov.get("AssertionEncryptionMode") else "")
+                + "</GetSAMLProviderResult>",
                 ns="iam")
 
 
@@ -2786,7 +2900,10 @@ def _update_saml_provider(p):
     if not prov:
         return _error(404, "NoSuchEntity",
                       f"SAML provider {arn} not found.", ns="iam")
-    prov["SAMLMetadataDocument"] = _p(p, "SAMLMetadataDocument")
+    if _p(p, "SAMLMetadataDocument"):
+        prov["SAMLMetadataDocument"] = _p(p, "SAMLMetadataDocument")
+    if _p(p, "AssertionEncryptionMode"):
+        prov["AssertionEncryptionMode"] = _p(p, "AssertionEncryptionMode")
     return _xml(200, "UpdateSAMLProviderResponse",
                 f"<UpdateSAMLProviderResult>"
                 f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
@@ -2801,6 +2918,360 @@ def _delete_saml_provider(p):
                       f"SAML provider {arn} not found.", ns="iam")
     del _saml_providers[arn]
     return _xml(200, "DeleteSAMLProviderResponse", "", ns="iam")
+
+
+# -------------------- Service-specific credentials --------------------
+#
+# UserName on this whole family is optional only for IAM-user callers —
+# every other principal gets "UserName must be specified when calling with
+# a non-user principal" (observed on AWS 2026-10-29 for list, update, reset
+# and delete alike). ``_caller_user`` is injected by handle_request.
+
+
+# CreateServiceSpecificCredential API reference and "API keys for AWS services": a user name and
+# password for CodeCommit and Keyspaces, an alias and secret (long-term API key) for the others.
+_PASSWORD_CREDENTIAL_SERVICES = frozenset({"codecommit.amazonaws.com", "cassandra.amazonaws.com"})
+_API_KEY_CREDENTIAL_SERVICES = frozenset({"bedrock.amazonaws.com", "aws-external-anthropic.amazonaws.com",
+                                          "cloudwatch.amazonaws.com", "logs.amazonaws.com"})
+
+
+def _unsupported_service(service):
+    if service in _PASSWORD_CREDENTIAL_SERVICES or service in _API_KEY_CREDENTIAL_SERVICES:
+        return None
+    return _error(404, "NotSupportedService",
+                  "The specified service does not support service-specific credentials.", ns="iam")
+
+
+def _credential_user(p):
+    user = _p(p, "UserName") or _p(p, "_caller_user")
+    if not user:
+        return None, _error(
+            400, "InvalidInput",
+            "UserName must be specified when calling with a non-user principal",
+            ns="iam")
+    if user != "default" and user not in _users:
+        return None, _error(404, "NoSuchEntity",
+                            f"The user with name {user} cannot be found.", ns="iam")
+    return user, None
+
+
+def _service_credential_fields(c, with_secret=False):
+    """The member fields AWS returns; ``ServiceCredentialSecret`` only ever
+    appears on create and reset responses (AWS 2026-10-29)."""
+    inner = ""
+    if with_secret and c.get("ServicePassword"):
+        inner += f"<ServicePassword>{_xml_escape(c['ServicePassword'])}</ServicePassword>"
+    if c.get("ServiceUserName"):
+        inner += f"<ServiceUserName>{_xml_escape(c['ServiceUserName'])}</ServiceUserName>"
+    if c.get("ServiceCredentialAlias"):
+        inner += f"<ServiceCredentialAlias>{_xml_escape(c['ServiceCredentialAlias'])}</ServiceCredentialAlias>"
+    inner += f"<CreateDate>{c['CreateDate']}</CreateDate>"
+    if c.get("ExpirationDate"):
+        inner += f"<ExpirationDate>{c['ExpirationDate']}</ExpirationDate>"
+    if with_secret and c.get("ServiceCredentialSecret"):
+        inner += (f"<ServiceCredentialSecret>{c['ServiceCredentialSecret']}"
+                  f"</ServiceCredentialSecret>")
+    return (inner +
+            f"<ServiceSpecificCredentialId>{c['Id']}</ServiceSpecificCredentialId>"
+            f"<ServiceName>{_xml_escape(c['ServiceName'])}</ServiceName>"
+            f"<UserName>{_xml_escape(c['UserName'])}</UserName>"
+            f"<Status>{c['Status']}</Status>")
+
+
+def _gen_service_credential():
+    """id ``ACCA`` + 17 chars and an opaque base64 secret, AWS's shapes."""
+    cred_id = "ACCA" + new_uuid().replace("-", "")[:17].upper()
+    secret = base64.b64encode(os.urandom(72)).decode()
+    return cred_id, secret
+
+
+def _new_service_secret(cred):
+    """A new secret of the credential's kind: a password (44 characters, as the API reference's
+    example) for a user-name credential, else the API key secret."""
+    if cred.get("ServiceUserName"):
+        cred["ServicePassword"] = base64.b64encode(os.urandom(32)).decode()
+    else:
+        _, cred["ServiceCredentialSecret"] = _gen_service_credential()
+
+
+def _create_service_specific_credential(p):
+    user, err = _credential_user(p)
+    if err:
+        return err
+    service = _p(p, "ServiceName")
+    unsupported = _unsupported_service(service)
+    if unsupported:
+        return unsupported
+    cred_id, _secret = _gen_service_credential()
+    cred = {
+        "Id": cred_id,
+        "UserName": user,
+        "ServiceName": service,
+        "Status": "Active",
+        "CreateDate": _now(),
+    }
+    if service in _PASSWORD_CREDENTIAL_SERVICES:
+        cred["ServiceUserName"] = f"{user}-at-{get_account_id()}"
+    else:
+        cred["ServiceCredentialAlias"] = f"{user}-at-{get_account_id()}"
+        age_days = _p(p, "CredentialAgeDays")
+        if age_days.isdigit() and int(age_days) > 0:
+            cred["ExpirationDate"] = _future(int(age_days) * 86400)
+    _new_service_secret(cred)
+    _service_specific_credentials[cred_id] = cred
+    return _xml(200, "CreateServiceSpecificCredentialResponse",
+                f"<CreateServiceSpecificCredentialResult>"
+                f"<ServiceSpecificCredential>"
+                f"{_service_credential_fields(cred, with_secret=True)}"
+                f"</ServiceSpecificCredential>"
+                f"</CreateServiceSpecificCredentialResult>",
+                ns="iam")
+
+
+def _list_service_specific_credentials(p):
+    user, err = _credential_user(p)
+    if err:
+        return err
+    service = _p(p, "ServiceName")
+    unsupported = service and _unsupported_service(service)
+    if unsupported:
+        return unsupported
+    members = list(
+        f"<member>{_service_credential_fields(c)}</member>"
+        for c in _service_specific_credentials.values()
+        if c["UserName"] == user and (not service or c["ServiceName"] == service)
+    )
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListServiceSpecificCredentialsResponse",
+                f"<ListServiceSpecificCredentialsResult>"
+                f"<ServiceSpecificCredentials>{members}</ServiceSpecificCredentials>"
+                f"{tail}"
+                f"</ListServiceSpecificCredentialsResult>",
+                ns="iam")
+
+
+def _lookup_service_credential(p):
+    user, err = _credential_user(p)
+    if err:
+        return None, err
+    cred_id = _p(p, "ServiceSpecificCredentialId")
+    cred = _service_specific_credentials.get(cred_id)
+    if not cred or cred["UserName"] != user:
+        return None, _error(
+            404, "NoSuchEntity",
+            f"The service specific credential with credential id {cred_id} "
+            f"cannot be found.", ns="iam")
+    return cred, None
+
+
+def _update_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    status = _p(p, "Status")
+    if status in ("Active", "Inactive"):
+        cred["Status"] = status
+    return _xml(200, "UpdateServiceSpecificCredentialResponse", "", ns="iam")
+
+
+def _reset_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    _new_service_secret(cred)
+    return _xml(200, "ResetServiceSpecificCredentialResponse",
+                f"<ResetServiceSpecificCredentialResult>"
+                f"<ServiceSpecificCredential>"
+                f"{_service_credential_fields(cred, with_secret=True)}"
+                f"</ServiceSpecificCredential>"
+                f"</ResetServiceSpecificCredentialResult>",
+                ns="iam")
+
+
+def _delete_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    del _service_specific_credentials[cred["Id"]]
+    return _xml(200, "DeleteServiceSpecificCredentialResponse", "", ns="iam")
+
+
+# -------------------- Server certificates --------------------
+
+
+def _cert_expiration(pem: str) -> str | None:
+    """notAfter of a PEM cert, like AWS parses it on upload; "" when it can't be read without the
+    optional cryptography package; None when the body is not a certificate."""
+    import importlib.util
+    if importlib.util.find_spec("cryptography") is None:
+        match = re.fullmatch(r"\s*-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----\s*", pem or "")
+        try:
+            return "" if match and base64.b64decode("".join(match.group(1).split()), validate=True) else None
+        except (binascii.Error, ValueError):
+            return None
+    try:
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(pem.encode())
+        return cert.not_valid_after_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _gen_server_cert_id():
+    return "ASCA" + new_uuid().replace("-", "")[:17].upper()
+
+
+def _server_cert_metadata(c):
+    inner = (f"<Path>{_xml_escape(c['Path'])}</Path>"
+             f"<ServerCertificateName>{_xml_escape(c['Name'])}</ServerCertificateName>"
+             f"<ServerCertificateId>{c['Id']}</ServerCertificateId>"
+             f"<Arn>{c['Arn']}</Arn>"
+             f"<UploadDate>{c['UploadDate']}</UploadDate>")
+    if c.get("Expiration"):
+        inner += f"<Expiration>{c['Expiration']}</Expiration>"
+    return inner
+
+
+def _server_cert_arn(path: str, name: str) -> str:
+    return (f"arn:aws:iam::{get_account_id()}:server-certificate"
+            f"{path}{name}")
+
+
+def _normalize_iam_path(path: str) -> str:
+    path = path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.endswith("/"):
+        path += "/"
+    return path
+
+
+def _upload_server_certificate(p):
+    name = _p(p, "ServerCertificateName")
+    path = _normalize_iam_path(_p(p, "Path"))
+    arn = _server_cert_arn(path, name)
+    if any(c["Name"] == name for c in _server_certificates.values()):
+        return _error(409, "EntityAlreadyExists",
+                      f"The Server Certificate with name {name} already exists.",
+                      ns="iam")
+    body_pem = _p(p, "CertificateBody")
+    expiration = _cert_expiration(body_pem)
+    if expiration is None:
+        return _error(400, "MalformedCertificate",
+                      "Unable to parse certificate.", ns="iam")
+    cert = {
+        "Name": name,
+        "Path": path,
+        "Id": _gen_server_cert_id(),
+        "Arn": arn,
+        "Body": body_pem,
+        "PrivateKey": _p(p, "PrivateKey"),
+        "CertificateChain": _p(p, "CertificateChain"),
+        "UploadDate": _now(),
+        "Expiration": expiration,
+        "Tags": _extract_tags(p),
+    }
+    _server_certificates[arn] = cert
+    return _xml(200, "UploadServerCertificateResponse",
+                f"<UploadServerCertificateResult>"
+                f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
+                f"</ServerCertificateMetadata>"
+                f"</UploadServerCertificateResult>",
+                ns="iam")
+
+
+def _list_server_certificates(p):
+    prefix = _p(p, "PathPrefix")
+    members = list(
+        f"<member>{_server_cert_metadata(c)}</member>"
+        for c in _server_certificates.values()
+        if not prefix or c["Path"].startswith(prefix)
+    )
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListServerCertificatesResponse",
+                f"<ListServerCertificatesResult>"
+                f"<ServerCertificateMetadataList>{members}"
+                f"</ServerCertificateMetadataList>"
+                f"{tail}"
+                f"</ListServerCertificatesResult>",
+                ns="iam")
+
+
+def _lookup_server_certificate(p):
+    name = _p(p, "ServerCertificateName")
+    cert = next((c for c in _server_certificates.values()
+                 if c["Name"] == name), None)
+    if not cert:
+        return None, _error(
+            404, "NoSuchEntity",
+            f"The Server Certificate with name {name} cannot be found.",
+            ns="iam")
+    return cert, None
+
+
+def _tags_xml(tags):
+    return "".join(
+        f"<member><Key>{_xml_escape(t['Key'])}</Key>"
+        f"<Value>{_xml_escape(t['Value'])}</Value></member>"
+        for t in tags
+    )
+
+
+def _get_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    return _xml(200, "GetServerCertificateResponse",
+                f"<GetServerCertificateResult><ServerCertificate>"
+                f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
+                f"</ServerCertificateMetadata>"
+                f"<CertificateBody>{_xml_escape(cert['Body'])}</CertificateBody>"
+                + (f"<CertificateChain>{_xml_escape(cert['CertificateChain'])}</CertificateChain>"
+                   if cert.get("CertificateChain") else "")
+                + f"<Tags>{_tags_xml(cert.get('Tags', []))}</Tags>"
+                f"</ServerCertificate></GetServerCertificateResult>",
+                ns="iam")
+
+
+def _update_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    new_name = _p(p, "NewServerCertificateName")
+    new_path = _normalize_iam_path(_p(p, "NewPath") or cert["Path"])
+    new_arn = _server_cert_arn(new_path, new_name or cert["Name"])
+    if new_name and new_name != cert["Name"] and any(c["Name"] == new_name for c in _server_certificates.values()):
+        return _error(409, "EntityAlreadyExists",
+                      "The Server Certificate with name "
+                      f"{new_name or cert['Name']} already exists.", ns="iam")
+    del _server_certificates[cert["Arn"]]
+    cert["Name"] = new_name or cert["Name"]
+    cert["Path"] = new_path
+    cert["Arn"] = new_arn
+    _server_certificates[new_arn] = cert
+    return _xml(200, "UpdateServerCertificateResponse", "", ns="iam")
+
+
+def _delete_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    del _server_certificates[cert["Arn"]]
+    return _xml(200, "DeleteServerCertificateResponse", "", ns="iam")
+
+
+def _list_server_certificate_tags(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    tags = [_tags_xml([t]) for t in cert.get("Tags", [])]
+    tags, tail = _iam_page(p, tags)
+    return _xml(200, "ListServerCertificateTagsResponse",
+                f"<ListServerCertificateTagsResult>"
+                f"<Tags>{tags}</Tags>"
+                f"{tail}"
+                f"</ListServerCertificateTagsResult>",
+                ns="iam")
 
 
 # -------------------- Account summary / password policy / aliases --------------------
@@ -2862,7 +3333,7 @@ def _get_account_password_policy(p):
         return _error(404, "NoSuchEntity",
                       "The account password policy does not exist.", ns="iam")
     fields = (
-        f"<MinimumPasswordLength>{pol.get('MinimumPasswordLength', 8)}</MinimumPasswordLength>"
+        f"<MinimumPasswordLength>{pol.get('MinimumPasswordLength', 6)}</MinimumPasswordLength>"
         f"<RequireSymbols>{'true' if pol.get('RequireSymbols') else 'false'}</RequireSymbols>"
         f"<RequireNumbers>{'true' if pol.get('RequireNumbers') else 'false'}</RequireNumbers>"
         f"<RequireUppercaseCharacters>{'true' if pol.get('RequireUppercaseCharacters') else 'false'}</RequireUppercaseCharacters>"
@@ -2883,7 +3354,8 @@ def _get_account_password_policy(p):
 
 
 def _update_account_password_policy(p):
-    pol = _account_password_policy.get("policy") or {}
+    # No partial updates: every omitted parameter reverts to its default.
+    pol = {"MinimumPasswordLength": 6}
     for field in ("MinimumPasswordLength", "MaxPasswordAge", "PasswordReusePrevention"):
         val = _p(p, field, "")
         if val:
@@ -2907,11 +3379,12 @@ def _delete_account_password_policy(p):
 
 def _list_account_aliases(p):
     aliases = _account_aliases.get("aliases") or []
-    members = "".join(f"<member>{a}</member>" for a in aliases)
+    members = list(f"<member>{a}</member>" for a in aliases)
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAccountAliasesResponse",
                 f"<ListAccountAliasesResult>"
                 f"<AccountAliases>{members}</AccountAliases>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</ListAccountAliasesResult>",
                 ns="iam")
 
@@ -2970,13 +3443,14 @@ def _list_policy_tags(p):
     if not pol:
         return _error(404, "NoSuchEntity",
                       f"Policy {arn} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in pol.get("Tags", [])
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListPolicyTagsResponse",
                 f"<ListPolicyTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListPolicyTagsResult>",
+                f"{tail}</ListPolicyTagsResult>",
                 ns="iam")
 
 
@@ -2988,6 +3462,24 @@ def _list_policy_tags(p):
 def _p(params, key, default=""):
     val = params.get(key, [default])
     return val[0] if isinstance(val, list) else val
+
+
+def _iam_page(p, *groups):
+    items = [(n, m) for n, g in enumerate(groups) for m in g]
+    try:
+        limit = max(int(_p(p, "MaxItems") or 100), 1)
+    except ValueError:
+        limit = 100
+    try:
+        start = max(int(base64.b64decode(_p(p, "Marker"), validate=True).decode()), 0)
+    except (ValueError, binascii.Error):
+        start = 0
+    end = start + limit
+    pages = ["".join(m for n, m in items[start:end] if n == g) for g in range(len(groups))]
+    if end < len(items):
+        marker = base64.b64encode(str(end).encode()).decode()
+        return (*pages, f"<IsTruncated>true</IsTruncated><Marker>{marker}</Marker>")
+    return (*pages, "<IsTruncated>false</IsTruncated>")
 
 
 def _now():
@@ -3082,7 +3574,7 @@ def _role_xml(name, boundary=True):
     tags_xml = ""
     if r.get("Tags"):
         tag_members = "".join(
-            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+            f"<member><Key>{_xml_escape(t['Key'])}</Key><Value>{_xml_escape(t['Value'])}</Value></member>"
             for t in r["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
@@ -3100,8 +3592,8 @@ def _role_xml(name, boundary=True):
             f"<Path>{r['Path']}</Path>"
             f"<CreateDate>{r['CreateDate']}</CreateDate>"
             f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
-            f"<Description>{desc}</Description>"
-            f"<MaxSessionDuration>{max_dur}</MaxSessionDuration>"
+            + (f"<Description>{_xml_escape(desc)}</Description>" if desc else "")
+            + f"<MaxSessionDuration>{max_dur}</MaxSessionDuration>"
             f"{boundary_xml}"
             f"{tags_xml}")
 
@@ -3296,6 +3788,17 @@ _IAM_HANDLERS = {
     "ListSAMLProviders": _list_saml_providers,
     "UpdateSAMLProvider": _update_saml_provider,
     "DeleteSAMLProvider": _delete_saml_provider,
+    "CreateServiceSpecificCredential": _create_service_specific_credential,
+    "ListServiceSpecificCredentials": _list_service_specific_credentials,
+    "UpdateServiceSpecificCredential": _update_service_specific_credential,
+    "ResetServiceSpecificCredential": _reset_service_specific_credential,
+    "DeleteServiceSpecificCredential": _delete_service_specific_credential,
+    "UploadServerCertificate": _upload_server_certificate,
+    "ListServerCertificates": _list_server_certificates,
+    "GetServerCertificate": _get_server_certificate,
+    "UpdateServerCertificate": _update_server_certificate,
+    "DeleteServerCertificate": _delete_server_certificate,
+    "ListServerCertificateTags": _list_server_certificate_tags,
     "ListOpenIDConnectProviders": _list_oidc_providers,
     "GetAccountAuthorizationDetails": _get_account_authorization_details,
     "CreateVirtualMFADevice": _create_virtual_mfa_device,
@@ -3342,6 +3845,8 @@ def reset():
     _credential_reports.clear()
     _account_password_policy.clear()
     _account_aliases.clear()
+    _service_specific_credentials.clear()
+    _server_certificates.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state
@@ -3355,3 +3860,21 @@ def reset():
 # scope (``_make_aws_managed_record`` references ``_now`` / ``_gen_id``
 # defined further down).
 _seed_aws_managed_policies()
+
+
+def role_trusts_service(role_arn, service_principal):
+    """True when *role_arn* names a role of the caller's account whose trust policy lets *service_principal* assume it."""
+    role = _roles.get(role_arn.rsplit("/", 1)[-1])
+    if role is None or role.get("Arn") != role_arn:
+        return False
+    try:
+        document = json.loads(role.get("AssumeRolePolicyDocument") or "{}")
+    except (TypeError, ValueError):
+        return False
+    statements = document.get("Statement", [])
+    for statement in [statements] if isinstance(statements, dict) else statements:
+        principal = statement.get("Principal") if statement.get("Effect") == "Allow" else None
+        services = principal.get("Service", []) if isinstance(principal, dict) else []
+        if service_principal in ([services] if isinstance(services, str) else services):
+            return True
+    return False

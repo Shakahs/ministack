@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import re
 import time
+import types
 import uuid as _uuid_mod
 import zipfile
 
@@ -9,6 +11,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 from ministack.services import elasticache
 from ministack.services.elasticache import _engine_image_and_port
@@ -128,12 +131,12 @@ def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
         CacheSubnetGroupDescription="Test EC SG",
-        SubnetIds=["subnet-aaa"],
+        SubnetIds=["subnet-00000001"],
     )
     ec.modify_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
         CacheSubnetGroupDescription="Updated EC SG",
-        SubnetIds=["subnet-bbb"],
+        SubnetIds=["subnet-00000002"],
     )
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName="test-mod-ecsg")
     assert resp["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "Updated EC SG"
@@ -155,7 +158,7 @@ def test_elasticache_user_crud(ec):
 def test_elasticache_user_group_crud(ec):
     ec.create_user(
         UserId="ug-usr-1",
-        UserName="ug-usr-1",
+        UserName="default",
         Engine="redis",
         AccessString="on ~* +@all",
         NoPasswordRequired=True,
@@ -564,7 +567,7 @@ def test_elasticache_users_and_user_groups_are_region_scoped():
     for client in (east, west):
         client.create_user(
             UserId=user_id,
-            UserName=user_id,
+            UserName="default",
             Engine="redis",
             AccessString="on ~* +@all",
             NoPasswordRequired=True,
@@ -600,6 +603,509 @@ def test_elasticache_users_and_user_groups_are_region_scoped():
                 pass
 
 
+_DEFAULT_USER_REQUIRED = {
+    "Type": "Sender", "Code": "DefaultUserRequired",
+    "Message": "Redis user group needs to contain a user with the user name default.",
+}
+
+
+def _assert_default_user_required(exc):
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == _DEFAULT_USER_REQUIRED
+
+
+@pytest.fixture
+def ec_users(ec):
+    """Users like the capture rounds': Redis IAM (three, and one created with Engine `Redis`), Redis `default` (two),
+    Redis `Default` (two), Valkey IAM and Valkey `default`. Yields their ids by role and deletes them, with any user group they joined."""
+    s = _uid()
+    ids = {k: f"dug-{k}-{s}" for k in ("r-iam", "r-iam2", "r-iam3", "r-def", "r-def2", "r-case", "r-case2", "up-iam", "v-iam", "v-def")}
+    names = {"r-def": "default", "r-def2": "default", "r-case": "Default", "r-case2": "Default", "v-def": "default"}
+    groups, created = [], []
+    try:
+        for k, uid in ids.items():
+            auth = ({"Type": "password", "Passwords": ["msc-capture-default-password-1"]} if k in names
+                    else {"Type": "iam"})
+            engine = {"r": "redis", "u": "Redis", "v": "valkey"}[k[0]]
+            ec.create_user(UserId=uid, UserName=names.get(k, uid), Engine=engine,
+                           AccessString="on ~* +@all", AuthenticationMode=auth)
+            created.append(uid)
+        yield ids, groups, s
+    finally:
+        for g in groups:
+            try:
+                ec.delete_user_group(UserGroupId=g)
+            except ClientError:
+                pass
+        for uid in created:
+            try:
+                ec.delete_user(UserId=uid)
+            except ClientError:
+                pass
+
+
+@pytest.mark.parametrize("key,engine,members", [
+    ("cug-r-no-default", "redis", ["r-iam"]),
+    ("cug-r-no-users", "redis", None),
+    ("cug-r-empty-list", "redis", []),
+    ("cug-r-case-default", "redis", ["r-case", "r-iam"]),
+    ("cug-engine-Redis", "Redis", ["r-iam"]),
+    ("cug-engine-REDIS", "REDIS", ["r-iam"]),
+    ("cug-r-upper-engine-iam-no-default", "redis", ["up-iam"]),
+])
+def test_create_redis_user_group_requires_default_user(ec, ec_users, key, engine, members):
+    """A Redis OSS user group needs a user named exactly `default`, whatever the case of `Engine`, and the
+    refused id stays free (real AWS, us-east-2: cug-r-no-default, cug-r-no-users, cug-r-empty-list,
+    cug-r-case-default, cug-engine-Redis, cug-engine-REDIS; a user created with Engine `Redis` counts
+    as a Redis user, cug-r-upper-engine-iam-no-default; the id is reused in cug-r-retry1-no-users then
+    cug-r-retry1-ok, and cug-r-retry2-iam-only then cug-r-retry2-ok)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "Engine": engine}
+    if members is not None:
+        params["UserIds"] = [ids[m] for m in members]
+    raw = make_client("elasticache", {"parameter_validation": False})  # the capture's empty UserIds
+    with pytest.raises(ClientError) as exc:
+        raw.create_user_group(**params)
+    _assert_default_user_required(exc)
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+
+
+def test_create_user_group_already_exists_before_default_user(ec, ec_users):
+    """An existing group id is refused before the default-user check
+    (real AWS, us-east-2: cug-r-ok, cug-r-duplicate-no-default)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-r-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    with pytest.raises(ClientError) as exc:
+        ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-iam"]])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == {
+        "Type": "Sender", "Code": "UserGroupAlreadyExists",
+        "Message": f"User group {group_id} already exists. Please retry with another name.",
+    }
+
+
+@pytest.mark.parametrize("key,members", [
+    ("cug-v-no-default", ["v-iam"]),
+    ("cug-v-no-users", None),
+    ("cug-v-redis-default", ["r-def", "v-iam"]),
+])
+def test_create_valkey_user_group_needs_no_default_user(ec, ec_users, key, members):
+    """Valkey user groups are created without a Valkey user named `default`
+    (real AWS, us-east-2: cug-v-no-default, cug-v-no-users, cug-v-redis-default)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    params = {"UserGroupId": group_id, "Engine": "valkey"}
+    if members is not None:
+        params["UserIds"] = [ids[m] for m in members]
+    resp = ec.create_user_group(**params)
+    groups.append(group_id)
+    assert resp["UserGroupId"] == group_id
+    assert resp["UserIds"] == params.get("UserIds", [])
+
+
+@pytest.mark.parametrize("key,members,remove,add", [
+    ("mug-r-remove-default", ["r-def", "r-iam"], ["r-def"], []),
+    ("mug-r-remove-default-add-case", ["r-def", "r-iam"], ["r-def"], ["r-case"]),
+    ("mug-r-remove-default-add-iam2", ["r-def", "r-iam"], ["r-def"], ["r-iam2"]),
+    ("mug-r-remove-only-default", ["r-def"], ["r-def"], []),
+    ("mug-r-remove-default-and-member", ["r-def", "r-iam", "r-iam2"], ["r-def", "r-iam"], []),
+    ("mug-r-remove-all", ["r-def", "r-iam", "r-iam2"], ["r-def", "r-iam", "r-iam2"], []),
+    ("mug-r-remove-default-add-two", ["r-def", "r-iam"], ["r-def"], ["r-iam2", "r-iam3"]),
+])
+def test_modify_redis_user_group_keeps_default_user(ec, ec_users, key, members, remove, add):
+    """Removing a Redis group's `default` user is refused, also when it is the only user or another user
+    is added, also with other users or all of them removed, and the group is left as it was (real AWS,
+    us-east-2: mug-r-remove-default, mug-r-remove-default-add-case, then describe-ug-r-1 after mug-r-remove-iam
+    took out only the IAM user; round 2's mug-r-remove-default-add-iam2, mug-r-remove-only-default and their
+    describe-ug-r-1, describe-ug-r-only-1; round 3's mug-r-remove-default-and-member, mug-r-remove-all,
+    describe-ug-r3; round 4's mug-r-remove-default-add-two, describe-ug-r4)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-r-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids[m] for m in members])
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "UserIdsToRemove": [ids[m] for m in remove]}
+    if add:
+        params["UserIdsToAdd"] = [ids[m] for m in add]
+    with pytest.raises(ClientError) as exc:
+        ec.modify_user_group(**params)
+    _assert_default_user_required(exc)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert group["UserIds"] == [ids[m] for m in members]
+
+
+def test_modify_redis_user_group_with_default_user_left(ec, ec_users):
+    """Removing another user, or swapping one `default` user for another, is accepted
+    (real AWS, us-east-2: mug-r-remove-iam, describe-ug-r-1, mug-r-swap-default, describe-ug-r-2)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-r-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-iam"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def"]]
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToAdd=[ids["r-def2"]], UserIdsToRemove=[ids["r-def"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def2"]]
+
+
+def test_modify_upper_case_engine_user_group_keeps_default_user(ec, ec_users):
+    """A group created with Engine `REDIS` is a Redis group for the rule too (real AWS, us-east-2:
+    cug-REDIS-ok, mug-REDIS-remove-default, describe-ug-REDIS-after)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-upper-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="REDIS", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    with pytest.raises(ClientError) as exc:
+        ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+    _assert_default_user_required(exc)
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def"], ids["r-iam"]]
+
+
+def test_modify_attached_user_group_keeps_default_user(ec, ec_users):
+    """A group attached to a replication group is refused the same way and stays attached and unchanged
+    (real AWS, us-east-2, round6-replication-group.py: mug-attached-remove-default,
+    describe-ug-attached-after)."""
+    ids, groups, s = ec_users
+    group_id, rg_id = f"dug-ug-rg-{s}", f"dug-rg-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ministack test",
+                                Engine="redis", CacheNodeType="cache.t4g.micro", NumCacheClusters=1,
+                                TransitEncryptionEnabled=True, UserGroupIds=[group_id])
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+        _assert_default_user_required(exc)
+        group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+        assert group["UserIds"] == [ids["r-def"], ids["r-iam"]]
+        assert group["ReplicationGroups"] == [rg_id]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_modify_serverless_attached_user_group_keeps_default_user(ec, ec_users):
+    """A group attached to a serverless cache is refused the same way and stays unchanged (real AWS,
+    us-east-2, round12-attached-cfn.py: mug-sl-remove-default, describe-after-mug-sl-remove-default)."""
+    ids, groups, s = ec_users
+    group_id, name = f"dug-{_uid()}-{s}", f"dug-sl-{_uid()}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="redis", MajorEngineVersion="7", UserGroupId=group_id)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+        _assert_default_user_required(exc)
+        assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def"], ids["r-iam"]]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_modify_valkey_user_group_removes_default_user(ec, ec_users):
+    """A Valkey group's `default` user can be removed (real AWS, us-east-2: cug-v-ok, mug-v-remove-default,
+    describe-ug-v)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-v-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="valkey", UserIds=[ids["v-def"], ids["v-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["v-def"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["v-iam"]]
+
+
+@pytest.mark.parametrize("key,engine,members,modify,code", [
+    ("cug-r-missing-user", "redis", ["missing"], None, "UserNotFound"),
+    ("cug-r-missing-user-with-default", "redis", ["r-def", "missing"], None, "UserNotFound"),
+    ("cug-r-same-id-twice", "redis", ["r-iam", "r-iam"], None, "InvalidParameterValue"),
+    ("cug-r-two-defaults", "redis", ["r-def", "r-def2"], None, None),
+    ("cug-r-two-case-defaults", "redis", ["r-case", "r-case2"], None, None),
+    ("cug-r-valkey-default", "redis", ["v-def", "r-iam"], None, None),
+    ("cug-no-engine", None, ["r-iam"], None, None),
+    ("mug-r-remove-default-and-missing", "redis", ["r-def", "r-iam"], {"UserIdsToRemove": ["r-def", "missing"]},
+     "InvalidParameterValue"),
+    ("mug-r-remove-default-add-missing", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["missing"], "UserIdsToRemove": ["r-def"]}, "UserNotFound"),
+    ("mug-r-remove-default-add-member", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["r-iam"], "UserIdsToRemove": ["r-def"]}, "InvalidParameterCombination"),
+    ("mug-r-remove-member-twice", "redis", ["r-def", "r-iam"], {"UserIdsToRemove": ["r-iam", "r-iam"]},
+     "InvalidParameterValue"),
+    ("mug-r-remove-default-twice", "redis", ["r-def", "r-iam"], {"UserIdsToRemove": ["r-def", "r-def"]},
+     "InvalidParameterValue"),
+    ("mug-r-remove-default-add-twice", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["r-iam2", "r-iam2"], "UserIdsToRemove": ["r-def"]}, "InvalidParameterValue"),
+    ("mug-r-remove-default-and-existing-non-member", "redis", ["r-def", "r-iam"],
+     {"UserIdsToRemove": ["r-def", "r-iam2"]}, "InvalidParameterValue"),
+    ("mug-r-remove-default-add-valkey-default", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["v-def"], "UserIdsToRemove": ["r-def"]}, None),
+    ("mug-r-remove-default-add-two-case", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["r-case", "r-case2"], "UserIdsToRemove": ["r-def"]}, None),
+])
+def test_redis_user_group_earlier_errors_come_before_default_user(ec, ec_users, key, engine, members, modify, code):
+    """AWS refuses these with another error before the default-user check (real AWS, us-east-2: the key
+    named). Where MiniStack emulates that error the call gets its code; MiniStack contract: where it
+    doesn't yet (code None), the call keeps MiniStack's earlier answer, 200, rather than DefaultUserRequired."""
+    ids, groups, s = ec_users
+    ids = {**ids, "missing": f"dug-missing-{s}"}
+    raw = make_client("elasticache", {"parameter_validation": False})
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "UserIds": [ids[m] for m in members]}
+    if engine:
+        params["Engine"] = engine
+    call, kwargs = raw.create_user_group, params
+    if modify:
+        ec.create_user_group(**params)
+        call, kwargs = raw.modify_user_group, {"UserGroupId": group_id,
+                                               **{k: [ids[m] for m in v] for k, v in modify.items()}}
+    if code is None:
+        assert call(**kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+    else:
+        with pytest.raises(ClientError) as exc:
+            call(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+
+
+@pytest.mark.parametrize("key,group_engine,engine", [
+    ("mug-engine-redis-remove-default", "redis", "redis"),
+    ("mug-engine-Redis-remove-default", "redis", "Redis"),
+    ("mug-engine-memcached-remove-default", "redis", "memcached"),
+    ("mug-r-engine-junk-remove-default", "redis", "not-an-engine"),
+    ("mug-v-engine-redis-remove-default", "valkey", "redis"),
+    ("mug-v-engine-memcached-remove-default", "valkey", "memcached"),
+    ("mug-v-engine-junk-remove-default", "valkey", "not-an-engine"),
+])
+def test_modify_user_group_engine_redis_keeps_default_user(ec, ec_users, key, group_engine, engine):
+    """Sending any Engine but `valkey` with the change keeps the rule, also on a Valkey group of Redis users,
+    and the group is left as it was, engine included (real AWS, us-east-2, rounds 7, 9, 10 and 11: the key
+    named and describe-after-<key>)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine=group_engine, UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    raw = make_client("elasticache", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw.modify_user_group(UserGroupId=group_id, Engine=engine, UserIdsToRemove=[ids["r-def"]])
+    _assert_default_user_required(exc)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == (group_engine, [ids["r-def"], ids["r-iam"]])
+
+
+@pytest.mark.parametrize("key,group_engine,engine,add,remove,after", [
+    ("mug-r-engine-valkey-add-user", "redis", "valkey", ["r-iam2"], [], ["r-def", "r-iam", "r-iam2"]),
+    ("mug-r-engine-valkey-remove-iam", "redis", "valkey", [], ["r-iam"], ["r-def"]),
+    ("mug-v-engine-redis-add-user", "valkey", "redis", ["r-iam2"], [], ["r-def", "r-iam", "r-iam2"]),
+    ("mug-v-engine-redis-remove-iam", "valkey", "redis", [], ["r-iam"], ["r-def"]),
+    ("mug-r-engine-valkey-add-Default", "redis", "valkey", ["r-case"], [], ["r-def", "r-iam", "r-case"]),
+    ("mug-r-engine-valkey-remove-all", "redis", "valkey", [], ["r-def", "r-iam"], []),
+])
+def test_modify_user_group_engine_change_with_other_users(ec, ec_users, key, group_engine, engine, add, remove,
+                                                          after):
+    """An engine change made together with adding or removing other users is applied with them, `Default`
+    beside `default` included (real AWS, us-east-2, round10-last.py and round12-attached-cfn.py: the key named
+    and describe-after-<key>; round13-tags-engine.py for removing every user)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine=group_engine, UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "Engine": engine}
+    if add:
+        params["UserIdsToAdd"] = [ids[m] for m in add]
+    if remove:
+        params["UserIdsToRemove"] = [ids[m] for m in remove]
+    ec.modify_user_group(**params)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == (engine, [ids[m] for m in after])
+
+
+@pytest.mark.parametrize("engine", ["valkey", "Valkey", "VALKEY"])
+def test_modify_user_group_engine_valkey_removes_default_user(ec, ec_users, engine):
+    """Changing the group to Valkey (any case) in the same call lets its `default` user go, and the group is
+    Valkey afterwards (real AWS, us-east-2: round 7's mug-engine-valkey-remove-default, round 9's
+    mug-engine-Valkey-remove-default, mug-engine-VALKEY-remove-default, and their describe-after-<key>)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-engine-valkey-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, Engine=engine, UserIdsToRemove=[ids["r-def"]])
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("valkey", [ids["r-iam"]])
+
+
+def test_modify_valkey_user_group_engine_redis(ec, ec_users):
+    """A Valkey group of Redis users with a `default` one changed to Redis on its own becomes Redis (real AWS,
+    us-east-2, round9-remaining.py: mug-v-engine-redis-only, describe-after-mug-v-engine-redis-only)."""
+    ids, groups, s = ec_users
+    changed = f"dug-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=changed, Engine="valkey", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(changed)
+    ec.modify_user_group(UserGroupId=changed, Engine="redis")
+    group = ec.describe_user_groups(UserGroupId=changed)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("redis", [ids["r-def"], ids["r-iam"]])
+
+
+def test_modify_valkey_user_group_engine_redis_adding_default_user(ec, ec_users):
+    """A Valkey group can be made Redis in the call that adds its `default` user (real AWS, us-east-2,
+    round13-tags-engine.py: mug-v-engine-redis-add-default, describe-after-mug-v-engine-redis-add-default)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    ec.create_user_group(UserGroupId=group_id, Engine="valkey", UserIds=[ids["r-iam"]])
+    ec.modify_user_group(UserGroupId=group_id, Engine="redis", UserIdsToAdd=[ids["r-def"]])
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("redis", [ids["r-iam"], ids["r-def"]])
+
+
+@pytest.mark.parametrize("key,members", [
+    ("mug-v-no-default-engine-redis", ["r-iam"]),
+    ("mug-v-empty-engine-redis", []),
+])
+def test_modify_valkey_user_group_engine_redis_requires_default_user(ec, ec_users, key, members):
+    """Making a Valkey group without a `default` user Redis is refused, and it stays Valkey (real AWS,
+    us-east-2, round13-tags-engine.py: the key named and describe-after-<key>)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    raw = make_client("elasticache", {"parameter_validation": False})  # the capture's empty UserIds
+    raw.create_user_group(UserGroupId=group_id, Engine="valkey", UserIds=[ids[m] for m in members])
+    with pytest.raises(ClientError) as exc:
+        ec.modify_user_group(UserGroupId=group_id, Engine="redis")
+    _assert_default_user_required(exc)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("valkey", [ids[m] for m in members])
+
+
+@pytest.mark.parametrize("case", ["valkey-user", "duplicate-name", "attached", "serverless-attached"])
+def test_modify_user_group_uncaptured_engine_changes_are_ignored(ec, ec_users, case):
+    """MiniStack contract: Engine `valkey` leaves the engine as it was, as before this change, with a second
+    `default` user added (AWS refuses two users with one name: DuplicateUserName, cug-r-two-defaults,
+    mug-r-remove-default-add-two-case), or on a group attached to a replication group or a serverless
+    cache (AWS: InvalidParameterValue, mug-rg-engine-valkey-only, mug-sl-engine-valkey-only), errors
+    MiniStack doesn't emulate; and, not captured, with a Valkey user added."""
+    ids, groups, s = ec_users
+    group_id, rg_id = f"dug-{_uid()}-{s}", f"dug-rg-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "Engine": "valkey"}
+    if case == "valkey-user":
+        params["UserIdsToAdd"] = [ids["v-iam"]]
+    elif case == "duplicate-name":
+        params["UserIdsToAdd"] = [ids["r-def2"]]
+    elif case == "serverless-attached":
+        ec.create_serverless_cache(ServerlessCacheName=rg_id, Engine="redis", MajorEngineVersion="7",
+                                   UserGroupId=group_id)
+    else:
+        ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ministack test",
+                                    Engine="redis", CacheNodeType="cache.t4g.micro", NumCacheClusters=1,
+                                    TransitEncryptionEnabled=True, UserGroupIds=[group_id])
+    try:
+        ec.modify_user_group(**params)
+        assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["Engine"] == "redis"
+        if case in ("attached", "valkey-user"):  # and the rest of the call goes through, as before
+            ec.modify_user_group(UserGroupId=group_id, Engine="valkey", UserIdsToRemove=[ids["r-def"]])
+            assert ids["r-def"] not in ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"]
+    finally:
+        if case == "attached":
+            ec.delete_replication_group(ReplicationGroupId=rg_id)
+        elif case == "serverless-attached":
+            ec.delete_serverless_cache(ServerlessCacheName=rg_id)
+
+
+@pytest.mark.parametrize("key,template,length", [
+    ("cug-upper-id-no-default", "dug-UPPER-{s}", None),
+    ("cug-id-39-no-default", "dug-{s}-" + "a" * 26, 39),
+    ("cug-id-40-no-default", "dug-{s}-" + "a" * 27, 40),
+    ("cug-id-trailing-hyphen-no-default", "dug-trail-{s}-", None),
+    ("cug-id-1-char-no-default", "{c}", 1),
+])
+def test_create_user_group_accepted_ids_require_default_user(ec, ec_users, key, template, length):
+    """Ids with upper-case letters, of 1, 39 or 40 characters, or ending with a hyphen pass AWS's id check and
+    get the rule (real AWS, us-east-2, round9-remaining.py, round10-last.py and round14-dup-tags.py: the key
+    named)."""
+    ids, groups, s = ec_users
+    group_id = template.format(s=s, c="abcdefghijklmnop"[int(s[0], 16)])  # a 1-character id still varies
+    groups.append(group_id)
+    assert length is None or len(group_id) == length
+    with pytest.raises(ClientError) as exc:
+        ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-iam"]])
+    _assert_default_user_required(exc)
+
+
+@pytest.mark.parametrize("key,tags", [
+    ("cug-tags-valid-no-default", [{"Key": "k", "Value": "v"}]),
+    ("cug-tags-key-128-no-default", [{"Key": "k" * 128, "Value": "v"}]),
+    ("cug-tags-no-value-no-default", [{"Key": "k"}]),
+    ("cug-tags-51-tags-no-default", [{"Key": f"k{i}", "Value": "v"} for i in range(51)]),
+    ("cug-tags-duplicate-keys-no-default", [{"Key": "k", "Value": "a"}, {"Key": "k", "Value": "b"}]),
+    ("cug-tags-multibyte-128-no-default", [{"Key": "é" * 128, "Value": "v"}]),
+])
+def test_create_user_group_accepted_tags_require_default_user(ec, ec_users, key, tags):
+    """Tags with keys up to 128 characters (multibyte ones too), without a value, with a key repeated, or
+    more than 50 of them pass AWS's checks and the group gets the rule (real AWS, us-east-2,
+    round13-tags-engine.py and round14-dup-tags.py: the key named)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    raw = make_client("elasticache", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-iam"]], Tags=tags)
+    _assert_default_user_required(exc)
+
+
+@pytest.mark.parametrize("key,group_id,tags", [
+    ("cug-bad-chars-no-default", "dug-Bad_ID!!-{s}", None),
+    ("cug-long-id-no-default", "dug-{s}-" + "x" * 300, None),
+    ("cug-id-41-no-default", "dug-{s}-" + "a" * 28, None),
+    ("cug-id-leading-digit-no-default", "9dug-digit-{s}", None),
+    ("cug-id-double-hyphen-no-default", "dug--double-{s}", None),
+    ("cug-empty-tag-key-no-default", "dug-tagkey-{s}", [{"Key": "", "Value": "v"}]),
+    ("cug-tags-key-129-no-default", "dug-tags-{s}", [{"Key": "k" * 129, "Value": "v"}]),
+    ("cug-tags-aws-prefix-no-default", "dug-tags-{s}", [{"Key": "aws:x", "Value": "v"}]),
+    ("cug-tags-value-257-no-default", "dug-tags-{s}", [{"Key": "k", "Value": "v" * 257}]),
+    ("cug-tags-odd-chars-no-default", "dug-tags-{s}", [{"Key": "a#b*{}", "Value": "v"}]),
+])
+def test_create_user_group_input_errors_are_not_default_user_required(ec, ec_users, key, group_id, tags):
+    """MiniStack contract: AWS refuses these with InvalidParameterValue before the default-user check (real
+    AWS, us-east-2, round9-remaining.py, round10-last.py, round11-id-length.py, round13-tags-engine.py and
+    round14-dup-tags.py: the key named), which
+    MiniStack doesn't emulate yet. Until it does, they keep MiniStack's earlier answer, 200, rather than
+    DefaultUserRequired."""
+    ids, groups, s = ec_users
+    group_id = group_id.format(s=s)
+    raw = make_client("elasticache", {"parameter_validation": False})
+    params = {"UserGroupId": group_id, "Engine": "redis", "UserIds": [ids["r-iam"]]}
+    if tags:
+        params["Tags"] = tags
+    resp = raw.create_user_group(**params)
+    groups.append(group_id)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
+def test_modify_user_group_engine_valkey_then_removes_default_user(ec, ec_users):
+    """A group changed to Valkey on its own is a Valkey group, whose `default` user can then be removed
+    (real AWS, us-east-2, round8-engine-sequence.py: mug-seq-engine-valkey, describe-seq-after-engine,
+    mug-seq-remove-default, describe-seq-after-remove)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-engine-valkey-only-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, Engine="valkey")
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("valkey", [ids["r-def"], ids["r-iam"]])
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-iam"]]
+
+
+def test_redis_user_group_valkey_default_user_removal_is_not_default_user_required(ec, ec_users):
+    """MiniStack contract, not captured: removing a Valkey `default` user from a Redis group (a group AWS
+    refuses to create, cug-r-valkey-default) keeps MiniStack's earlier answer, 200."""
+    ids, groups, s = ec_users
+    group_id = f"dug-vdef-in-redis-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["v-def"], ids["r-iam"]])
+    groups.append(group_id)
+    resp = ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["v-def"]])
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
 def test_elasticache_subnet_and_param_groups_are_region_scoped():
     east = _ec_client("us-east-1")
     west = _ec_client("us-west-2")
@@ -609,12 +1115,12 @@ def test_elasticache_subnet_and_param_groups_are_region_scoped():
     east.create_cache_subnet_group(
         CacheSubnetGroupName=subnet_name,
         CacheSubnetGroupDescription="east subnet",
-        SubnetIds=["subnet-east"],
+        SubnetIds=["subnet-00000001"],
     )
     west.create_cache_subnet_group(
         CacheSubnetGroupName=subnet_name,
         CacheSubnetGroupDescription="west subnet",
-        SubnetIds=["subnet-west"],
+        SubnetIds=["subnet-00000001"],
     )
     east.create_cache_parameter_group(
         CacheParameterGroupName=param_name,
@@ -733,8 +1239,8 @@ def test_elasticache_events_are_region_scoped():
         east_events = east.describe_events(SourceIdentifier=cid)["Events"]
         west_events = west.describe_events(SourceIdentifier=cid)["Events"]
         assert [e["Message"] for e in east_events] == [
-            "Cache cluster created",
             "Cache cluster deleted",
+            "Cache cluster created",
         ]
         assert [e["Message"] for e in west_events] == ["Cache cluster created"]
     finally:
@@ -1093,7 +1599,7 @@ def test_delete_cache_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName=name,
         CacheSubnetGroupDescription="To be deleted",
-        SubnetIds=["subnet-aaa"],
+        SubnetIds=["subnet-00000001"],
     )
     # verify exists
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
@@ -1106,6 +1612,44 @@ def test_delete_cache_subnet_group(ec):
     with pytest.raises(ClientError) as exc:
         ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
     assert "CacheSubnetGroupNotFoundFault" in str(exc.value)
+
+
+def test_cache_subnet_group_keeps_subnets_and_tags(ec):
+    name = f"sg-keep-{_uid()}"
+    group = ec.create_cache_subnet_group(
+        CacheSubnetGroupName=name,
+        CacheSubnetGroupDescription="two subnets",
+        SubnetIds=["subnet-00000001", "subnet-00000002"],
+        Tags=[{"Key": "env", "Value": "dev"}],
+    )["CacheSubnetGroup"]
+    try:
+        described = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)["CacheSubnetGroups"][0]
+        for g in (group, described):
+            assert g["VpcId"] == "vpc-00000001"
+            assert [(s["SubnetIdentifier"], s["SubnetAvailabilityZone"]["Name"]) for s in g["Subnets"]] == [
+                ("subnet-00000001", "us-east-1a"), ("subnet-00000002", "us-east-1b")]
+        assert ec.list_tags_for_resource(ResourceName=group["ARN"])["TagList"] == [{"Key": "env", "Value": "dev"}]
+
+        with pytest.raises(ClientError) as exc:
+            ec.create_cache_subnet_group(CacheSubnetGroupName=name, CacheSubnetGroupDescription="again",
+                                         SubnetIds=["subnet-00000001"])
+        assert exc.value.response["Error"]["Code"] == "CacheSubnetGroupAlreadyExists"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        modified = ec.modify_cache_subnet_group(
+            CacheSubnetGroupName=name, SubnetIds=["subnet-00000003"])["CacheSubnetGroup"]
+        assert modified["VpcId"] == "vpc-00000001"
+        assert [s["SubnetIdentifier"] for s in modified["Subnets"]] == ["subnet-00000003"]
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_cache_subnet_group(CacheSubnetGroupName=name, SubnetIds=["subnet-doesnotexist"])
+        assert exc.value.response["Error"]["Code"] == "InvalidSubnet"
+    finally:
+        ec.delete_cache_subnet_group(CacheSubnetGroupName=name)
+
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +1960,303 @@ def _tls_command(endpoint, ca_file, command):
             conn.sendall(f"*{len(parts)}\r\n".encode()
                          + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
             return conn.recv(65536)
+
+
+def _tls_session(endpoint, ca_file, *commands):
+    """Replies to ``commands`` sent in order on one TLS connection."""
+    import socket
+    import ssl
+    ctx = ssl.create_default_context(cafile=ca_file)
+    replies = []
+    with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname=endpoint["Address"]) as conn:
+            for parts in commands:
+                conn.sendall(f"*{len(parts)}\r\n".encode()
+                             + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                time.sleep(0.2)
+                replies.append(conn.recv(65536))
+    return replies
+
+
+def _docker_reachable():
+    try:
+        import docker
+        return docker.from_env().ping()
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
+    """#2457: with a Valkey user group the engine's default user is off (AWS RBAC docs), the group's users
+    exist with their access strings and passwords, and an iam user logs in with its token."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    pw_user, iam_user, ro_user, group, name = (f"u-pw-{uid}", f"u-iam-{uid}", f"u-ro-{uid}", f"g-{uid}", f"sls-acl-{uid}")
+    ec.create_user(UserId=pw_user, UserName=pw_user, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    ec.create_user(UserId=iam_user, UserName=iam_user, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    ec.create_user(UserId=ro_user, UserName=ro_user, Engine="valkey", AccessString="on ~app:* -@all +get",
+                   AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[pw_user, iam_user, ro_user])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="8", UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        noauth, wrongpass = b"-NOAUTH Authentication required.\r\n", \
+            b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        assert _tls_session(ep, ca, ("PING",), ("SET", "k", "v")) == [noauth, noauth]
+        assert _tls_session(ep, ca, ("AUTH", pw_user, "wrong-password-123456"), ("PING",)) == [wrongpass, noauth]
+        assert _tls_session(ep, ca, ("AUTH", "default", pw), ("AUTH", pw)) == [wrongpass, wrongpass]
+        assert _tls_session(ep, ca, ("AUTH", pw_user, pw), ("ACL", "WHOAMI"), ("SET", "k", "v")) == [
+            b"+OK\r\n", f"${len(pw_user)}\r\n{pw_user}\r\n".encode(), b"+OK\r\n"]
+        assert _tls_session(ep, ca, ("AUTH", iam_user, f"{name}/?Action=connect&User={iam_user}"), ("PING",)) == [
+            b"+OK\r\n", b"+PONG\r\n"]
+        ro = _tls_session(ep, ca, ("AUTH", ro_user, pw), ("GET", "app:1"), ("SET", "app:1", "x"))
+        assert ro[:2] == [b"+OK\r\n", b"$-1\r\n"] and ro[2].startswith(b"-NOPERM")
+        assert _tls_session(ep, ca, ("HELLO", "3", "AUTH", pw_user, "nope-nope-nope-nope")) == [wrongpass]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (pw_user, iam_user, ro_user):
+            ec.delete_user(UserId=user)
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+def test_serverless_cache_user_changes_reach_the_engine_with_restricted_commands(ec, tmp_path):
+    """User and group changes reach a running serverless cache (#2554), its users cannot run ACL SETUSER or
+    CONFIG (AWS restricted commands), and detaching the group reopens `default`."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    keep, rem, group, name = f"u-keep-{uid}", f"u-rem-{uid}", f"g-{uid}", f"sls-chg-{uid}"
+    for user in (keep, rem):
+        ec.create_user(UserId=user, UserName=user, Engine="valkey", AccessString="on ~* +@all",
+                       AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[keep, rem])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="8", UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        ok, wrongpass = b"+OK\r\n", b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        replies = _tls_session(ep, ca, ("AUTH", keep, pw), ("SET", "k", "v"), ("ACL", "SETUSER", "x", "on"),
+                               ("CONFIG", "GET", "maxmemory"))
+        assert replies[:2] == [ok, ok] and all(r.startswith(b"-NOPERM") for r in replies[2:])
+        assert _tls_session(ep, ca, ("AUTH", rem, pw)) == [ok]
+
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[rem])
+        assert _tls_session(ep, ca, ("AUTH", rem, pw)) == [wrongpass]
+        assert _tls_session(ep, ca, ("AUTH", keep, pw), ("GET", "k")) == [ok, b"$1\r\nv\r\n"]  # data kept
+
+        ec.modify_user(UserId=keep, AccessString="on ~app:* -@all +get")
+        assert _tls_session(ep, ca, ("AUTH", keep, pw), ("SET", "k", "v"))[1].startswith(b"-NOPERM")
+
+        ec.modify_serverless_cache(ServerlessCacheName=name, RemoveUserGroup=True)
+        assert _tls_session(ep, ca, ("PING",)) == [b"+PONG\r\n"]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (keep, rem):
+            ec.delete_user(UserId=user)
+
+
+# Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS in us-east-2: the
+# same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (capture rounds
+# aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7), aws-channel-cases and
+# aws-selectors-node). Round aws-one-group-password captured every string here again in one group per
+# engine, as the test sets them up, and three of them also as password users, with the same channels.
+_AWS_ACL_CHANNELS = {
+    "on ~* +@all": "&*",
+    "on ~* &allowed* +@all": "&allowed*",
+    "on ~* resetchannels +@all": "",
+    "on ~* allchannels +@all": "&*",
+    "on ~* &* +@all": "&*",
+    "on ~* &a resetchannels &b +@all": "&b",
+    "on ~* +@all (&chan +get ~k)": "",
+    "on ~* +@all (+get ~k)": "",
+    # without channel rules, serverless only (aws-no-channel-shapes, aws-no-channel-shapes-v8-v9)
+    "on ~k +get": "&*",
+    "off ~* +@all": "&*",
+    "on ~* -@all +publish +subscribe": "&*",
+    "on ~app:* +@all": "&*",
+    "on +@all": "&*",
+    # the #2518 unit test's string; serverless only (aws-one-group-password)
+    "on ~foo) (~x +get) +set": "",
+}
+# More selector shapes, captured in groups that also held a password user named default, on every
+# serverless engine (aws-selectors-default); checked in the same setup.
+_AWS_ACL_CHANNELS_WITH_DEFAULT = {
+    "on ~* +@all": "&*",
+    "on ~k +get (&chan +publish)": "",
+    "off (+get ~k)": "",
+    "on ~* &x +@all (+get ~k)": "&x",
+    "on ~* +@all (+get ~k) (&c +publish)": "",
+    "on (~k +get)": "",
+}
+
+
+def test_user_access_string_with_channel_pattern_round_trips(ec):
+    """AWS returns an access string with `&` XML-escaped in CreateUser, DescribeUsers, ModifyUser and
+    DeleteUser (captures create-user-ctl, describe-user-ctl, modify-user-amp, delete-user-amp); AWS also
+    rewrites it (`on ~* resetchannels &allowed* +@all`), which MiniStack does not, so only the pattern
+    is compared."""
+    uid = f"u-amp-{_uid()}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* &allowed* +@all",
+                             AuthenticationMode={"Type": "iam"})
+    try:
+        assert "&allowed*" in created["AccessString"]
+        assert "&allowed*" in ec.describe_users(UserId=uid)["Users"][0]["AccessString"]
+        assert "&other*" in ec.modify_user(UserId=uid, AccessString="on ~* &other* +@all")["AccessString"]
+    finally:
+        assert "&other*" in ec.delete_user(UserId=uid)["AccessString"]
+
+
+def test_user_acl_channels_default_to_all():
+    """The ACL SETUSER commands MiniStack sends: `&*` before an access string without channel rules or
+    selectors, and nothing before the rest."""
+    def user(access):
+        return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
+
+    with_all_channels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
+                         "on ~app:* +@all", "on +@all"}  # the rest set channels or have a selector
+    for access in {**_AWS_ACL_CHANNELS, **_AWS_ACL_CHANNELS_WITH_DEFAULT}:
+        prefix = ["reset", "&*"] if access in with_all_channels else ["reset"]
+        assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
+
+
+def test_user_acl_keeps_unicode_space_inside_a_pattern():
+    """AWS stores `~a\\xa0b` appended to `on ~x +@all` as one key pattern (us-east-2, issue #2551,
+    round23 modify-a-key-nbsp). MiniStack sends the engine the rules as stored; no capture reads a
+    real cache's ACL for it."""
+    user = {"UserId": "u", "UserName": "u", "AccessString": "on ~x ~a\xa0b +@all", "Authentication": {"Type": "iam"}}
+    assert elasticache._acl_setuser(user) == ["ACL", "SETUSER", "u", "reset", "&*", "on", "~x", "~a\xa0b", "+@all",
+                                              "nopass"]
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+@pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
+def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
+    """Capture rounds aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7),
+    aws-no-channel-shapes and aws-no-channel-shapes-v8-v9 (AWS, us-east-2): each user's channels match
+    `_AWS_ACL_CHANNELS`, an iam user with
+    `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all` gets
+    NOPERM outside `allowed*` (Valkey's exact text; for Redis only a channel NOPERM, see below).
+    A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
+    one (DefaultUserRequired), so the Redis group has one with `on ~* +@all`, which gets `&*`."""
+    import socket
+    import ssl
+    uid, pw = _uid(), "msc-capture-default-password-1"
+    expected = _AWS_ACL_CHANNELS
+    users = {access: f"u-{i}-{uid}" for i, access in enumerate(expected)}
+    all_user, ctl_user = users["on ~* +@all"], users["on ~* &allowed* +@all"]
+    group, name, default_id = f"g-{uid}", f"sls-chan-{uid}", f"u-def-{uid}"
+    for access, user_id in users.items():
+        ec.create_user(UserId=user_id, UserName=user_id, Engine=engine, AccessString=access,
+                       AuthenticationMode={"Type": "iam"})
+    group_ids = list(users.values())
+    if engine == "redis":
+        ec.create_user(UserId=default_id, UserName="default", Engine="redis", AccessString="on ~* +@all",
+                       AuthenticationMode={"Type": "password", "Passwords": [pw]})
+        group_ids.append(default_id)
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=group_ids)
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        # AWS's Redis OSS 7.1 words the error "this user has no permissions to access one of the channels
+        # used as arguments"; MiniStack's redis:7 image words it like Valkey, so for Redis only a channel
+        # NOPERM is required.
+        valkey_nochan = b"-NOPERM No permissions to access a channel\r\n"
+
+        def nochan(reply):
+            if engine == "redis":
+                return reply.startswith(b"-NOPERM ") and b"channel" in reply
+            return reply == valkey_nochan
+
+        def auth(user):
+            return ("AUTH", user, f"{name}/?Action=connect&User={user}")
+
+        def subscribe_and_publish(user, channel):
+            ctx = ssl.create_default_context(cafile=ca)
+            with socket.create_connection((ep["Address"], ep["Port"]), timeout=10) as raw:
+                with ctx.wrap_socket(raw, server_hostname=ep["Address"]) as sub:
+                    for parts in (auth(user), ("SUBSCRIBE", channel)):
+                        sub.sendall(f"*{len(parts)}\r\n".encode()
+                                    + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                        time.sleep(0.2)
+                        subscribed = sub.recv(65536)
+                    published = _tls_session(ep, ca, auth(user), ("PUBLISH", channel, "hello"))[1]
+                    time.sleep(0.2)
+                    return subscribed, published, sub.recv(65536) if published == b":1\r\n" else None
+
+        for access, user_id in users.items():
+            channels = expected[access]
+            # read through the `on ~* +@all` user, as in the capture: an `off` user cannot AUTH
+            reply = _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", user_id))[1]
+            # the root channels come right before `selectors`; each selector has its own channels field
+            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
+        selector_user = users["on ~* +@all (&chan +get ~k)"]
+        reply = _tls_session(ep, ca, auth(selector_user), ("ACL", "GETUSER", selector_user), ("PUBLISH", "chan", "x"))
+        # a selector's channels are its last field, and the selectors list ends the reply
+        assert reply[1].endswith(b"$8\r\nchannels\r\n$5\r\n&chan\r\n") and nochan(reply[2])
+        selector_user = users["on ~* +@all (+get ~k)"]
+        reply = _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", selector_user))[1]
+        assert reply.endswith(b"$8\r\nchannels\r\n$0\r\n\r\n")
+        if engine == "redis":
+            default = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"))[1]
+            assert b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in default
+        else:
+            assert b"$25\r\nuser default off &* -@all\r\n" in _tls_session(ep, ca, auth(all_user), ("ACL", "LIST"))[1]
+        chan = b"$8\r\nany-chan\r\n"
+        assert subscribe_and_publish(all_user, "any-chan") == (
+            b"*3\r\n$9\r\nsubscribe\r\n" + chan + b":1\r\n", b":1\r\n",
+            b"*3\r\n$7\r\nmessage\r\n" + chan + b"$5\r\nhello\r\n")
+        subscribed, published, message = subscribe_and_publish(ctl_user, "any-chan")
+        assert nochan(subscribed) and nochan(published) and message is None
+        assert subscribe_and_publish(ctl_user, "allowed-chan")[1] == b":1\r\n"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in group_ids:
+            ec.delete_user(UserId=user)
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+@pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
+def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path, engine, major):
+    """Capture rounds aws-engines (v7def) and aws-selectors-default (AWS, serverless, us-east-2): a
+    password user named default with `on ~* +@all`, in the group when the cache is created, has channels
+    `&*` and can PUBLISH, and the group's other users have the root channels in
+    `_AWS_ACL_CHANNELS_WITH_DEFAULT`."""
+    uid, pw = _uid(), "msc-capture-default-password-1"
+    user_id, group, name = f"u-def-{uid}", f"g-{uid}", f"sls-def-{uid}"
+    ec.create_user(UserId=user_id, UserName="default", Engine=engine, AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    users = {access: f"u-{i}-{uid}" for i, access in enumerate(_AWS_ACL_CHANNELS_WITH_DEFAULT)}
+    for access, other in users.items():
+        ec.create_user(UserId=other, UserName=other, Engine=engine, AccessString=access,
+                       AuthenticationMode={"Type": "iam"})
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=[user_id, *users.values()])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        replies = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"),
+                               ("PUBLISH", "any-chan", "x"))
+        assert replies[0] == b"+OK\r\n" and b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in replies[1]
+        assert replies[2] == b":0\r\n"
+        reader = users["on ~* +@all"]
+        for access, other in users.items():
+            channels = _AWS_ACL_CHANNELS_WITH_DEFAULT[access]
+            reply = _tls_session(ep, ca, ("AUTH", reader, f"{name}/?Action=connect&User={reader}"),
+                                 ("ACL", "GETUSER", other))[1]
+            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (user_id, *users.values()):
+            ec.delete_user(UserId=user)
 
 
 def test_serverless_cache_create_describe_delete(ec):
@@ -1822,7 +2663,7 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
 
     spawned = []
 
-    def fake_spawn(name, engine, engine_version, labels):
+    def fake_spawn(name, engine, engine_version, labels, **_):
         spawned.append({"name": name, "engine": engine,
                          "engine_version": engine_version, "labels": labels})
         return ("ministack-elasticache", 6379, f"cid-{name}")
@@ -1865,7 +2706,7 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     set_request_account_id("000000000000")
     _ec.reset()
     monkeypatch.setattr(_ec, "_spawn_redis_container",
-                          lambda name, engine, engine_version, labels: ("rg-host", 6379, f"cid-{name}"))
+                          lambda name, engine, engine_version, labels, **_: ("rg-host", 6379, f"cid-{name}"))
 
     _ec.load_persisted_state({
         "replication_groups": {
@@ -1886,6 +2727,34 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     assert ("000000000000", "us-east-1", "rg-1") not in _ec._pending_rg_respawn
 
 
+def test_elasticache_restore_state_reports_the_respawned_replication_group_address(monkeypatch):
+    """A respawned node group container has a new address; the group's endpoints report it (#2521)."""
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                        lambda name, engine, engine_version, labels, **_: ("172.18.0.9", 6379, f"cid-{name}"))
+    old = {"Address": "172.18.0.4", "Port": 6379}
+    _ec.load_persisted_state({
+        "replication_groups": {
+            "rg-ep": {
+                "ReplicationGroupId": "rg-ep", "Engine": "valkey", "EngineVersion": "8.1",
+                "ConfigurationEndpoint": dict(old),
+                "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                                "NodeGroupMembers": [{"CacheClusterId": "rg-ep-0001-001", "ReadEndpoint": dict(old)}]}],
+                "_docker_container_ids": ["dead-cid"],
+            },
+        },
+    })
+    _ec._ensure_live_containers()
+    rg = _ec._replication_groups["rg-ep"]
+    new = {"Address": "172.18.0.9", "Port": 6379}
+    ng = rg["NodeGroups"][0]
+    assert ng["PrimaryEndpoint"] == ng["ReaderEndpoint"] == ng["NodeGroupMembers"][0]["ReadEndpoint"] == new
+    assert rg["ConfigurationEndpoint"] == new
+
+
 def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
     from ministack.services import elasticache as _ec
@@ -1893,7 +2762,7 @@ def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
     _ec.reset()
     spawned = []
 
-    def fake_spawn(name, engine, engine_version, labels):
+    def fake_spawn(name, engine, engine_version, labels, **_):
         spawned.append({"name": name, "labels": labels})
         return (f"{labels['region']}-host", 6379, f"cid-{name}")
 
@@ -2297,3 +3166,634 @@ def test_serverless_ca_persists_across_restart(monkeypatch):
     monkeypatch.setattr(ec, "_serverless_ca", None)
     ec.load_persisted_state(state)
     assert ec.serverless_ca_cert_pem() == pem
+
+
+def test_replication_group_auth_token_needs_transit_encryption(ec):
+    rg_id = f"auth-{_uid()}"
+    for kwargs, code, message in (
+        ({"TransitEncryptionEnabled": False}, "InvalidParameterValue",
+         "The AUTH token is only supported when encryption-in-transit is enabled"),
+        ({"TransitEncryptionEnabled": True, "TransitEncryptionMode": "preferred"}, "InvalidParameterCombination",
+         "Transit encryption preferred is not supported with access control enabled clusters."),
+    ):
+        with pytest.raises(ClientError) as exc:
+            ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="t", Engine="redis",
+                                        NumCacheClusters=1, AuthToken="a-very-long-auth-token-123", **kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+
+    plain = ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="t",
+                                        Engine="redis", NumCacheClusters=1)["ReplicationGroup"]
+    try:
+        assert plain["TransitEncryptionEnabled"] is False and "TransitEncryptionMode" not in plain
+        member = ec.describe_cache_clusters(CacheClusterId=plain["MemberClusters"][0])["CacheClusters"][0]
+        assert (member["AuthTokenEnabled"], member["TransitEncryptionEnabled"], member["AtRestEncryptionEnabled"]) == (
+            False, False, False)
+        with pytest.raises(ClientError) as exc:
+            ec.modify_replication_group(ReplicationGroupId=rg_id, AuthToken="a-very-long-auth-token-123",
+                                        AuthTokenUpdateStrategy="ROTATE")
+        assert exc.value.response["Error"]["Message"] == (
+            "The AUTH token modification is only supported when encryption-in-transit is enabled")
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def _redis_session(endpoint, ca_file, *commands):
+    import socket
+    import ssl
+    ctx = ssl.create_default_context(cafile=ca_file)
+    deadline = time.time() + 30
+    while True:
+        try:
+            with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=5) as raw:
+                with ctx.wrap_socket(raw, server_hostname=endpoint["Address"]) as conn:
+                    replies = []
+                    for parts in commands:
+                        conn.sendall(f"*{len(parts)}\r\n".encode()
+                                     + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                        replies.append(conn.recv(65536))
+                    return replies
+        except (OSError, ssl.SSLError):
+            if time.time() > deadline:
+                raise
+            time.sleep(0.3)
+
+
+@pytest.mark.data_plane
+def test_replication_group_serves_tls_and_requires_auth_token(ec, tmp_path):
+    rg_id = f"tls-{_uid()}"
+    first, second = "first-auth-token-0123", "second-auth-token-4567"
+    rg = ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="t", Engine="redis",
+                                     NumCacheClusters=1, TransitEncryptionEnabled=True,
+                                     AtRestEncryptionEnabled=True, AuthToken=first)["ReplicationGroup"]
+    try:
+        assert (rg["TransitEncryptionEnabled"], rg["TransitEncryptionMode"], rg["AuthTokenEnabled"]) == (
+            True, "required", True)
+        member = ec.describe_cache_clusters(CacheClusterId=rg["MemberClusters"][0])["CacheClusters"][0]
+        assert (member["TransitEncryptionEnabled"], member["TransitEncryptionMode"],
+                member["AuthTokenEnabled"], member["AtRestEncryptionEnabled"]) == (True, "required", True, True)
+
+        endpoint = rg["NodeGroups"][0]["PrimaryEndpoint"]
+        ca_file = _serverless_ca_file(tmp_path)
+        assert _redis_session(endpoint, ca_file, ["PING"])[0].startswith(b"-NOAUTH")
+        assert _redis_session(endpoint, ca_file, ["AUTH", first], ["PING"]) == [b"+OK\r\n", b"+PONG\r\n"]
+
+        ec.modify_replication_group(ReplicationGroupId=rg_id, AuthToken=second,
+                                    AuthTokenUpdateStrategy="ROTATE", ApplyImmediately=True)
+        for token in (first, second):
+            assert _redis_session(endpoint, ca_file, ["AUTH", token])[0] == b"+OK\r\n"
+        ec.modify_replication_group(ReplicationGroupId=rg_id, AuthToken=second,
+                                    AuthTokenUpdateStrategy="SET", ApplyImmediately=True)
+        assert _redis_session(endpoint, ca_file, ["AUTH", first])[0].startswith(b"-WRONGPASS")
+        assert _redis_session(endpoint, ca_file, ["AUTH", second])[0] == b"+OK\r\n"
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_elasticache_host_port_skips_a_port_already_taken():
+    """#2456: a host port another process holds is skipped, so the container's docker run does not
+    fail with "port is already allocated"."""
+    import socket
+
+    from ministack.services import elasticache as ec_mod
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("0.0.0.0", 0))
+    holder.listen(1)
+    taken = holder.getsockname()[1]
+    saved = ec_mod._port_counter[0]
+    try:
+        ec_mod._port_counter[0] = taken
+        port = ec_mod._next_host_port()
+        assert port != taken
+        assert port > taken
+        assert ec_mod._port_counter[0] == port + 1
+    finally:
+        ec_mod._port_counter[0] = saved
+        holder.close()
+
+
+@pytest.mark.parametrize("engine,minimum", [("valkey", "7.2"), ("redis", "7.0")])
+def test_elasticache_iam_user_follows_aws(ec, engine, minimum):
+    """#2458, captured on AWS: an iam user keeps Type iam with no PasswordCount, its MinimumEngineVersion,
+    and AWS's InvalidParameterCombination errors."""
+    uid = f"iam-{engine}-{_uuid_mod.uuid4().hex[:6]}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine=engine, AccessString="on ~* +@all",
+                             AuthenticationMode={"Type": "iam"})
+    try:
+        assert created["Authentication"] == {"Type": "iam"}
+        assert created["MinimumEngineVersion"] == minimum
+        described = ec.describe_users(UserId=uid)["Users"][0]
+        assert (described["Authentication"], described["MinimumEngineVersion"]) == ({"Type": "iam"}, minimum)
+    finally:
+        ec.delete_user(UserId=uid)
+    for kwargs, message in (
+            ({"UserName": f"{uid}-other", "AuthenticationMode": {"Type": "iam"}},
+             "User Id and User name must be same for authentication type: iam"),
+            ({"UserName": uid, "AuthenticationMode": {"Type": "iam", "Passwords": ["a-long-enough-password-1"]}},
+             "Password field is not allowed with authentication type: iam")):
+        with pytest.raises(ClientError) as exc:
+            ec.create_user(UserId=uid, Engine=engine, AccessString="on ~* +@all", **kwargs)
+        err = exc.value.response["Error"]
+        assert (err["Code"], err["Message"]) == ("InvalidParameterCombination", message)
+
+
+def test_elasticache_user_modes_and_modify_follow_aws(ec):
+    """#2458: no-password-required is refused for Valkey, a password user reports its PasswordCount,
+    and ModifyUser to iam answers with the user modifying."""
+    with pytest.raises(ClientError) as exc:
+        ec.create_user(UserId=f"nopw-{_uuid_mod.uuid4().hex[:6]}", UserName="n", Engine="valkey",
+                       AccessString="on ~* +@all", AuthenticationMode={"Type": "no-password-required"})
+    assert exc.value.response["Error"]["Message"] == "No-password-required is not allowed for a user with engine Valkey"
+    uid = f"pw-{_uuid_mod.uuid4().hex[:6]}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all",
+                             AuthenticationMode={"Type": "password", "Passwords": ["a-long-enough-password-1"]})
+    try:
+        assert created["Authentication"] == {"Type": "password", "PasswordCount": 1}
+        modified = ec.modify_user(UserId=uid, AuthenticationMode={"Type": "iam"})
+        assert (modified["Status"], modified["Authentication"]) == ("modifying", {"Type": "iam"})
+        assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+# Real AWS (us-east-2, issue #2551): each captured user's CreateUser, ModifyUser and DescribeUsers calls in
+# order, with AWS's answers. Built from the raw captures; a user's calls stop before one MiniStack doesn't model.
+def _append_captures():
+    """Expand the compact fixture: a step is ["c", create], [append, expect], ["m", params, expect] or
+    ["d", expect], and an integer expect is an index into "errors"."""
+    with open(os.path.join(os.path.dirname(__file__), "fixtures", "elasticache", "append_access_string.json")) as f:
+        data = json.load(f)
+    def step(row):
+        if row[0] == "c":
+            return "c", data["creates"][row[1]], None
+        op, params, expect = (("d", None, row[1]) if row[0] == "d" else ("m", row[1], row[2]) if row[0] == "m"
+                              else ("m", {"AppendAccessString": row[0]}, row[1]))
+        return op, params, data["errors"][expect] if isinstance(expect, int) else expect
+    return [{"id": case_id, "steps": [step(row) for row in rows]} for case_id, rows in data["cases"]]
+
+
+_APPEND_CAPTURES = _append_captures()
+
+
+@pytest.mark.parametrize("case", _APPEND_CAPTURES, ids=[c["id"] for c in _APPEND_CAPTURES])
+def test_elasticache_modify_user_append_replays_aws(ec, case):
+    """Each step is sent as captured and answered as AWS answered: the error's status, code and message, or
+    the user's Status, AccessString, MinimumEngineVersion and Authentication."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:8]}"
+    calls = {"c": ec.create_user, "m": ec.modify_user, "d": ec.describe_users}
+    created = False
+    try:
+        for op, params, expect in case["steps"]:
+            kwargs = {"UserId": uid, **({"UserName": uid} if op == "c" else {}), **(params or {})}
+            if expect and isinstance(expect[0], int):
+                with pytest.raises(ClientError) as exc:
+                    calls[op](**kwargs)
+                response = exc.value.response
+                assert [response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"],
+                        response["Error"]["Message"]] == expect
+                continue
+            answer = calls[op](**kwargs)
+            created = created or op == "c"
+            if op == "c":
+                continue
+            user = answer["Users"][0] if op == "d" else answer
+            want = {"Status": "modifying" if op == "m" else "active", "AccessString": expect[0],
+                    "MinimumEngineVersion": expect[1], "Authentication": expect[2] if len(expect) > 2 else {"Type": "iam"}}
+            if want["Authentication"] is None:  # no-password: AWS omits PasswordCount, MiniStack writes 0
+                del want["Authentication"]
+                assert user["Authentication"]["Type"] == "no-password"
+            assert {k: user.get(k) for k in want} == want
+    finally:
+        if created:
+            ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_append_skips_stored_rules_aws_refuses(ec):
+    """MiniStack contract, not AWS behavior: a stored AccessString can hold rules AWS would have refused
+    (`reset` here), since CreateUser doesn't check them all. An append skips them instead of failing."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="reset on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        assert ec.modify_user(UserId=uid, AppendAccessString="-flushall")["AccessString"] == "on ~* +@all -flushall"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_no_password_redis_user_reports_engine_floor(ec):
+    """AWS reports 6.0 for a no-password Redis user (us-east-2, issue #2551, round22 create-nopass-get)."""
+    uid = f"nopass-{_uuid_mod.uuid4().hex[:8]}"
+    user = ec.create_user(UserId=uid, UserName=uid, Engine="redis", AccessString="on ~* -@all",
+                          AuthenticationMode={"Type": "no-password-required"})
+    try:
+        assert user["MinimumEngineVersion"] == "6.0"
+        assert user["Authentication"]["Type"] == "no-password"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_append_refuses_control_characters(ec):
+    """MiniStack contract: XML can't carry a control character, so an append holding one is refused and
+    the user keeps its access string. (AWS stores `~a\\x1cb` and then answers InternalFailure, round 23.)"""
+    uid = f"ctrl-{_uuid_mod.uuid4().hex[:8]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~x +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        for append in ("~a\x1cb", "&a\x01b", "(+get|\x01)", "~a\ufffeb"):
+            with pytest.raises(ClientError) as exc:
+                ec.modify_user(UserId=uid, AppendAccessString=append)
+            assert exc.value.response["Error"]["Message"] == "The access-string is invalid."
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~x +@all"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_access_string_and_append_together(ec):
+    """AccessString with AppendAccessString is refused and the user keeps its rules
+    (AWS captures round1 modify-both, describe-both); an unknown user is reported first
+    (round2 modify-both-missing)."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=uid, AccessString="on ~* +get", AppendAccessString="-get")
+        err = exc.value.response["Error"]
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]) == (
+            400, "InvalidParameterCombination",
+            "Both AccessString and AppendAccessString provided together. Pass either one of them.")
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~* +@all"
+        with pytest.raises(ClientError) as exc:  # round8 modify-both-spaces: an append of only spaces counts
+            ec.modify_user(UserId=uid, AccessString="on ~* +get", AppendAccessString="   ")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=f"{uid}-nosuch", AccessString="on ~* +get", AppendAccessString="-get")
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"],
+                exc.value.response["Error"]["Code"]) == (404, "UserNotFound")
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_user_group_changes_answer_as_aws(ec):
+    """Real AWS (us-west-2): access strings are reported with `-@all`, user-group changes answer pending,
+    a group's default user cannot be deleted, and UserGroupIds is absent once the last group is detached."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    default, app, group, rg_id = f"d-{uid}", f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=default, UserName="default", Engine="valkey", AccessString="off -@all", Passwords=[pw])
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[default, app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        assert ec.modify_user(UserId=app, AccessString="on ~app:* +@read")["AccessString"] == "on ~app:* -@all +@read"
+        removed = ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert (removed["Status"], removed["UserIds"], removed["PendingChanges"]) == (
+            "modifying", [default, app], {"UserIdsToRemove": [app]})
+        with pytest.raises(ClientError) as exc:
+            ec.delete_user(UserId=default)
+        assert exc.value.response["Error"]["Code"] == "DefaultUserAssociatedToUserGroup"
+        detached = ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group],
+                                               ApplyImmediately=True)["ReplicationGroup"]
+        assert (detached["Status"], detached["UserGroupIds"], detached["PendingModifiedValues"]) == (
+            "modifying", [group], {"UserGroups": {"UserGroupIdsToAdd": [], "UserGroupIdsToRemove": [group]}})
+        assert "UserGroupIds" not in ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+        # A group still attached cannot be deleted; a user in it can (real AWS, us-west-2).
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToAdd=[group], ApplyImmediately=True)
+        with pytest.raises(ClientError) as exc:
+            ec.delete_user_group(UserGroupId=group)
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "InvalidUserGroupState", f"User group {group} can't be deleted because it is still associated "
+            "with at least 1 replication group or serverless cache.")
+        assert ec.delete_user(UserId=app)["Status"] == "deleting"
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group], ApplyImmediately=True)
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=default)
+
+
+def test_elasticache_user_access_string_validated_as_aws(ec):
+    """Real AWS (us-west-2, Valkey 8.1): unknown commands, categories and syntax are refused; subcommands are not checked."""
+    uid = _uid()
+    for access, message in (
+            ("on ~* +doesnotexist", "Access string contains invalid command(s). "
+                                    "Please verify the list of available commands in user-api."),
+            ("on ~* +@notacategory", "Access string contains invalid category(s). "
+                                     "Please verify the list of available category in user-api."),
+            ("garbage", "The access-string is invalid.")):
+        with pytest.raises(ClientError) as exc:
+            ec.create_user(UserId=f"bad-{uid}", UserName=f"bad-{uid}", Engine="valkey", AccessString=access,
+                           Passwords=["a-long-enough-password-1"])
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "InvalidParameterValue", message)
+    ec.create_user(UserId=f"ok-{uid}", UserName=f"ok-{uid}", Engine="valkey", AccessString="on ~* +get|nosub",
+                   Passwords=["a-long-enough-password-1"])
+    try:
+        assert ec.describe_users(UserId=f"ok-{uid}")["Users"][0]["AccessString"] == "on ~* -@all +get|nosub"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=f"ok-{uid}", AccessString="on ~* (+doesnotexist)")
+        assert "invalid command(s)" in exc.value.response["Error"]["Message"]
+        assert ec.modify_user(UserId=f"ok-{uid}", AccessString="on ~* +@json +bf.add +hgetex")["AccessString"] == (
+            "on ~* -@all +@json +bf.add +hgetex")
+    finally:
+        ec.delete_user(UserId=f"ok-{uid}")
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path):
+    """A replication group's user group is configured on its engine and follows every change: default is
+    off without a default user, application users cannot change users, and detaching restores default."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all (~* +@all)", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        ep = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0]["PrimaryEndpoint"]
+        ca = _serverless_ca_file(tmp_path)
+        ok, deadline = b"+OK\r\n", time.time() + 30
+        while True:
+            try:
+                unauthenticated = _tls_session(ep, ca, ("SET", "k", "v"))[0]
+                break
+            except OSError:  # still starting
+                assert time.time() < deadline
+                time.sleep(0.5)
+        assert unauthenticated.startswith(b"-NOAUTH")
+        assert _tls_session(ep, ca, ("AUTH", app, "wrong-password-123456"))[0].startswith(b"-WRONGPASS")
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v")) == [ok, ok]
+        # No channels outside its selectors, as on AWS, for an access string with a selector.
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("PUBLISH", "ch", "x"))[1].startswith(b"-NOPERM")
+        took = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "SETUSER", "default", "on", "nopass", "+@all"))
+        assert took[1].startswith(b"-NOPERM")
+        # Only the group's users and `default off`, as on AWS (real AWS, us-west-2, Valkey 8.1).
+        users, acl = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "USERS"), ("ACL", "LIST"))[1:]
+        assert users == f"*2\r\n${len(app)}\r\n{app}\r\n$7\r\ndefault\r\n".encode()
+        acl_lines = [line for line in acl.split(b"\r\n") if line.startswith(b"user ")]
+        assert len(acl_lines) == 2 and acl_lines[0].startswith(f"user {app} on #".encode())
+        assert acl_lines[1] == b"user default off &* -@all"
+
+        ec.modify_user(UserId=app, AccessString="on ~app:* +@read")  # re-applied with default off
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v"))[1].startswith(b"-NOPERM")
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert _tls_session(ep, ca, ("AUTH", app, pw))[0].startswith(b"-WRONGPASS")
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group], ApplyImmediately=True)
+        assert _tls_session(ep, ca, ("SET", "k", "v")) == [ok]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=app)
+
+
+def test_elasticache_acl_setuser_denies_inside_selectors_only():
+    """Restricted commands are denied inside each (selector), and a key pattern ending in `)` is no selector."""
+    from ministack.services import elasticache as _ec
+    user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
+    assert _ec._acl_setuser(user, ("-a", "-b")) == [
+        "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+    assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
+    assert _ec._engine_acl({"Engine": "redis", "EngineVersion": "5.0.6"}, None, None) is None  # no ACL before 6
+    assert _ec._engine_rules(["on", "+json.get", "(+@bloom", "~x)", "(~y", "+bf.add)", "(-@json)"],
+                             _ec._ACL_MODULE_NAMES) == ["on", "(~x)", "(~y)", "()"]
+    from ministack.core.responses import get_account_id, get_region
+    uid = _uid()
+    _ec._users[f"u-{uid}"] = {"UserId": f"u-{uid}", "UserName": "u", "AccessString": "on ~* +get +hgetex +json.get",
+                              "Authentication": {"Type": "iam"}}
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"u-{uid}"]}
+    try:
+        _ec._users[f"u-{uid}"]["AccessString"] += " -eval_ro"
+        for engine, version, rules in (("valkey", "8.0", "~* +get -eval_ro"), ("valkey", "9.0", "~* +get +hgetex -eval_ro"),
+                                       ("redis", "7", "~* +get -eval_ro"), ("redis", "6.2", "~* +get")):
+            rg = {"Engine": engine, "EngineVersion": version, "UserGroupIds": [f"g-{uid}"]}
+            assert f"user u reset &* on {rules} -acl" in _ec._engine_acl(rg, get_account_id(), get_region())
+    finally:
+        del _ec._users[f"u-{uid}"], _ec._user_groups[f"g-{uid}"]
+
+
+def test_elasticache_engine_acl_takes_no_credentials_or_lines_from_the_api():
+    """A user name cannot add ACL file lines, and an access string cannot set passwords or nopass."""
+    from ministack.core.responses import get_account_id, get_region
+    from ministack.services import elasticache as _ec
+    uid = _uid()
+    _ec._users[f"u-{uid}"] = {"UserId": f"u-{uid}", "UserName": "app\nuser evil on nopass ~* &* +@all",
+                              "AccessString": "on ~* +@all", "Authentication": {"Type": "iam"}}
+    _ec._users[f"p-{uid}"] = {"UserId": f"p-{uid}", "UserName": "pw", "Authentication": {"Type": "password"},
+                              "AccessString": "on ~* >secret #ab !cd <x nopass resetpass reset +@all",
+                              "_PasswordHashes": ["ef"]}
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"u-{uid}", f"p-{uid}"]}
+    try:
+        acl = _ec._engine_acl({"Engine": "valkey", "EngineVersion": "8.0", "UserGroupIds": [f"g-{uid}"]},
+                              get_account_id(), get_region())
+        assert "evil" not in acl and acl.count("\n") == 2
+        assert "user pw reset &* on ~* +@all -acl|setuser -acl|deluser -acl|load -acl|save -config #ef\n" in acl
+    finally:
+        del _ec._users[f"u-{uid}"], _ec._users[f"p-{uid}"], _ec._user_groups[f"g-{uid}"]
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_elasticache_replication_group_keeps_its_data_when_users_change(ec, tmp_path):
+    """A user change restarts the engines to read the new ACL file; the data survives the restart."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        ep = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0]["PrimaryEndpoint"]
+        ca = _serverless_ca_file(tmp_path)
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "app:k", "v"))[1] == b"+OK\r\n"
+        ec.modify_user(UserId=app, AccessString="on ~app:* +@read")
+        got = _tls_session(ep, ca, ("AUTH", app, pw), ("GET", "app:k"), ("SET", "app:k", "w"))
+        assert got[1] == b"$1\r\nv\r\n" and got[2].startswith(b"-NOPERM")  # the new access string, the old key
+        # Module commands the engine image does not load are left out of its ACL; the rest applies.
+        ec.modify_user(UserId=app, AccessString="on ~* +@write +json.get (+@bloom ~x)")
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "app:k", "w")) == [b"+OK\r\n", b"+OK\r\n"]
+        assert ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0][
+            "PrimaryEndpoint"] == ep
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=app)
+
+
+def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkeypatch):
+    """A change that lands while the ACL file is being written is written too, without a lock."""
+    from ministack.core.responses import get_account_id, get_region
+    from ministack.services import elasticache as _ec
+    uid = _uid()
+    user = {"UserId": f"a-{uid}", "UserName": f"a-{uid}", "AccessString": "on ~* +@all",
+            "Authentication": {"Type": "iam"}}
+    _ec._users[user["UserId"]] = user
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [user["UserId"]]}
+    written = []
+
+    class Container:
+        id = "c1"
+
+        def put_archive(self, path, data):
+            import tarfile
+            with tarfile.open(fileobj=io.BytesIO(data)) as bundle:
+                written.append(bundle.extractfile(bundle.getmembers()[0]).read().decode())
+            user["AccessString"] = "on ~app:* -@all +@read"  # a ModifyUser landing meanwhile
+            return True
+
+        def restart(self, timeout):
+            written.append("restart")
+
+        def exec_run(self, cmd):
+            return types.SimpleNamespace(exit_code=0, output=b"NOAUTH Authentication required.")
+
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda cid: Container()))
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    rg = {"ReplicationGroupId": f"rg-{uid}", "Engine": "valkey", "EngineVersion": "8.0",
+          "UserGroupIds": [f"g-{uid}"], "_docker_container_ids": ["c1"]}
+    try:
+        _ec._apply_user_groups(rg, get_account_id(), get_region())
+        assert written[-1] == "restart" and "~app:*" in written[-2] and "+@all" not in written[-2]
+        assert written[-2].endswith("user default reset &*\n")
+    finally:
+        del _ec._users[user["UserId"]], _ec._user_groups[f"g-{uid}"]
+
+
+
+def test_elasticache_modify_user_group_refuses_member_adds_and_non_member_removes(ec):
+    """Adding a current member or removing a non-member is refused before anything changes, adds checked
+    first, the first bad entry named (real AWS, us-east-1); a group is never recorded twice on a user."""
+    uid = _uid()
+    dflt, member, other, group = f"d-{uid}", f"m-{uid}", f"o-{uid}", f"g-{uid}"
+    ec.create_user(UserId=dflt, UserName="default", Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    for user in (member, other):
+        ec.create_user(UserId=user, UserName=user, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    ec.create_user_group(UserGroupId=group, Engine="redis", UserIds=[dflt, member])
+
+    def refused(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user_group(UserGroupId=group, **kwargs)
+        err = exc.value.response["Error"]
+        return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
+
+    try:
+        already = (400, "InvalidParameterCombination", f"{member} is already a member of {group}.")
+        assert refused(UserIdsToAdd=[member], UserIdsToRemove=[member]) == already
+        assert refused(UserIdsToAdd=[member]) == already
+        assert refused(UserIdsToAdd=[other, member]) == already
+        not_member = (400, "InvalidParameterValue", f"User {other} is not a member of user group {group}.")
+        assert refused(UserIdsToRemove=[other]) == not_member
+        assert refused(UserIdsToAdd=[other], UserIdsToRemove=[other]) == not_member
+        assert refused(UserIdsToRemove=[member, other]) == not_member
+        assert refused(UserIdsToAdd=[member], UserIdsToRemove=[other]) == already  # adds first
+        group_after = ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]
+        assert sorted(group_after["UserIds"]) == sorted([dflt, member])
+        assert ec.describe_users(UserId=other)["Users"][0]["UserGroupIds"] == []
+        assert ec.describe_users(UserId=member)["Users"][0]["UserGroupIds"] == [group]
+    finally:
+        ec.delete_user_group(UserGroupId=group)
+        for user in (dflt, member, other):
+            ec.delete_user(UserId=user)
+
+
+def test_elasticache_builtin_default_user(ec):
+    """Every account has the built-in `default` user, which can't be modified or deleted (real AWS, us-east-1)."""
+    user = ec.describe_users(UserId="default")["Users"][0]
+    assert {k: v for k, v in user.items() if k != "ARN"} == {
+        "UserId": "default", "UserName": "default", "Status": "active", "Engine": "redis",
+        "MinimumEngineVersion": "6.0", "AccessString": "on ~* +@all", "UserGroupIds": [],
+        "Authentication": {"Type": "no-password"}}
+    assert re.fullmatch(r"arn:aws:elasticache:[a-z0-9-]+:\d{12}:user:default", user["ARN"])
+    assert [u for u in ec.describe_users()["Users"] if u["UserId"] == "default"] == [user]
+    for call, word in ((lambda: ec.modify_user(UserId="default", AccessString="on ~* +@read"), "modified"),
+                       (lambda: ec.delete_user(UserId="default"), "deleted")):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == f"default user can't be {word}."
+    uid = _uid()
+    group = f"g-{uid}"
+    ec.create_user_group(UserGroupId=group, Engine="redis", UserIds=["default"])
+    try:
+        assert ec.describe_users(UserId="default")["Users"][0]["UserGroupIds"] == [group]
+    finally:
+        ec.delete_user_group(UserGroupId=group)
+    assert ec.describe_users(UserId="default")["Users"][0]["UserGroupIds"] == []
+
+
+def test_elasticache_user_group_duplicate_and_unknown_users(ec):
+    """ModifyUserGroup checks run member-to-add, duplicate-to-add, unknown-to-add, non-member-to-remove,
+    duplicate-to-remove; CreateUserGroup checks duplicates before unknown users; DeleteUser drops the user
+    from its groups (real AWS, us-east-1)."""
+    uid = _uid()
+    dflt, member, other, group, ghost = f"d-{uid}", f"m-{uid}", f"o-{uid}", f"g-{uid}", f"x-{uid}"
+    ec.create_user(UserId=dflt, UserName="default", Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    for user in (member, other):
+        ec.create_user(UserId=user, UserName=user, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+
+    def refused(fn, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            fn(**kwargs)
+        err = exc.value.response["Error"]
+        return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
+
+    dup = (400, "InvalidParameterValue", "Duplicate user id specified.")
+    unknown = (404, "UserNotFound", f"User {ghost} not found.")
+    already = (400, "InvalidParameterCombination", f"{member} is already a member of {group}.")
+    not_member = (400, "InvalidParameterValue", f"User {other} is not a member of user group {group}.")
+    create = lambda ids: refused(ec.create_user_group, UserGroupId=group, Engine="redis", UserIds=ids)
+    assert create([dflt, member, member]) == dup
+    assert create([dflt, ghost, member, member]) == dup
+    assert create([dflt, ghost, f"y-{uid}"]) == unknown
+    assert ec.describe_users(UserId=member)["Users"][0]["UserGroupIds"] == []
+    ec.create_user_group(UserGroupId=group, Engine="redis", UserIds=[dflt, member])
+    modify = lambda **kw: refused(ec.modify_user_group, UserGroupId=group, **kw)
+    try:
+        assert modify(UserIdsToAdd=[other, other, member]) == already
+        assert modify(UserIdsToAdd=[ghost, other, other]) == dup
+        assert modify(UserIdsToAdd=[ghost], UserIdsToRemove=[member, member]) == unknown
+        assert modify(UserIdsToAdd=[ghost, f"y-{uid}"]) == unknown
+        assert modify(UserIdsToAdd=[ghost], UserIdsToRemove=[other]) == unknown
+        assert modify(UserIdsToRemove=[member, member, other]) == not_member
+        assert modify(UserIdsToRemove=[ghost]) == (400, "InvalidParameterValue",
+                                                   f"User {ghost} is not a member of user group {group}.")
+        assert modify(UserIdsToAdd=[other], UserIdsToRemove=[member, member]) == dup
+        assert sorted(ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"]) == sorted([dflt, member])
+        assert ec.describe_users(UserId=other)["Users"][0]["UserGroupIds"] == []
+        ec.delete_user(UserId=member)
+        assert ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"] == [dflt]
+        assert modify(UserIdsToRemove=[member]) == (400, "InvalidParameterValue",
+                                                    f"User {member} is not a member of user group {group}.")
+    finally:
+        ec.delete_user_group(UserGroupId=group)
+        for user in (dflt, other):
+            ec.delete_user(UserId=user)
+
+
+
+def test_elasticache_failed_replication_group_respawn_drops_the_stale_address(monkeypatch, caplog):
+    """A node group whose respawn fails reports the fallback endpoint, not its old address, and the log says it
+    failed (#2709)."""
+    import logging
+
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                        lambda name, engine, engine_version, labels, **_: (_ec.REDIS_DEFAULT_HOST, 6379, None))
+    old = {"Address": "192.168.148.10", "Port": 6379}
+    _ec.load_persisted_state({"replication_groups": {"rg-1": {
+        "ReplicationGroupId": "rg-1", "Engine": "valkey", "EngineVersion": "8.0",
+        "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                        "NodeGroupMembers": [{"ReadEndpoint": dict(old)}]}],
+        "_docker_container_ids": ["dead"]}}})
+    with caplog.at_level(logging.INFO):
+        _ec._ensure_live_containers()
+    ng = _ec._replication_groups["rg-1"]["NodeGroups"][0]
+    fallback = {"Address": _ec.REDIS_DEFAULT_HOST, "Port": 6379}
+    assert (ng["PrimaryEndpoint"], ng["ReaderEndpoint"], ng["NodeGroupMembers"][0]["ReadEndpoint"]) == (
+        fallback, fallback, fallback)
+    assert "failed to respawn node group(s) 0001 of replication group rg-1" in caplog.text
+    assert "respawned containers for replication group rg-1" not in caplog.text

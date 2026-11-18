@@ -74,18 +74,30 @@ def _resource_key(type_name, identifier):
     return f"{type_name}\x00{identifier}"
 
 
-def _extract_identifier(props):
-    """Derive a primary identifier from a resource's properties.
+def _primary_identifier_keys(type_name):
+    """Schema primaryIdentifier for the types MiniStack's CloudFormation import knows."""
+    try:
+        from ministack.services.cloudformation.changesets import _IMPORT_LOOKUPS
+    except Exception:
+        return ()
+    entry = _IMPORT_LOOKUPS.get(type_name)
+    return entry[0] if entry else ()
 
-    Real Cloud Control derives the identifier from the resource type's schema
-    primaryIdentifier. Without those schemas we pick a stable, deterministic
-    value: a common id-like property if present, else a generated id.
-    """
+
+def _extract_identifier(type_name, props):
+    """The resource's primary identifier; compound identifiers join with ``|`` in schema order."""
+    keys = _primary_identifier_keys(type_name)
+    values = [props.get(k) for k in keys]
+    if keys and all(isinstance(v, (str, int)) and str(v) for v in values):
+        return "|".join(str(v) for v in values)
     for candidate in ("Id", "Name", "Arn", "BucketName", "Identifier",
                       "PhysicalResourceId", "ResourceId"):
         val = props.get(candidate)
         if isinstance(val, (str, int)) and str(val):
             return str(val)
+    names = [k for k, v in props.items() if k.endswith("Name") and isinstance(v, str) and v]
+    if len(names) == 1:
+        return props[names[0]]
     return new_uuid()
 
 
@@ -143,7 +155,7 @@ def _create_resource(data):
             400,
         )
 
-    identifier = _extract_identifier(props)
+    identifier = _extract_identifier(type_name, props)
     key = _resource_key(type_name, identifier)
     if key in _resources:
         return error_response_json(
@@ -246,6 +258,19 @@ def _delete_resource(data):
     return json_response({"ProgressEvent": event})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_resources(data):
     type_name = data.get("TypeName")
     if not type_name:
@@ -259,10 +284,11 @@ def _list_resources(data):
         for rec in _resources.values()
         if rec.get("TypeName") == type_name
     ]
-    return json_response({
-        "TypeName": type_name,
-        "ResourceDescriptions": descriptions,
-    })
+    page, nxt = _page(descriptions, data.get("MaxResults"), data.get("NextToken"))
+    resp = {"TypeName": type_name, "ResourceDescriptions": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _list_resource_requests(data):
@@ -276,7 +302,11 @@ def _list_resource_requests(data):
         if statuses and event.get("OperationStatus") not in statuses:
             continue
         summaries.append(event)
-    return json_response({"ResourceRequestStatusSummaries": summaries})
+    page, nxt = _page(summaries, data.get("MaxResults") or 20, data.get("NextToken"))
+    resp = {"ResourceRequestStatusSummaries": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _get_resource_request_status(data):

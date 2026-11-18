@@ -12,9 +12,12 @@ import json
 import logging
 import os
 import re
+import uuid
 from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
+
+from ministack.core.arn import ArnParseError, parse_arn
 
 logger = logging.getLogger("ministack")
 
@@ -273,60 +276,29 @@ _S3CONTROL_MRAP_ASYNC_ACTIONS = {
 }
 
 
-_S3CONTROL_ACCESS_POINT_ACTIONS = {
-    ("PUT", False): "s3:CreateAccessPoint",
-    ("GET", False): "s3:GetAccessPoint",
-    ("DELETE", False): "s3:DeleteAccessPoint",
-    ("PUT", True): "s3:PutAccessPointPolicy",
-    ("GET", True): "s3:GetAccessPointPolicy",
-    ("DELETE", True): "s3:DeleteAccessPointPolicy",
-}
-
-
-_S3CONTROL_OBJECT_LAMBDA_ACTIONS = {
-    ("PUT", ""): "s3:CreateAccessPointForObjectLambda",
-    ("GET", ""): "s3:GetAccessPointForObjectLambda",
-    ("DELETE", ""): "s3:DeleteAccessPointForObjectLambda",
-    ("PUT", "configuration"): "s3:PutAccessPointConfigurationForObjectLambda",
-    ("GET", "configuration"): "s3:GetAccessPointConfigurationForObjectLambda",
-    ("PUT", "policy"): "s3:PutAccessPointPolicyForObjectLambda",
-    ("GET", "policy"): "s3:GetAccessPointPolicyForObjectLambda",
-    ("DELETE", "policy"): "s3:DeleteAccessPointPolicyForObjectLambda",
-}
-
-
 def s3control_action(method: str, path: str) -> str | None:
     """IAM action for an S3 Control Multi-Region Access Point or access point request, or None."""
     from urllib.parse import unquote
 
-    path = unquote(path).rstrip("/")
-    object_lambda = "/v20180820/accesspointforobjectlambda"
-    if path == object_lambda:
-        return "s3:ListAccessPointsForObjectLambda" if method == "GET" else None
-    if path.startswith(object_lambda + "/"):
-        sub = path[len(object_lambda) + 1:].partition("/")[2]
-        return _S3CONTROL_OBJECT_LAMBDA_ACTIONS.get((method, sub))
-    access_points = "/v20180820/accesspoint"
-    if path == access_points:
-        return "s3:ListAccessPoints" if method == "GET" else None
-    if path.startswith(access_points + "/"):
-        return _S3CONTROL_ACCESS_POINT_ACTIONS.get((method, path.endswith("/policy")))
-    async_prefix = "/v20180820/async-requests/mrap/"
+    from ministack.services import s3
+
+    # Access point and MRAP instance actions come from the route the handler serves.
+    for in_family, route_of in ((s3.is_object_lambda_control_path, s3.object_lambda_control_route),
+                                (s3.is_access_point_control_path, s3.access_point_control_route)):
+        if in_family(path):
+            route = route_of(path)
+            return route[3].get(method) if route else None
     instances = "/v20180820/mrap/instances"
+    if unquote(path) == instances or unquote(path).startswith(instances + "/"):
+        route = s3.mrap_control_route(path)
+        return route[3].get(method) if route else None
+    path = unquote(path).rstrip("/")
+    async_prefix = "/v20180820/async-requests/mrap/"
     if path.startswith(async_prefix):
         tail = path[len(async_prefix):]
         if method == "POST":
             return _S3CONTROL_MRAP_ASYNC_ACTIONS.get(tail)
         return "s3:DescribeMultiRegionAccessPointOperation" if method == "GET" else None
-    if path == instances:
-        return "s3:ListMultiRegionAccessPoints" if method == "GET" else None
-    if path.startswith(instances + "/"):
-        if path.endswith("/routes"):
-            return {"GET": "s3:GetMultiRegionAccessPointRoutes",
-                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}.get(method)
-        if path.endswith("/policy"):
-            return "s3:GetMultiRegionAccessPointPolicy" if method == "GET" else None
-        return "s3:GetMultiRegionAccessPoint" if method == "GET" else None
     return None
 
 
@@ -464,6 +436,52 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
     return checks
 
 
+# The context key marking the checks of a PutObject through another account's access point.
+S3_FOREIGN_STEP = "ministack:s3foreignstep"
+
+
+def s3_access_point_resources(resource_arn: str, action: str = "") -> list[tuple[str, dict]]:
+    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias.
+
+    A ``s3:PutObject`` through another account's access point is checked in the order recorded on AWS
+    (us-east-2): the caller's identity policy on the bucket object, then the owner's bucket policy, then the
+    caller's identity policy on the access point object, then the access point policy (with neither resource
+    policy allowing, the bucket answers; the identity policy must allow both objects). ``S3_FOREIGN_STEP``
+    names the step of each check.
+    """
+    from ministack.core.responses import get_account_id
+    from ministack.services import s3 as s3_svc
+
+    alias, sep, key = resource_arn.removeprefix("arn:aws:s3:::").partition("/")
+    foreign = action == "s3:PutObject" and bool(sep)
+    access_point = s3_svc.access_point_for_alias(alias, foreign) if resource_arn.startswith("arn:aws:s3:::") else None
+    if access_point is None:
+        return [(resource_arn, {})]
+    access_point_arn, bucket, keys = access_point
+    if sep:
+        checks = [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+        if keys["s3:DataAccessPointAccount"] != get_account_id():
+            checks = [(checks[1][0], {**keys, S3_FOREIGN_STEP: "identity"}),
+                      (checks[1][0], {**keys, S3_FOREIGN_STEP: "bucket"}),
+                      (checks[0][0], {**keys, S3_FOREIGN_STEP: "accesspoint-identity"}),
+                      (checks[0][0], {**keys, S3_FOREIGN_STEP: "accesspoint"})]
+        return checks
+    return [(access_point_arn, keys), (f"arn:aws:s3:::{bucket}", keys)]
+
+
+def s3_foreign_denial_message(keys: dict, action: str, principal_arn: str, denied, resource: str) -> str:
+    """The message of a denial in a step of a PutObject through another account's access point, or "" for
+    any other check (and for an explicit Deny of a resource policy, which has its own wording)."""
+    step = keys.get(S3_FOREIGN_STEP)
+    explicit = denied.decision == "Deny"
+    if not step or (explicit and denied.resource_policy_arn):
+        return ""
+    if explicit or step in ("identity", "accesspoint-identity"):
+        return identity_denial_message(action, principal_arn, f'"{resource}"', explicit)
+    return (f'User: {principal_arn} is not authorized to perform: {action} on resource: "{resource}" '
+            f"because no resource-based policy allows the {action} action")
+
+
 # Lambda REST path → IAM action
 def _lambda_action(method: str, path: str) -> str | None:
     parts = [p for p in path.split("/") if p]
@@ -549,11 +567,13 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "airflow": ["mwaa"],
     "opensearch": ["opensearch"],
     "pipes": ["pipes"],
+    "rds-data": ["rds-data"],
     "resource-groups": ["resource-groups"],
     "route53": ["route53"],
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "ses": ["sesv2"],  # the v2 REST API; v1 names its Action
     "signer": ["signer"],
 }
 
@@ -808,6 +828,8 @@ def extract_iam_action(service: str, method: str, path: str,
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
         return f"{_IAM_NAMESPACE_BY_OPERATION.get((service, action_name), namespace)}:{action_name}"
+    if service == "ses" and method == "GET" and path.rstrip("/") in _SES_V2_LEGACY_LIST_ROUTES:
+        return f"ses:{_SES_V2_LEGACY_LIST_ROUTES[path.rstrip('/')]}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)
@@ -933,6 +955,145 @@ def _kms_key_id_from_ciphertext(ciphertext_b64: str) -> str:
     return candidate if _KMS_KEY_ID_RE.match(candidate) else ""
 
 
+# Older SDK models send these SES v2 list calls as GET on the collection; the current model lists with POST.
+_SES_V2_LEGACY_LIST_ROUTES = {
+    "/v2/email/identities": "ListEmailIdentities",
+    "/v2/email/configuration-sets": "ListConfigurationSets",
+}
+
+# SES v2 path collection -> the resource type it names, and the body field that names it on create.
+_SES_V2_RESOURCES = {
+    "configuration-sets": ("configuration-set", "ConfigurationSetName"),
+    "contact-lists": ("contact-list", "ContactListName"),
+    "custom-verification-email-templates": ("custom-verification-email-template", "TemplateName"),
+    "dedicated-ip-pools": ("dedicated-ip-pool", "PoolName"),
+    "identities": ("identity", "EmailIdentity"),
+    "templates": ("template", "TemplateName"),
+}
+
+
+def _ses_v2_resource_arn(method: str, path: str, body: bytes, region: str, account_id: str) -> str:
+    """The SES v2 resource a /v2/email path or create body names, or '*'."""
+    parts = [p for p in path.split("/") if p]
+    if parts[:2] != ["v2", "email"] or len(parts) < 3 or parts[2] not in _SES_V2_RESOURCES:
+        return "*"
+    resource_type, create_field = _SES_V2_RESOURCES[parts[2]]
+    name = parts[3] if len(parts) > 3 else _safe_json_field(body, create_field) if method == "POST" else ""
+    return f"arn:aws:ses:{region}:{account_id}:{resource_type}/{name}" if name else "*"
+
+
+# Verified Access creates are authorized on a wildcard of the new resource's
+# type; the other calls on the id they name, in this order.
+_VERIFIED_ACCESS_CREATE_RESOURCES = {
+    "CreateVerifiedAccessInstance": "verified-access-instance",
+    "CreateVerifiedAccessTrustProvider": "verified-access-trust-provider",
+}
+_VERIFIED_ACCESS_ID_FIELDS = (
+    ("VerifiedAccessEndpointId", "Endpoint", "verified-access-endpoint"),
+    ("VerifiedAccessGroupId", "Group", "verified-access-group"),
+    ("VerifiedAccessInstanceId", "Instance", "verified-access-instance"),
+    ("VerifiedAccessTrustProviderId", "TrustProvider", "verified-access-trust-provider"),
+)
+
+
+def _va_arn(kind, rtype, value, region, account_id):
+    """The id's ARN when it exists, ``<type>/*`` when it doesn't or is a deleting endpoint (which answers NotFound)."""
+    from ministack.services import ec2
+
+    record = ec2._VA_STORES[kind].get_scoped(account_id, region, value)
+    if record is not None and record.get("Status") != "deleting":
+        return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{value}"
+    return f"arn:aws:ec2:{region}:{account_id}:{rtype}/*"
+
+
+def _verified_access_resource(action, query_params, region, account_id):
+    """The resource AWS names in a Verified Access denial (see verified_access_resource_arns for the rest)."""
+    from ministack.services import ec2
+
+    def name(kind, rtype, value):
+        return _va_arn(kind, rtype, value, region, account_id)
+
+    new = _VERIFIED_ACCESS_CREATE_RESOURCES.get(action)
+    if new:
+        return f"arn:aws:ec2:{region}:{account_id}:{new}/*"
+    if action == "CreateVerifiedAccessEndpoint":
+        for field, store, rtype in (("LoadBalancerOptions.SubnetId", ec2._subnets, "subnet"),
+                                    ("SecurityGroupId", ec2._security_groups, "security-group")):
+            for index in range(1, 1 + sum(1 for k in query_params if k.startswith(field + "."))):
+                value = _query_param(query_params, f"{field}.{index}")
+                if value and store.contains_scoped(account_id, region, value):
+                    return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{value}"
+        eni = _query_param(query_params, "NetworkInterfaceOptions.NetworkInterfaceId")
+        if eni and ec2._network_interfaces.contains_scoped(account_id, region, eni):
+            return f"arn:aws:ec2:{region}:{account_id}:network-interface/{eni}"
+        group = _query_param(query_params, "VerifiedAccessGroupId")
+        if group:
+            return name("Group", "verified-access-group", group)
+        return f"arn:aws:ec2:{region}:{account_id}:verified-access-endpoint/*"
+    fields = _VERIFIED_ACCESS_ID_FIELDS
+    if action == "ModifyVerifiedAccessGroup":
+        # Moving a group is checked on the instance it moves to first.
+        fields = sorted(fields, key=lambda f: f[0] != "VerifiedAccessInstanceId")
+    # Attach, Detach and a group move skip a malformed instance id.
+    skips_bad_instance = action in ("AttachVerifiedAccessTrustProvider", "DetachVerifiedAccessTrustProvider",
+                                    "ModifyVerifiedAccessGroup")
+    for field, kind, rtype in fields:
+        value = _query_param(query_params, field)
+        if not value:
+            continue
+        if skips_bad_instance and kind == "Instance" and ec2._va_bad_id(kind, value, prefix_only=True):
+            continue
+        return name(kind, rtype, value)
+    return "*"
+
+
+# Every resource type AWS authorizes each call on (Service Authorization Reference).
+_VERIFIED_ACCESS_AUTHORIZED = {
+    "AttachVerifiedAccessTrustProvider": ("instance", "trust-provider"),
+    "DetachVerifiedAccessTrustProvider": ("instance", "trust-provider"),
+    "CreateVerifiedAccessGroup": ("new-group", "instance"),
+    "ModifyVerifiedAccessGroup": ("group", "instance"),
+    "CreateVerifiedAccessEndpoint": ("network-interface", "security-group", "subnet", "new-endpoint", "group"),
+    "ModifyVerifiedAccessEndpoint": ("subnet", "endpoint", "group"),
+}
+
+
+def verified_access_resource_arns(query_params: dict, region: str, account_id: str) -> list[str]:
+    """The resources a Verified Access call is authorized on: the one AWS names in a denial, then the others."""
+    action = _query_param(query_params, "Action")
+    if "VerifiedAccess" not in action or action.startswith("DescribeVerifiedAccess"):
+        return []
+
+    def listed(member):
+        lead = member + "."
+        return [v for k in query_params if k.startswith(lead) and (v := _query_param(query_params, k))]
+
+    def arns(kind):
+        if kind == "new-group":
+            return [f"arn:aws:ec2:{region}:{account_id}:verified-access-group/*"]
+        if kind == "new-endpoint":
+            return [f"arn:aws:ec2:{region}:{account_id}:verified-access-endpoint/*"]
+        if kind in ("instance", "trust-provider", "group", "endpoint"):
+            member, store = {"instance": ("VerifiedAccessInstanceId", "Instance"),
+                             "trust-provider": ("VerifiedAccessTrustProviderId", "TrustProvider"),
+                             "group": ("VerifiedAccessGroupId", "Group"),
+                             "endpoint": ("VerifiedAccessEndpointId", "Endpoint")}[kind]
+            value = _query_param(query_params, member)
+            return [_va_arn(store, f"verified-access-{kind}", value, region, account_id)] if value else []
+        if kind == "subnet":
+            ids = listed("LoadBalancerOptions.SubnetId")
+        elif kind == "security-group":
+            ids = listed("SecurityGroupId")
+        else:
+            ids = [v for v in (_query_param(query_params, "NetworkInterfaceOptions.NetworkInterfaceId"),) if v]
+        return [f"arn:aws:ec2:{region}:{account_id}:{kind}/{v}" for v in ids]
+
+    resources = [_verified_access_resource(action, query_params, region, account_id)]
+    for kind in _VERIFIED_ACCESS_AUTHORIZED.get(action, ()):
+        resources += [arn for arn in arns(kind) if arn not in resources]
+    return resources
+
+
 def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
@@ -985,6 +1146,15 @@ def extract_resource_arn(service: str, method: str, path: str,
                 if func_name.startswith("arn:"):
                     return func_name
                 return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+            if method == "POST" and path_parts[-1] == "functions":
+                # CreateFunction is checked on the function it creates (Service Authorization Reference).
+                func_name = _safe_json_field(body, "FunctionName")
+                if isinstance(func_name, str) and func_name:
+                    if func_name.startswith("arn:"):
+                        return func_name
+                    if ":function:" in func_name:  # the partial ARN form, <account>:function:<name>
+                        return f"arn:aws:lambda:{region}:{func_name}"
+                    return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
         if "layers" in path_parts:
             li = path_parts.index("layers")
             if li + 1 < len(path_parts):
@@ -1016,7 +1186,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         # QueueName param (CreateQueue, GetQueueUrl)
         queue_name = _param(body, query_params, "QueueName")
         if queue_name:
-            return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+            owner = _param(body, query_params, "QueueOwnerAWSAccountId")
+            owner = owner if isinstance(owner, str) and re.fullmatch(r"\d{12}", owner) else account_id
+            return f"arn:aws:sqs:{region}:{owner}:{queue_name}"
         return "*"
 
     if service == "sns":
@@ -1026,6 +1198,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         target_arn = _query_param(query_params, "TargetArn")
         if target_arn:
             return target_arn
+        resource_arn = _query_param(query_params, "ResourceArn")
+        if resource_arn:
+            return resource_arn
+        subscription_arn = _query_param(query_params, "SubscriptionArn")
+        if isinstance(subscription_arn, str) and subscription_arn.count(":") >= 6:
+            # A subscription action is checked on the subscription's topic (Service Authorization Reference).
+            return subscription_arn.rsplit(":", 1)[0]
         # CreateTopic — name in params
         topic_name = _query_param(query_params, "Name")
         if topic_name:
@@ -1039,6 +1218,11 @@ def extract_resource_arn(service: str, method: str, path: str,
             # keys — the key is recovered from the ciphertext.
             key_id = _kms_key_id_from_ciphertext(
                 _safe_json_field(body, "CiphertextBlob"))
+            if key_id:
+                # The ciphertext names its key by id; it may belong to another account.
+                from ministack.services.kms import ciphertext_key_arn
+
+                return ciphertext_key_arn(key_id)
         if key_id:
             # KeyId can be an ARN, alias, or key ID
             if key_id.startswith("arn:"):
@@ -1059,6 +1243,8 @@ def extract_resource_arn(service: str, method: str, path: str,
             from ministack.services import secretsmanager as secretsmanager_svc
 
             _, secret = secretsmanager_svc._resolve(secret_id)
+            if not secret and secret_id.startswith("arn:") and f":{region}:" in secret_id:
+                _, secret = secretsmanager_svc._resolve(secret_id, use_arn_scope=True, cross_account=True)
             if secret:
                 return secret["ARN"]
             if secret_id.startswith("arn:"):
@@ -1068,18 +1254,25 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "iam":
         # IAM actions target users, roles, policies — extract from params
-        role_name = _query_param(query_params, "RoleName")
-        if role_name:
-            return f"arn:aws:iam::{account_id}:role/{role_name}"
-        user_name = _query_param(query_params, "UserName")
-        if user_name:
-            return f"arn:aws:iam::{account_id}:user/{user_name}"
+        # The resource is the entity's ARN with its path: the stored one, or the Path a create names.
+        from ministack.services import iam as iam_svc
+
+        path_param = _query_param(query_params, "Path") or "/"
+        if not (isinstance(path_param, str) and path_param.startswith("/") and path_param.endswith("/")):
+            path_param = "/"
+        for param, kind, store in (("RoleName", "role", iam_svc._roles), ("UserName", "user", iam_svc._users),
+                                   ("GroupName", "group", iam_svc._groups)):
+            name = _query_param(query_params, param)
+            if name and param == "GroupName" and _query_param(query_params, "PolicyArn"):
+                break
+            if name:
+                entity = store.get_scoped(account_id, None, name) if isinstance(name, str) else None
+                if isinstance(entity, dict) and isinstance(entity.get("Arn"), str):
+                    return entity["Arn"]
+                return f"arn:aws:iam::{account_id}:{kind}{path_param}{name}"
         policy_arn = _query_param(query_params, "PolicyArn")
         if policy_arn:
             return policy_arn
-        group_name = _query_param(query_params, "GroupName")
-        if group_name:
-            return f"arn:aws:iam::{account_id}:group/{group_name}"
         return "*"
 
     if service == "sts":
@@ -1091,10 +1284,6 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- Target-based (JSON body) services ---
 
     if service == "events":
-        try:
-            event_data = json.loads(body or b"{}")
-        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-            event_data = {}
         buses = eventbridge_resource_arns(body, region, account_id)
         if buses:
             return buses[0]
@@ -1125,7 +1314,8 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "kinesis":
-        arn = _safe_json_field(body, "StreamARN")
+        # The resource-policy operations name their stream or consumer as ResourceARN.
+        arn = _safe_json_field(body, "ResourceARN") or _safe_json_field(body, "StreamARN")
         if arn:
             return arn
         name = _safe_json_field(body, "StreamName")
@@ -1280,6 +1470,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudformation":
+        set_name = _query_param(query_params, "StackSetName")
+        if set_name and _query_param(query_params, "Action") in ("DescribeStackSet", "ListStackInstances"):
+            # A StackSet's ARN ends in its StackSetId, whether named by name or by ID.
+            from ministack.services.cloudformation import _stack_sets
+            rec = next((r for r in _stack_sets.values_scoped(account_id, region) if r["StackSetId"] == set_name
+                        or (r["StackSetName"] == set_name and r["Status"] == "ACTIVE")), None)
+            return f"arn:aws:cloudformation:{region}:{account_id}:stackset/{rec['StackSetId'] if rec else set_name}"
         name = _query_param(query_params, "StackName")
         if name:
             if name.startswith("arn:"):
@@ -1337,7 +1534,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         identity = _query_param(query_params, "Identity")
         if identity:
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
-        return "*"
+        return _ses_v2_resource_arn(method, path, body, region, account_id)
 
     if service == "signer":
         # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
@@ -1401,12 +1598,19 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudfront":
-        # REST: /2020-05-31/distribution/{id}
+        # REST: /2020-05-31/distribution/{id}, /2020-05-31/vpc-origin/{id}
         parts = [p for p in path.split("/") if p]
         if "distribution" in parts:
             di = parts.index("distribution")
             if di + 1 < len(parts):
                 return f"arn:aws:cloudfront::{account_id}:distribution/{parts[di + 1]}"
+        if "vpc-origin" in parts:
+            vi = parts.index("vpc-origin")
+            if vi + 1 < len(parts):
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/{parts[vi + 1]}"
+            if method == "POST":
+                # CreateVpcOrigin authorizes on every VPC origin of the account.
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/*"
         return "*"
 
     if service in ("cognito-idp", "cognito_idp"):
@@ -1574,6 +1778,12 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "ec2":
         # EC2 uses query params. Try resource ID fields in priority order.
+        # Verified Access: the resource AWS names when it denies the call.
+        # These come before the generic fields: CreateVerifiedAccessEndpoint
+        # also carries SecurityGroupId.1.
+        action = _query_param(query_params, "Action")
+        if "VerifiedAccess" in action and not action.startswith("DescribeVerifiedAccess"):
+            return _verified_access_resource(action, query_params, region, account_id)
         _EC2_RESOURCE_FIELDS = [
             ("InstanceId.1", "instance"),
             ("InstanceId", "instance"),
@@ -1613,6 +1823,17 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
             topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
+        # The tagging calls authorize on the resource they name in resourceArn,
+        # read from where the handler reads it: the body of a POST, the query of a GET.
+        if parts in (["tags"], ["untag"]):
+            arn = (_safe_json_field(body, "resourceArn") if method == "POST"
+                   else _query_param(query_params, "resourceArn"))
+            return arn if isinstance(arn, str) and arn else "*"
+        # A membership call is checked on the thing group and the thing its body
+        # names: the group here, the thing in iot_resource_arns()[1:].
+        membership = iot_resource_arns(method, path, body, region, account_id)
+        if membership:
+            return membership[0]
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1774,6 +1995,10 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
         return []
     table = data.get("TableName") if isinstance(data, dict) else None
+    resource = data.get("ResourceArn") if isinstance(data, dict) else None
+    if not table and isinstance(resource, str) and resource.startswith("arn:"):
+        # Tag and resource-policy actions are checked on the table or stream they name.
+        return [resource]
     if isinstance(table, str) and table:
         index = data.get("IndexName")
         suffix = f"/index/{index}" if isinstance(index, str) and index else ""
@@ -1786,6 +2011,37 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
         for name in tables
         if isinstance(name, str) and name
     ]
+
+
+_IOT_MEMBERSHIP_PATHS = ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup")
+
+
+def iot_resource_arns(method: str, path: str, body: bytes, region: str, account_id: str) -> list[str]:
+    """The thing group and the thing a thing-group membership call names, in the order AWS checks them."""
+    if method not in ("PUT", "POST") or path not in _IOT_MEMBERSHIP_PATHS:
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    arns = []
+    for field, rtype in (("thingGroup", "thinggroup"), ("thing", "thing")):
+        # The handler refuses a body whose name and ARN differ, and an ARN of
+        # another region names the resource of the request's region.
+        name, arn = data.get(f"{field}Name"), data.get(f"{field}Arn")
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            spec = None
+        if isinstance(name, str) and name:
+            arns.append(f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}")
+        elif spec and spec.service == "iot" and spec.account_id == account_id and spec.resource.startswith(f"{rtype}/"):
+            arns.append(f"arn:aws:iot:{region}:{account_id}:{spec.resource}")
+        else:
+            arns.append(arn if isinstance(arn, str) and arn else "*")
+    return arns
 
 
 def logs_service_context(action: str, body: bytes, resource_arn: str,
@@ -1872,17 +2128,116 @@ def dynamodb_transaction_checks(
     return checks
 
 
-def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
-    """The s3:prefix, s3:delimiter and s3:max-keys a ListBucket or ListBucketVersions request sends."""
+def s3_service_context(iam_action: str, query_params: dict | None, path: str = "",
+                       headers: dict | None = None) -> dict:
+    """The S3 condition keys a request carries: its signature on every action, listing keys, a
+    write's encryption, ACL, storage, copy, lock and tag headers, a read's object tags and version."""
+    query_params, headers = query_params or {}, headers or {}
+    context = _s3_request_context(query_params, headers)
+    if iam_action in ("s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"):
+        return {**context, **_s3_object_context(iam_action, query_params, path, headers)}
+    if iam_action in ("s3:CreateBucket", "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:PutBucketAcl"):
+        context.update(_s3_header_keys(headers, _S3_ACL_HEADERS))
+        if iam_action == "s3:CreateBucket":
+            context.update(_s3_header_keys(headers, ("x-amz-object-ownership",)))
+    if iam_action.endswith("Version") or iam_action.endswith("VersionAcl") or iam_action.endswith("VersionTagging"):
+        version_id = _query_param(query_params, "versionId")
+        if version_id:
+            context["s3:versionid"] = version_id
     if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
-        return {}
-    context = {}
+        return context
     for param in ("prefix", "delimiter", "max-keys"):
         value = (query_params or {}).get(param)
         if isinstance(value, list):
             value = value[0] if value else None
         if value is not None:
             context[f"s3:{param}"] = value
+    return context
+
+
+_S3_ACL_HEADERS = ("x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
+                   "x-amz-grant-write-acp", "x-amz-grant-full-control")
+# Write headers whose condition key holds the header's value: s3:<header name>.
+_S3_WRITE_HEADERS = ("x-amz-storage-class", "x-amz-copy-source", "x-amz-metadata-directive",
+                     "x-amz-website-redirect-location", "x-amz-server-side-encryption-customer-algorithm")
+_S3_LOCK_HEADERS = {"x-amz-object-lock-mode": "s3:object-lock-mode",
+                    "x-amz-object-lock-retain-until-date": "s3:object-lock-retain-until-date",
+                    "x-amz-object-lock-legal-hold": "s3:object-lock-legal-hold"}
+
+
+def _s3_header_keys(headers: dict, names) -> dict:
+    return {f"s3:{name}": headers[name] for name in names if headers.get(name)}
+
+
+def _s3_request_context(query_params: dict, headers: dict) -> dict:
+    """The keys every authenticated S3 request carries (AWS's SigV4 policy keys): s3:authType REST-HEADER or
+    REST-QUERY-STRING, s3:signatureversion AWS4-HMAC-SHA256 (AWS for Signature Version 2), s3:signatureAge in
+    milliseconds and s3:x-amz-content-sha256 as sent. s3:ResourceAccount is resolved by the evaluator."""
+    import time as _time
+    from datetime import datetime, timezone
+
+    context: dict = {}
+    authorization = headers.get("authorization", "")
+    if authorization.startswith("AWS4-HMAC-SHA256"):
+        context.update({"s3:authType": "REST-HEADER", "s3:signatureversion": "AWS4-HMAC-SHA256"})
+        signed_at = headers.get("x-amz-date", "")
+    elif authorization.startswith("AWS "):
+        context.update({"s3:authType": "REST-HEADER", "s3:signatureversion": "AWS"})
+        signed_at = ""
+    elif _query_param(query_params, "X-Amz-Algorithm") == "AWS4-HMAC-SHA256":
+        context.update({"s3:authType": "REST-QUERY-STRING", "s3:signatureversion": "AWS4-HMAC-SHA256"})
+        signed_at = _query_param(query_params, "X-Amz-Date")
+    elif _query_param(query_params, "AWSAccessKeyId") and _query_param(query_params, "Signature"):
+        context.update({"s3:authType": "REST-QUERY-STRING", "s3:signatureversion": "AWS"})
+        signed_at = ""
+    else:
+        signed_at = ""
+    if signed_at:
+        try:
+            when = datetime.strptime(signed_at, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
+            context["s3:signatureAge"] = str(max(int((_time.time() - when) * 1000), 0))
+        except ValueError:
+            pass
+    if headers.get("x-amz-content-sha256"):
+        context["s3:x-amz-content-sha256"] = headers["x-amz-content-sha256"]
+    return context
+
+
+def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
+    """s3:x-amz-server-side-encryption(-aws-kms-key-id), s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
+    from ministack.services import s3 as s3_svc
+
+    bucket, _, key = path.lstrip("/").partition("/")
+    context: dict = {}
+    if not key:
+        return context
+    if iam_action == "s3:PutObject":
+        # A part and the completion carry no headers: the upload's own request decides.
+        upload_id = _query_param(query_params, "uploadId")
+        sse = (s3_svc.upload_encryption_header(upload_id, bucket) if upload_id
+               else headers.get("x-amz-server-side-encryption"))
+        if sse:
+            context["s3:x-amz-server-side-encryption"] = sse
+        kms_key = s3_svc.kms_key_for_condition(bucket, headers, upload_id)
+        if kms_key:
+            context["s3:x-amz-server-side-encryption-aws-kms-key-id"] = kms_key
+        if not upload_id:
+            context.update(_s3_header_keys(headers, _S3_ACL_HEADERS + _S3_WRITE_HEADERS))
+            context.update({key: headers[name] for name, key in _S3_LOCK_HEADERS.items() if headers.get(name)})
+            tags = {}
+            for pair in (headers.get("x-amz-tagging") or "").split("&"):
+                if pair:
+                    name, _, value = pair.partition("=")
+                    tags[unquote(name.replace("+", " "))] = unquote(value.replace("+", " "))
+            if tags:
+                context.update({f"s3:RequestObjectTag/{name}": value for name, value in tags.items()})
+                context["s3:RequestObjectTagKeys"] = list(tags)
+    else:
+        for name, value in s3_svc.object_tags_for_condition(bucket, key, query_params).items():
+            context[f"s3:ExistingObjectTag/{name}"] = value
+        version_id = _query_param(query_params, "versionId")
+        if iam_action == "s3:GetObjectVersion" and version_id:
+            context["s3:versionid"] = version_id
     return context
 
 
@@ -1952,6 +2307,100 @@ def _tag_operations(service: str) -> frozenset[str]:
                     ops.add(op_name)
         _TAG_OPERATIONS[service] = frozenset(ops)
     return _TAG_OPERATIONS[service]
+
+
+_UNSIGNED_OPERATIONS: dict[str, frozenset[str]] = {}
+
+
+def unsigned_operations(service: str) -> frozenset[str]:
+    """The operations of *service* its SDK model sends without credentials."""
+    if service not in _UNSIGNED_OPERATIONS:
+        _UNSIGNED_OPERATIONS[service] = frozenset(
+            op_name for name in _BOTOCORE_SERVICE_MAP.get(service) or [service]
+            for op_name, op in _load_botocore_model(name).get("operations", {}).items()
+            if op.get("authtype") == "none" or op.get("auth") == ["smithy.api#noAuth"])
+    return _UNSIGNED_OPERATIONS[service]
+
+
+# Request-field condition keys, on the actions AWS's service reference lists them for.
+_KMS_CONTEXT_ACTIONS = {"CreateGrant", "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyPair",
+                        "GenerateDataKeyPairWithoutPlaintext", "GenerateDataKeyWithoutPlaintext", "RetireGrant"}
+_KMS_ALGORITHM_ACTIONS = {"Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyPair",
+                          "GenerateDataKeyPairWithoutPlaintext", "GenerateDataKeyWithoutPlaintext"}
+_IAM_BOUNDARY_REQUEST_ACTIONS = {"CreateRole", "CreateUser", "PutRolePermissionsBoundary",
+                                 "PutUserPermissionsBoundary"}
+_IAM_BOUNDARY_TARGET_ACTIONS = {"AttachRolePolicy", "AttachUserPolicy", "DeleteRole", "DeleteRolePermissionsBoundary",
+                                "DeleteRolePolicy", "DeleteUserPermissionsBoundary", "DeleteUserPolicy",
+                                "DetachRolePolicy", "DetachUserPolicy", "GetRole", "PutRolePolicy", "PutUserPolicy",
+                                "UpdateAssumeRolePolicy", "UpdateRole", "UpdateRoleDescription"}
+_SECRET_ID_ACTIONS = {"CancelRotateSecret", "DeleteResourcePolicy", "DeleteSecret", "DescribeSecret",
+                      "GetResourcePolicy", "GetSecretValue", "ListSecretVersionIds", "PutResourcePolicy",
+                      "PutSecretValue", "RemoveRegionsFromReplication", "ReplicateSecretToRegions", "RestoreSecret",
+                      "RotateSecret", "StopReplicationToReplica", "TagResource", "UntagResource", "UpdateSecret",
+                      "UpdateSecretVersionStage", "ValidateResourcePolicy"}
+
+
+def request_field_context(service: str, iam_action: str, body: bytes, params: dict, region: str) -> dict:
+    """Condition keys that hold a request field as sent (kms:EncryptionContext, secretsmanager:SecretId,
+    sns:Protocol and the like), kms:CallerAccount, ec2:Region, and iam:PermissionsBoundary of the request or
+    of the role or user it names."""
+    from ministack.core.responses import get_account_id
+
+    action = iam_action.split(":", 1)[-1]
+    try:
+        data = json.loads(body) if (body or b"")[:1] == b"{" else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    context: dict = {}
+    if service == "kms":
+        context["kms:CallerAccount"] = get_account_id()
+        encryption_context = data.get("EncryptionContext")
+        if action == "CreateGrant":
+            constraints = data.get("Constraints") or {}
+            encryption_context = constraints.get("EncryptionContextEquals") or constraints.get("EncryptionContextSubset")
+        if action in _KMS_CONTEXT_ACTIONS and isinstance(encryption_context, dict) and encryption_context:
+            context.update({f"kms:EncryptionContext:{k}": str(v) for k, v in encryption_context.items()})
+            context["kms:EncryptionContextKeys"] = [str(k) for k in encryption_context]
+        if action in _KMS_ALGORITHM_ACTIONS and data.get("EncryptionAlgorithm"):
+            context["kms:EncryptionAlgorithm"] = data["EncryptionAlgorithm"]
+    elif service == "secretsmanager":
+        if action in _SECRET_ID_ACTIONS and data.get("SecretId"):
+            context["secretsmanager:SecretId"] = data["SecretId"]
+        if action in ("GetSecretValue", "UpdateSecretVersionStage") and data.get("VersionStage"):
+            context["secretsmanager:VersionStage"] = data["VersionStage"]
+        if action == "CreateSecret" and data.get("Name"):
+            context["secretsmanager:Name"] = data["Name"]
+        if action in ("CreateSecret", "UpdateSecret"):
+            for field in ("KmsKeyId", "Description"):
+                if data.get(field):
+                    context[f"secretsmanager:{field}"] = data[field]
+    elif service == "ssm":
+        if action == "PutParameter" and "Overwrite" in data:
+            context["ssm:Overwrite"] = "true" if data["Overwrite"] is True else "false"
+    elif service == "sns":
+        if action == "Subscribe":
+            for field in ("Protocol", "Endpoint"):
+                if _query_param(params, field):
+                    context[f"sns:{field}"] = _query_param(params, field)
+    elif service == "ec2":
+        context["ec2:Region"] = region
+    elif service == "iam":
+        boundary = None
+        if action in _IAM_BOUNDARY_REQUEST_ACTIONS:
+            boundary = _query_param(params, "PermissionsBoundary")
+        elif action in _IAM_BOUNDARY_TARGET_ACTIONS:
+            from ministack.services import iam as iam_svc
+
+            entity = (iam_svc._roles.get(_query_param(params, "RoleName")) if _query_param(params, "RoleName")
+                      else iam_svc._users.get(_query_param(params, "UserName")))
+            boundary = (entity or {}).get("PermissionsBoundary")
+            if isinstance(boundary, dict):
+                boundary = boundary.get("PermissionsBoundaryArn")
+        if boundary:
+            context["iam:PermissionsBoundary"] = boundary
+    return context
 
 
 def request_tag_context(service: str, iam_action: str, body: bytes, params: dict) -> dict:
@@ -2024,8 +2473,21 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
         "SignatureDoesNotMatch", 403, "InvalidSignatureException",
         ("RequestTimeTooSkewed", 403, "The difference between the request time and the current time is too large."),
     ),
+    "RequestExpired": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("AccessDenied", 403, "Request has expired"),
+    ),
     "IncompleteSignature": _INCOMPLETE,
     "MissingAuthorizationParameter": _INCOMPLETE,
+    "MissingAuthenticationToken": (
+        "MissingAuthenticationToken", 403, "MissingAuthenticationTokenException",
+        ("AccessDenied", 403, "Access Denied"),
+    ),
+    "UnsupportedSignature": (
+        "IncompleteSignature", 400, "IncompleteSignatureException",
+        ("InvalidRequest", 400, "The authorization mechanism you have provided is not supported. "
+                                "Please use AWS4-HMAC-SHA256."),
+    ),
 }
 
 _QUERY_COMPATIBLE = frozenset({"sqs"})
@@ -2034,10 +2496,37 @@ _EC2_AUTH_FAILURE = ("AuthFailure", 401, "AWS was not able to validate the provi
 _EC2_FAILURES = {"ExpiredTokenException": ("RequestExpired", 400, "Request has expired.")}
 
 
+_MISSING_TOKEN_FAILURES = {
+    "secretsmanager": ("UnrecognizedClientException", 400, "The security token included in the request is invalid."),
+    "ec2": ("MissingParameter", 400, "The request must contain the parameter AWSAccessKeyId"),
+}
+
+
+def anonymous_denial_message(service: str, iam_action: str, resource_arn: str) -> str:
+    """The message of a refused request without credentials; SQS names the anonymous caller and the queue."""
+    if service == "sqs" and resource_arn.startswith("arn:"):
+        action = iam_action.lower()
+        return (f"User: anonymous is not authorized to perform: {action} on resource: {resource_arn} "
+                f"because no resource-based policy allows the {action} action")
+    return "Request is missing Authentication Token"
+
+
 def _auth_failure(service: str, code: str, message: str, headers: dict) -> tuple[str, int, str]:
     """The code, status and message a service answers for a failed authentication."""
     if service == "lambda" and code == "MissingAuthorizationParameter":
         return "MissingAuthenticationTokenException", 403, "Missing Authentication Token"
+    if code == "MissingAuthenticationToken":
+        if service == "sqs":
+            from ministack.core.iam_evaluator import _request_origin
+
+            if not message.startswith("User: anonymous"):
+                scheme = "https" if _request_origin.get()[1] else "http"
+                message = f"Access to the resource {scheme}://{headers.get('host', '')}/ is denied."
+            return "AccessDenied", 403, message
+        if service in _MISSING_TOKEN_FAILURES:
+            return _MISSING_TOKEN_FAILURES[service]
+        if _SERVICE_PROTOCOL.get(service) is None and service != "dynamodb":
+            message = "Missing Authentication Token"
     query_code, query_status, json_code, s3_failure = _AUTH_FAILURES[code]
     protocol = _SERVICE_PROTOCOL.get(service)
     if service == "s3":
@@ -2067,11 +2556,37 @@ def _resource_policy_denial(service: str, action: str, principal_arn: str, resou
             "with an explicit deny in a resource-based policy")
 
 
+def _iam_denied_resource(resource_arn: str) -> str:
+    """How an IAM denial names a role or user (AWS capture 2026-11-18): an existing one as "role <name>" /
+    "user <name>", one being created by its ARN. Other IAM resources keep the message without a resource."""
+    _, _, tail = resource_arn.partition(":iam::")
+    kind, _, rest = tail.partition(":")[2].partition("/")
+    if kind not in ("role", "user") or not rest:
+        return ""
+    from ministack.services import iam as iam_svc
+
+    name = rest.rsplit("/", 1)[-1]
+    exists = name in (iam_svc._roles if kind == "role" else iam_svc._users)
+    return f"{kind} {name}" if exists else resource_arn
+
+
+def identity_denial_message(action: str, principal_arn: str, resource: str, explicit_deny: bool) -> str:
+    """The message of a denial an identity-based policy decided, naming the resource."""
+    reason = (
+        "with an explicit deny in an identity-based policy" if explicit_deny
+        else f"because no identity-based policy allows the {action} action"
+    )
+    return f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource} {reason}"
+
+
+_IOT_DATA_FAILURES = {"MissingAuthenticationToken": "Missing authentication"}
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
                            resource_arn: str = "*", explicit_deny: bool = False,
-                           resource_policy_arn: str = "") -> tuple:
+                           resource_policy_arn: str = "", no_resource_allow: bool = False) -> tuple:
     """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
@@ -2079,20 +2594,44 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service in {"ssm", "logs"} and not error_code:
-        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
-        # capitalized Message naming the resource, as observed on live AWS.
-        reason = (
-            "with an explicit deny in an identity-based policy" if explicit_deny
-            else f"because no identity-based policy allows the {action} action"
-        )
-        message = (
-            f"User: {principal_arn} is not authorized to perform: {action} "
-            f"on resource: {resource_arn} {reason}"
-        )
+    if service in {"ssm", "logs", "kinesis"} and not error_code:
+        # SSM, Logs and Kinesis authorization denials are HTTP 400, JSON 1.1,
+        # with a capitalized Message naming the resource, as observed on live AWS.
+        message = identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
+    if service == "kms" and not error_code and not explicit_deny:
+        # KMS denials no policy allows are HTTP 400 and name the key (an alias resolved to its key), as recorded on AWS.
+        from ministack.services.kms import key_arn_for_request
+
+        message = identity_denial_message(action, principal_arn, key_arn_for_request(resource_arn), explicit_deny)
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
+        )
+    if service in ("dynamodb", "secretsmanager") and not error_code and resource_arn.startswith("arn:"):
+        # DynamoDB and Secrets Manager denials are HTTP 400 and name the resource; across accounts its own
+        # policy may be the one that did not allow (AWS captures).
+        if not message and explicit_deny and resource_policy_arn:
+            message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
+        elif not message and no_resource_allow:
+            message = (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
+                       f"because no resource-based policy allows the {action} action")
+        message = message or identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
+        content_type = "application/x-amz-json-1.0" if service == "dynamodb" else "application/x-amz-json-1.1"
+        return (
+            400, {"Content-Type": content_type, "x-amzn-errortype": "AccessDeniedException"},
+            json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
+        )
+    if service == "iot-data":
+        # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
+        # for a failed authentication, no message for a policy denial.
+        return (
+            403, {"Content-Type": "application/json", "x-amzn-errortype": "ForbiddenException:"},
+            json.dumps({"message": _IOT_DATA_FAILURES.get(error_code, "Forbidden") if error_code else None,
+                        "traceId": str(uuid.uuid4())}).encode(),
         )
     if not message and explicit_deny and resource_policy_arn:
         message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
@@ -2101,7 +2640,11 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
-        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
+        # IoT names the resource, "*" for an action that takes none.
+        on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        if service == "iam" and (iam_resource := _iam_denied_resource(resource_arn)):
+            on_resource = f" on resource: {iam_resource}"
+        message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
     if code in _AUTH_FAILURES:

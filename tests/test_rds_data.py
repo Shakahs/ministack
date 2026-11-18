@@ -135,14 +135,91 @@ def test_batch_execute_missing_sql():
 # ── Invalid ARN ────────────────────────────────────────────
 
 def test_execute_nonexistent_cluster():
-    """ExecuteStatement with a non-existent cluster ARN returns an error."""
+    """As captured on AWS (us-east-1): ExecuteStatement with a well-formed ARN of a
+    cluster that does not exist answers 400 HttpEndpointNotEnabledException."""
     status, body = _raw_post("/Execute", {
         "resourceArn": FAKE_CLUSTER_ARN,
         "secretArn": FAKE_SECRET_ARN,
         "sql": "SELECT 1",
     })
     assert status == 400
-    assert "not found" in body.get("message", body.get("Message", "")).lower()
+    assert body["__type"] == "HttpEndpointNotEnabledException"
+    assert body["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
+
+
+def test_execute_deleted_cluster_reports_endpoint_not_enabled(rds):
+    """A cluster ARN stays answered as HttpEndpointNotEnabledException after the
+    cluster is deleted, the same as a cluster that never existed."""
+    cluster_id = f"rds-data-deleted-{uuid.uuid4().hex[:8]}"
+    cluster_arn = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-mysql",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )["DBCluster"]["DBClusterArn"]
+    rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+    status, body = _raw_post("/Execute", {
+        "resourceArn": cluster_arn,
+        "secretArn": FAKE_SECRET_ARN,
+        "sql": "SELECT 1",
+    })
+    assert status == 400
+    assert body["__type"] == "HttpEndpointNotEnabledException"
+
+
+@pytest.mark.parametrize("path, body", [
+    ("/CommitTransaction", {"transactionId": "AQ" + "A" * 182}),
+    ("/RollbackTransaction", {"transactionId": "AQ" + "A" * 182}),
+], ids=["commit", "rollback"])
+def test_transaction_calls_on_nonexistent_cluster_report_endpoint_not_enabled(path, body):
+    """As captured on AWS (us-east-1): CommitTransaction and RollbackTransaction
+    answer a well-formed ARN of a cluster that does not exist the same way as
+    ExecuteStatement, before they look up the transaction."""
+    status, response = _raw_post(path, {"resourceArn": FAKE_CLUSTER_ARN, "secretArn": FAKE_SECRET_ARN, **body})
+    assert status == 400
+    assert response["__type"] == "HttpEndpointNotEnabledException"
+    assert response["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("operation,action,params,cluster,reason", [
+    ("execute_statement", "ExecuteStatement", {"sql": "select 1"}, "other", None),
+    ("batch_execute_statement", "BatchExecuteStatement", {"sql": "select 1"}, "other", None),
+    ("begin_transaction", "BeginTransaction", {}, "other", None),
+    ("commit_transaction", "CommitTransaction", {"transactionId": "t"}, "other", None),
+    ("rollback_transaction", "RollbackTransaction", {"transactionId": "t"}, "other", None),
+    ("execute_statement", "ExecuteStatement", {"sql": "select 1"}, "denied",
+     "with an explicit deny in an identity-based policy"),
+], ids=["execute", "batch-execute", "begin", "commit", "rollback", "explicit-deny"])
+def test_rds_data_authorization_contract(auth_enabled, iam_user, operation, action, params, cluster, reason):
+    """An RDS Data call is authorized as rds-data:<operation> on the cluster its resourceArn names."""
+    name = f"rdsdata-{uuid.uuid4().hex[:8]}"
+    clusters = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{name}"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["rds-data:ExecuteStatement", "rds-data:BeginTransaction"],
+         "Resource": f"{clusters}-allowed"},
+        {"Effect": "Deny", "Action": "rds-data:ExecuteStatement", "Resource": f"{clusters}-denied"},
+    ]})
+    rds = user.client("rds-data")
+    allowed = {"resourceArn": f"{clusters}-allowed", "secretArn": FAKE_SECRET_ARN}
+    # An authorized call reaches the handler, which answers for the absent cluster.
+    for call in (lambda: rds.execute_statement(**allowed, sql="select 1"), lambda: rds.begin_transaction(**allowed)):
+        with pytest.raises(ClientError) as served:
+            call()
+        assert served.value.response["Error"]["Code"] == "HttpEndpointNotEnabledException"
+    with pytest.raises(ClientError) as exc:
+        getattr(rds, operation)(resourceArn=f"{clusters}-{cluster}", secretArn=FAKE_SECRET_ARN, **params)
+    response = exc.value.response
+    if not auth_enabled:
+        assert response["Error"]["Code"] == "HttpEndpointNotEnabledException"
+        return
+    reason = reason or f"because no identity-based policy allows the rds-data:{action} action"
+    assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (
+        403, "AccessDeniedException")
+    assert response["Error"]["Message"] == (
+        f"User: {user.arn} is not authorized to perform: rds-data:{action} on resource: {clusters}-{cluster} {reason}")
+    assert response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == "application/json"
 
 
 def test_rds_data_resolves_cluster_arn_by_arn_region(rds, sm):
@@ -346,23 +423,26 @@ def test_rds_data_db_arn_lookup_rejects_foreign_account():
 
 
 def test_begin_transaction_nonexistent_cluster():
-    """BeginTransaction with a non-existent cluster ARN returns an error."""
+    """As captured on AWS (us-east-1): answered like ExecuteStatement."""
     status, body = _raw_post("/BeginTransaction", {
         "resourceArn": FAKE_CLUSTER_ARN,
         "secretArn": FAKE_SECRET_ARN,
     })
     assert status == 400
-    assert "not found" in body.get("message", body.get("Message", "")).lower()
+    assert body["__type"] == "HttpEndpointNotEnabledException"
+    assert body["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
 
 
 def test_batch_execute_nonexistent_cluster():
+    """As captured on AWS (us-east-1): answered like ExecuteStatement."""
     status, body = _raw_post("/BatchExecute", {
         "resourceArn": FAKE_CLUSTER_ARN,
         "secretArn": FAKE_SECRET_ARN,
         "sql": "INSERT INTO t VALUES (1)",
     })
     assert status == 400
-    assert "not found" in body.get("message", body.get("Message", "")).lower()
+    assert body["__type"] == "HttpEndpointNotEnabledException"
+    assert body["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
 
 
 # ── Transaction lifecycle (error paths) ────────────────────
@@ -1594,7 +1674,19 @@ def test_rds_data_negative_rowcount_is_clamped(monkeypatch, engine):
 
 
 @pytest.mark.parametrize("engine", _MYSQL_ENGINES)
-def test_rds_data_mysql_row_counts_are_unchanged(monkeypatch, engine):
-    """pymysql has no statusmessage, so the MySQL path is untouched."""
-    assert _execute_with_cursor(
-        monkeypatch, engine, 2, "SELECT 2", [(1,), (2,)])["numberOfRecordsUpdated"] == 2
+@pytest.mark.parametrize("rows", ([], [(1,)], [(1,), (2,)]), ids=("none", "one", "two"))
+def test_rds_data_mysql_select_reports_no_updated_records(monkeypatch, engine, rows):
+    """As captured on AWS (Aurora MySQL): SELECT 1 answers numberOfRecordsUpdated 0
+    and no generatedFields, whatever PyMySQL puts in rowcount."""
+    result = _execute_with_cursor(monkeypatch, engine, len(rows), rows=rows, sql="SELECT 1")
+    assert result["numberOfRecordsUpdated"] == 0
+    assert "generatedFields" not in result
+    assert result["records"] == [[{"longValue": row[0]}] for row in rows]
+
+
+@pytest.mark.parametrize("engine", _MYSQL_ENGINES)
+def test_rds_data_mysql_dml_keeps_its_count(monkeypatch, engine):
+    """Without a result set the MySQL path is unchanged."""
+    result = _execute_with_cursor(monkeypatch, engine, 2, sql="UPDATE t SET name = 'b'")
+    assert result["numberOfRecordsUpdated"] == 2
+    assert result["generatedFields"] == []

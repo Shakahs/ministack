@@ -189,6 +189,13 @@ async def handle_request(method, path, headers, body, query_params):
 # Server handlers
 # ---------------------------------------------------------------------------
 
+_SERVER_OPTIONAL = (
+    "Certificate", "EndpointDetails", "IdentityProviderDetails", "LoggingRole", "PostAuthenticationLoginBanner",
+    "PreAuthenticationLoginBanner", "ProtocolDetails", "SecurityPolicyName", "WorkflowDetails",
+    "StructuredLogDestinations", "S3StorageOptions",
+)
+
+
 async def _create_server(data):
     sid = _server_id()
     now = now_iso()
@@ -204,7 +211,11 @@ async def _create_server(data):
         "Tags": data.get("Tags", []),
         "UserCount": 0,
         "DateCreated": now,
+        "IpAddressType": data.get("IpAddressType", "IPV4"),
     }
+    for key in _SERVER_OPTIONAL:
+        if data.get(key) is not None:
+            server[key] = data[key]
 
     _servers[sid] = server
 
@@ -235,7 +246,7 @@ def _describe_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     server = _servers[sid]
     described = {
@@ -248,7 +259,11 @@ def _describe_server(data):
         "State": server["State"],
         "Tags": server.get("Tags", []),
         "UserCount": server.get("UserCount", 0),
+        "IpAddressType": server.get("IpAddressType", "IPV4"),
     }
+    for key in _SERVER_OPTIONAL:
+        if key in server:
+            described[key] = server[key]
     # SFTP port discovery is via GET /_ministack/transfer/sftp-ports —
     # boto3's model-driven deserializer drops fields not in the AWS spec
     # (so DescribeServer can't carry an SftpPort field meaningfully).
@@ -258,7 +273,7 @@ def _describe_server(data):
 def _start_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
-        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 404)
+        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 400)
     _servers[sid]["State"] = "ONLINE"
     return json_response({})
 
@@ -266,7 +281,7 @@ def _start_server(data):
 def _stop_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
-        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 404)
+        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 400)
     _servers[sid]["State"] = "OFFLINE"
     return json_response({})
 
@@ -275,7 +290,7 @@ async def _delete_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     # Cascade-delete all users on this server
     to_delete = [k for k in _users if k.startswith(sid + "/")]
@@ -314,7 +329,6 @@ def _list_servers(data):
             "Domain": s.get("Domain", "S3"),
             "EndpointType": s["EndpointType"],
             "IdentityProviderType": s["IdentityProviderType"],
-            "Protocols": s["Protocols"],
             "ServerId": s["ServerId"],
             "State": s["State"],
             "UserCount": s.get("UserCount", 0),
@@ -337,12 +351,12 @@ def _create_user(data):
 
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     uk = _user_key(sid, user_name)
     if uk in _users:
         return _error("ResourceExistsException",
-                       f"User already exists: {user_name}", 409)
+                       f"User already exists: {user_name}", 400)
 
     ssh_keys = []
     ssh_body = data.get("SshPublicKeyBody")
@@ -368,6 +382,9 @@ def _create_user(data):
         "SshPublicKeys": ssh_keys,
         "Tags": data.get("Tags", []),
     }
+    for key in ("Policy", "PosixProfile"):
+        if data.get(key) is not None:
+            user[key] = data[key]
 
     _users[uk] = user
     _servers[sid]["UserCount"] = _servers[sid].get("UserCount", 0) + 1
@@ -382,7 +399,7 @@ def _describe_user(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     user = _users[uk]
     described = {
@@ -396,6 +413,9 @@ def _describe_user(data):
     }
     if user.get("HomeDirectory"):
         described["HomeDirectory"] = user["HomeDirectory"]
+    for key in ("Policy", "PosixProfile"):
+        if key in user:
+            described[key] = user[key]
 
     return json_response({"ServerId": sid, "User": described})
 
@@ -407,7 +427,7 @@ def _delete_user(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     del _users[uk]
     if sid in _servers:
@@ -420,7 +440,7 @@ def _list_users(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     max_results = data.get("MaxResults", 1000)
     next_token = data.get("NextToken")
@@ -468,7 +488,7 @@ def _import_ssh_public_key(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     if not _validate_ssh_key(ssh_body):
         return _error("InvalidRequestException",
@@ -497,7 +517,7 @@ def _delete_ssh_public_key(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     keys = _users[uk]["SshPublicKeys"]
     _users[uk]["SshPublicKeys"] = [k for k in keys if k["SshPublicKeyId"] != key_id]

@@ -69,6 +69,7 @@ class EvalResult:
     matched_sid: str = ""
     reason: str = ""
     resource_policy_arn: str = ""  # set when the resource's own policy denied
+    no_resource_allow: bool = False  # the identity allowed; another account's resource policy did not
 
 
 @dataclass
@@ -86,6 +87,7 @@ class AuthError:
     """Authentication failure (before policy evaluation)."""
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
+    details: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +781,10 @@ def combine_resource_policy(identity: EvalResult, ctx: EvalContext,
                 within_limits
                 or evaluate_resource_policy(policy, ctx, direct_only=True).decision == "Allow"):
             return named
-    return resource if identity.decision == "Allow" else identity
+    if identity.decision == "Allow":
+        resource.no_resource_allow = True
+        return resource
+    return identity
 
 
 # Services whose resources carry their own policy: the module and the function
@@ -793,10 +798,19 @@ _RESOURCE_POLICY_LOOKUPS = {
     "ecr": ("ecr", "repository_policy_for_arn"),
     "kms": ("kms", "key_policy_for_arn"),
     "apigateway": ("apigateway_v1", "rest_api_policy_for_arn"),
+    "kinesis": ("kinesis", "stream_policy_for_arn"),
+    "dynamodb": ("dynamodb", "table_policy_for_arn"),
 }
+
+_DYNAMODB_ITEM_ACTIONS = frozenset(f"dynamodb:{a}" for a in (
+    "GetItem", "PutItem", "UpdateItem", "DeleteItem", "Query", "Scan", "BatchGetItem", "BatchWriteItem",
+    "ConditionCheckItem"))
 
 # A key policy must allow even the owner's own users and roles.
 _POLICY_REQUIRED = frozenset({"kms"})
+
+# What the bucket owner's root can still do when the bucket policy denies everyone.
+_ROOT_BUCKET_POLICY_ACTIONS = frozenset({"s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"})
 
 
 def _resource_policy(service: str, resource_arn: str) -> tuple | None:
@@ -1248,21 +1262,78 @@ class SignedRequest:
     headers: dict
     body: bytes = b""
     presigned: bool = False
+    handshake: bool = False
+    # Credentials this server cannot verify (another algorithm, a key the signature does not cover).
+    unverifiable: bool = False
+    # A SigV2 (HmacV1) header or query signature, checked against the path S3 signs.
+    sigv2: bool = False
+    auth_path: str = ""
+    # A SigV4 presigned query scoped to s3: S3 checks its own, any other service refuses its scope.
+    s3_scoped: bool = False
 
 
 _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
     "ministack_signed_request", default=None)
+# The access key whose signature this request already passed, once checked.
+_verified_key: contextvars.ContextVar[str] = contextvars.ContextVar("ministack_verified_key", default="")
+# Whether the request carries no credentials: no Authorization header and no query signature.
+_anonymous: contextvars.ContextVar[bool] = contextvars.ContextVar("ministack_anonymous", default=False)
 
 
-def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_headers: list) -> None:
+def caller_verified(access_key_id: str, account_id: str) -> bool:
+    """Whether the request's SigV4/SigV2 signature for this key checks out (root keys are not checked)."""
+    if not access_key_id:
+        return False
+    if _is_root_key(access_key_id) or _verified_key.get() == access_key_id:
+        return True
+    checked = authenticate(access_key_id, account_id)
+    return checked is not None and not isinstance(checked, AuthError)
+
+
+def pin_signed_request(
+    method: str, raw_path: str, query_params: dict, raw_headers: list, handshake: bool = False,
+) -> None:
     """Keep a request signed with an IAM user or STS session key as sent, for its signature check."""
     from ministack.core.router import extract_access_key_id
     from ministack.core.sigv4 import decode_header_value
 
+    _verified_key.set("")
     authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
-    presigned = not authorization.startswith("AWS4-HMAC-SHA256") and _query_signed(query_params)
+    payload_hash = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"x-amz-content-sha256"), b""))
+    presigned = not authorization.startswith("AWS4-HMAC-SHA256") and (
+        _query_signed(query_params) or _sigv4a_s3_presign(query_params))
     access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
-    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or _is_root_key(access_key_id):
+    # AWS reads query credentials without X-Amz-Algorithm as none at all.
+    _anonymous.set(not authorization and not any(
+        _query_value(query_params or {}, name) for name in ("X-Amz-Algorithm", "AWSAccessKeyId")))
+    # The key the policy check will use; it must be the one the signature is checked for.
+    claimed = extract_access_key_id({"authorization": authorization}, query_params)
+    header_signed = authorization.startswith("AWS4-HMAC-SHA256") or _sigv4a_header(authorization, payload_hash)
+    verifiable = (header_signed or presigned) and bool(claimed) and access_key_id == claimed
+    sigv2 = authorization.startswith("AWS ") or bool(
+        _query_value(query_params or {}, "AWSAccessKeyId") and _query_value(query_params or {}, "Signature")
+        and not _query_value(query_params or {}, "SignatureVersion"))
+    if sigv2 and claimed and not _is_root_key(claimed) and not authorization.startswith("AWS4-"):
+        headers = {name.decode("latin-1").lower(): decode_header_value(value) for name, value in raw_headers}
+        from ministack.app import _ACCESS_POINT_HOST_RE, _extract_s3_vhost_bucket
+        from ministack.services.s3 import resolve_access_point_host
+        bucket = _extract_s3_vhost_bucket(headers.get("host", ""))
+        access_point = _ACCESS_POINT_HOST_RE.match(bucket or "")
+        if access_point and resolve_access_point_host(access_point["name"], access_point["account"], None):
+            bucket = None  # an access point host signs its path without a bucket
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, headers, sigv2=True,
+                                          auth_path=f"/{bucket}{raw_path}" if bucket else raw_path))
+        return
+    if not authorization and claimed and not _is_root_key(claimed) and _s3_presigned_query(query_params):
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, presigned=True, s3_scoped=True))
+        return
+    # A SigV4 signature that names no key is checked too: it is incomplete or names an unknown key.
+    names_no_key = not claimed and (authorization.startswith("AWS4-HMAC-SHA256") or presigned)
+    if not verifiable and not names_no_key and _signature_attempted(authorization, query_params) and not (
+            claimed and _is_root_key(claimed)) and not _s3_presigned_query(query_params):
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, unverifiable=True))
+        return
+    if not (verifiable or names_no_key) or (access_key_id and _is_root_key(access_key_id)):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1270,7 +1341,94 @@ def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_heade
         key, text = name.decode("latin-1").lower(), decode_header_value(value)
         # SigV4 signs a header sent on several lines as its values joined by a bare comma.
         headers[key] = f"{headers[key]},{text}" if key in headers else text
-    _signed_request.set(SignedRequest(access_key_id, method, raw_path, query_params, headers, presigned=presigned))
+    _signed_request.set(SignedRequest(
+        access_key_id, method, raw_path, query_params, headers, presigned=presigned, handshake=handshake))
+
+
+def _sigv2_check(request: SignedRequest, account_id: str) -> AuthError | ResolvedCredential:
+    """Verify a SigV2 (HmacV1) header or query signature as S3 computes it."""
+    from urllib.parse import urlencode, urlsplit
+
+    from botocore.auth import HmacV1Auth
+    from botocore.awsrequest import HTTPHeaders
+    from botocore.credentials import Credentials
+
+    from ministack.core.responses import _account_from_sts_session
+
+    query = request.query_params or {}
+    presigned = not request.headers.get("authorization", "").startswith("AWS ")
+    token = (_query_value(query, "x-amz-security-token") if presigned
+             else request.headers.get("x-amz-security-token", ""))
+    credential = resolve_credential(request.access_key_id,
+                                    _account_from_sts_session(request.access_key_id) or account_id, token)
+    if isinstance(credential, CredentialResolutionError):
+        return AuthError(credential.code, credential.message)
+    headers = HTTPHeaders()
+    for name, value in request.headers.items():
+        headers[name] = value
+    pairs = [(k, v) for k, values in query.items() for v in (values if isinstance(values, list) else [values])]
+    split = urlsplit("http://host" + request.auth_path + ("?" + urlencode(pairs) if pairs else ""))
+    if presigned:
+        # A query signature signs Expires where a header signature signs Date.
+        signed_date = _query_value(query, "Expires")
+        if not signed_date.isdigit() or int(signed_date) < time.time():
+            return AuthError("SignatureDoesNotMatch", "Request has expired")
+        given = _query_value(query, "Signature")
+    else:
+        signed_date = request.headers.get("date", "")
+        given = request.headers["authorization"].split(":", 1)[-1]
+
+    class _Signer(HmacV1Auth):
+        def _get_date(self):  # the date the client signed, not the time of this check
+            return signed_date
+
+    signer = _Signer(Credentials(credential.access_key_id, credential.secret_access_key, token or None))
+    expected = signer.get_signature(request.method, split, headers)
+    if not hmac.compare_digest(given.encode(), expected.encode()):
+        return AuthError("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
+                                                  "you provided. Check your key and signing method.")
+    _verified_key.set(request.access_key_id)
+    return credential
+
+
+def _query_value(query_params: dict, name: str) -> str:
+    found = query_params.get(name) or query_params.get(name.lower()) or [""]
+    return found[0] if isinstance(found, list) else found
+
+
+def _signature_attempted(authorization: str, query_params: dict) -> bool:
+    """Whether a request carries any AWS signature or credential, valid or not."""
+    if authorization.startswith(("AWS4-", "AWS ")):
+        return True
+    return any(_query_value(query_params or {}, name) for name in (
+        "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Signature", "AWSAccessKeyId", "Signature"))
+
+
+def _s3_presigned_query(query_params: dict) -> bool:
+    """A complete SigV4 presigned S3 URL, which S3 verifies itself."""
+    query_params = query_params or {}
+    scope = _query_value(query_params, "X-Amz-Credential").split("/")
+    return (_query_value(query_params, "X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0])
+            and len(scope) == 5 and scope[3] == "s3" and bool(_query_value(query_params, "X-Amz-Signature")))
+
+
+def _sigv4a_header(authorization: str, payload_hash: str) -> bool:
+    """A SigV4a header signature that signs its region set and does not sign its body in chunks."""
+    from ministack.core.sigv4 import SIGV4A
+
+    if not authorization.startswith(SIGV4A + " "):
+        return False
+    fields = dict(part.strip().partition("=")[::2] for part in authorization.split(" ", 1)[1].split(","))
+    return ("x-amz-region-set" in fields.get("SignedHeaders", "").split(";")
+            and not payload_hash.startswith("STREAMING-AWS4-ECDSA"))
+
+
+def _sigv4a_s3_presign(query_params: dict) -> bool:
+    """A SigV4a presigned S3 URL; the S3 handler checks only SigV4 ones itself."""
+    from ministack.core.sigv4 import SIGV4A
+
+    scope = _query_value(query_params or {}, "X-Amz-Credential").split("/")
+    return _query_value(query_params or {}, "X-Amz-Algorithm") == SIGV4A and len(scope) == 4 and scope[2] == "s3"
 
 
 def _query_signed(query_params: dict) -> bool:
@@ -1280,8 +1438,7 @@ def _query_signed(query_params: dict) -> bool:
         return found[0] if isinstance(found, list) else found
 
     scope = value("X-Amz-Credential").split("/")
-    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0]) and (
-        len(scope) < 4 or scope[3] != "s3")
+    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and (len(scope) < 4 or scope[3] != "s3")
 
 
 def pin_signed_body(body: bytes) -> None:
@@ -1291,13 +1448,51 @@ def pin_signed_body(body: bytes) -> None:
         _signed_request.set(replace(request, body=body))
 
 
+def _s3_scope_failure(service: str | None) -> AuthError | None:
+    """An s3-scoped presigned query: S3 verifies it itself, any other service refuses the scope."""
+    request = _signed_request.get()
+    if request is None or not request.s3_scoped:
+        return None
+    _signed_request.set(None)
+    if service == "s3":
+        return None
+    from ministack.core.iam_actions import SERVICE_TO_IAM_NAMESPACE
+
+    name = SERVICE_TO_IAM_NAMESPACE.get(service or "", service or "")
+    return AuthError("SignatureDoesNotMatch", f"Credential should be scoped to correct service: '{name}'. ")
+
+
+def authenticate_handshake(scope: dict, service: str | None = None) -> AuthError | ResolvedCredential | None:
+    """Check a WebSocket upgrade signed in its Authorization header or query string, as ``authenticate`` does."""
+    from urllib.parse import parse_qs, quote
+
+    from ministack.core.responses import get_account_id
+
+    raw_path = scope.get("raw_path") or quote(scope.get("path", "")).encode()
+    query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
+    pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
+    failure = _s3_scope_failure(service)
+    if failure:
+        return failure
+    request = _signed_request.get()
+    if request is None:
+        return None
+    try:
+        account_id = find_iam_access_key_account(request.access_key_id) or get_account_id()
+    except AmbiguousAccessKeyError:
+        account_id = get_account_id()
+    return authenticate(request.access_key_id, account_id)
+
+
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
     """Check the pinned request's time, session token and signature: its credential, a failure, or None."""
-    from ministack.core.responses import _account_from_sts_session
+    from ministack.core.responses import _account_from_sts_session, get_region
     from ministack.core.sigv4 import (
         header_signature_failure,
         parse_header_signature,
         parse_query_signature,
+        presigned_request_is_expired,
+        region_set_covers,
         request_time_failure,
     )
 
@@ -1305,20 +1500,41 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     if request is None or request.access_key_id != access_key_id:
         return None
     _signed_request.set(None)  # checked once; the request's later checks skip it
+    if request.unverifiable:
+        return AuthError("UnsupportedSignature", "The request signature does not conform to AWS standards.")
+    if request.sigv2:
+        return _sigv2_check(request, account_id)
     if request.presigned:
         signature = parse_query_signature(request.query_params)
     else:
         signature = parse_header_signature(request.headers)
     if isinstance(signature, tuple):
         return AuthError(*signature)
-    skewed = request_time_failure(signature)
-    if skewed:
-        return AuthError(*skewed)
+    if request.presigned and signature.region_set is not None:
+        # A SigV4a presigned URL is good until its X-Amz-Expires, however long ago it was signed.
+        expires = _query_value(request.query_params, "X-Amz-Expires")
+        try:
+            expired = bool(expires) and presigned_request_is_expired(signature.amz_date, expires)
+        except ValueError:
+            expired = True
+        if expired:
+            return AuthError("RequestExpired", "Request has expired")
+    else:
+        skewed = request_time_failure(signature)
+        if skewed:
+            return AuthError(*skewed)
+    if signature.region_set is not None and signature.service != "s3" and not region_set_covers(
+            signature.region_set, get_region()):
+        # A region set without the region serving the request is refused like an unknown key; S3 checks its own.
+        unknown = _unknown_access_key()
+        return AuthError(unknown.code, unknown.message)
     if request.presigned:
         token = (request.query_params.get("X-Amz-Security-Token") or [""])[0]
     else:
         token = request.headers.get("x-amz-security-token", "")
-    credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id, token)
+    credential = resolve_credential(
+        access_key_id, _account_from_sts_session(access_key_id) or account_id, token,
+    ) if access_key_id else _unknown_access_key()
     if isinstance(credential, CredentialResolutionError):
         if credential.code == "InvalidToken":
             # AWS treats a session key without its token as unknown, and any other token as invalid.
@@ -1329,13 +1545,58 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     failure = header_signature_failure(
         signature, credential.secret_access_key, request.method, request.raw_path,
         request.query_params, request.headers, request.body, presigned=request.presigned,
+        explain=request.handshake,
     )
-    return AuthError(*failure) if failure else credential
+    if failure:
+        details = {}
+        if signature.service == "s3" and failure[0] == "SignatureDoesNotMatch":
+            from ministack.core.sigv4 import header_signing_documents
+
+            canonical, string_to_sign = header_signing_documents(
+                signature, request.method, request.raw_path, request.query_params, request.headers, request.body,
+                presigned=request.presigned,
+            )
+            details = {
+                "AWSAccessKeyId": access_key_id,
+                "StringToSign": string_to_sign,
+                "SignatureProvided": signature.signature,
+                "StringToSignBytes": string_to_sign.encode("utf-8").hex(" "),
+                "CanonicalRequest": canonical,
+                "CanonicalRequestBytes": canonical.encode("utf-8").hex(" "),
+            }
+        return AuthError(*failure, details=details)
+    _verified_key.set(access_key_id)
+    return credential
+
+
+def check_credentials(access_key_id: str, service: str | None = None) -> AuthError | None:
+    """Authenticate a request no IAM action covers, with the checks enforce() makes before any policy."""
+    from ministack.core.responses import get_account_id
+
+    failure = _s3_scope_failure(service)
+    if failure:
+        return failure
+    account_id = get_account_id()
+    checked = authenticate(access_key_id or "", account_id)
+    if checked is None:
+        checked = resolve_principal(access_key_id or "", account_id)
+    return checked if isinstance(checked, AuthError) else None
 
 
 # ---------------------------------------------------------------------------
 # Top-level enforcement entry point
 # ---------------------------------------------------------------------------
+
+# Signed in the SDK models, yet served without credentials: the links in SNS subscription messages.
+_UNSIGNED_LINK_ACTIONS = frozenset({"sns:ConfirmSubscription", "sns:Unsubscribe"})
+
+
+def _served_unsigned(service: str, iam_action: str) -> bool:
+    """Whether AWS serves this action without credentials: an operation its SDK model sends unsigned, or a link."""
+    from ministack.core.iam_actions import unsigned_operations
+
+    return iam_action in _UNSIGNED_LINK_ACTIONS or iam_action.partition(":")[2] in unsigned_operations(service)
+
 
 # Actions that AWS always allows regardless of IAM policies.
 # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
@@ -1414,7 +1675,17 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
-    checked = authenticate(access_key_id or "", account_id)
+    failure = _s3_scope_failure(service)
+    if failure:
+        return failure
+    # S3, API Gateway methods and function URLs can be called anonymously: an unsigned request is not checked.
+    anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
+    if _anonymous.get() and not anonymous_ok and not _served_unsigned(service, iam_action):
+        from ministack.core.iam_actions import anonymous_denial_message
+
+        return AuthError("MissingAuthenticationToken", anonymous_denial_message(service, iam_action, resource_arn))
+    unsigned = anonymous_ok and not access_key_id and _signed_request.get() is None
+    checked = None if unsigned else authenticate(access_key_id or "", account_id)
     if isinstance(checked, AuthError):
         return checked
 
@@ -1428,13 +1699,61 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     if isinstance(principal, AuthError):
         return principal
 
-    # Root principal: allow everything
-    if principal.policies is None:
-        return None
-
     context = {key.lower(): value for key, value in (service_context or {}).items()}
     # A request that names no tags has no aws:TagKeys.
     context.setdefault("aws:tagkeys", None)
+
+    # Root principal: no identity policy limits it, but an explicit Deny in a bucket policy does,
+    # except on the bucket policy itself for the bucket owner's root (captured on AWS).
+    if service == "kms" and resource_arn.startswith("arn:aws:kms:"):
+        # KMS answers these itself, as on AWS: a key that does not exist is NotFoundException before any
+        # permission check, and a key policy in another account that does not allow the caller is refused
+        # in KMS's own words. What is left is the usual identity check, for a key in another account too.
+        from ministack.services import kms
+
+        resource_arn = kms.key_arn_for_request(resource_arn)
+        found = _resource_policy(service, resource_arn)
+        if found is None:
+            return None
+        owner, rec = kms._foreign_key(resource_arn)
+        if owner and not kms.key_policy_allows_caller(rec, iam_action.split(":", 1)[1], principal.arn):
+            return None
+        if principal.policies is None:
+            return None
+    if principal.policies is None:
+        step = context.get("ministack:s3foreignstep")
+        if step in ("accesspoint", "bucket"):
+            # A root caller's own account allows it everything (the identity step), but another account's
+            # access point and bucket must still grant it, and an explicit Deny there denies it.
+            from ministack.services.s3 import access_point_policy_for_arn, bucket_policy_for_owner
+
+            found = (access_point_policy_for_arn(resource_arn) if step == "accesspoint"
+                     else bucket_policy_for_owner(resource_arn, context["s3:dataaccesspointaccount"]))
+            root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
+                                   principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
+                                   region=region, service_context=context, principal_keys=principal.keys)
+            result = evaluate_resource_policy(found[0] if found else "", root_ctx)
+            if result.decision == "Allow":
+                return None
+            if result.decision == "Deny":
+                result.resource_policy_arn = resource_arn
+            result.principal_arn = principal.arn
+            return result
+        if service != "s3" or "s3:dataaccesspointarn" in context:
+            return None
+        found = _resource_policy(service, resource_arn)
+        if found is None or (iam_action in _ROOT_BUCKET_POLICY_ACTIONS and found[1] in (None, principal.account)):
+            return None
+        root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
+                               principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
+                               region=region, service_context=context, principal_keys=principal.keys)
+        denied = evaluate_resource_policy(found[0], root_ctx)
+        if denied.decision != "Deny":
+            return None
+        denied.resource_policy_arn = resource_arn
+        denied.principal_arn = principal.arn
+        return denied
+
     if _names_condition_key(principal.policies, "aws:resourcetag/"):
         from ministack.services.tagging import resource_tags
         for name, value in (resource_tags(resource_arn) or {}).items():
@@ -1451,7 +1770,31 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     )
 
     result = evaluate(ctx, principal.policies, *principal.limits)
+    if context.get("ministack:s3foreignstep") == "accesspoint-identity":
+        # The caller's identity policy on the access point object, alone: the access point policy is the next step.
+        if result.decision == "Allow":
+            return None
+        result.principal_arn = principal.arn
+        return result
     found = _resource_policy(service, resource_arn)
+    if found is not None and service == "dynamodb" and iam_action not in _DYNAMODB_ITEM_ACTIONS:
+        found = None  # Only item calls reach another account's table by its ARN.
+    if found is not None and service == "s3" and "MultiRegionAccessPoint" in iam_action:
+        found = None  # The MRAP policy governs data requests, not S3 Control's MRAP calls.
+    if found is None and service == "s3" and context.get("ministack:s3foreignstep") == "bucket":
+        # The owner's bucket policy, for a PutObject through the owner's access point.
+        from ministack.services.s3 import bucket_policy_for_owner
+
+        found = bucket_policy_for_owner(resource_arn, context["s3:dataaccesspointaccount"])
+    elif found is None and service == "s3" and "s3:dataaccesspointarn" in context:
+        if (iam_action in ("s3:PutBucketPolicy", "s3:DeleteBucketPolicy") and result.decision != "Deny"
+                and resource_arn == context["s3:dataaccesspointarn"]):
+            # An access point refuses bucket policy writes as an explicit Deny of its own.
+            return EvalResult("Deny", principal_arn=principal.arn, resource_policy_arn=resource_arn)
+        # A data request through an access point meets the access point policy on the access point ARN.
+        from ministack.services.s3 import access_point_policy_for_arn
+
+        found = access_point_policy_for_arn(resource_arn)
     if found is not None:
         result = combine_resource_policy(result, ctx, *found, required=service in _POLICY_REQUIRED,
                                          limits=principal.limits)

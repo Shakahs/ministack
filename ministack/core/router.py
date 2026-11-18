@@ -704,7 +704,6 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     host = headers.get("host", "")
     target = headers.get("x-amz-target", "")
     auth = headers.get("authorization", "")
-    content_type = headers.get("content-type", "")
 
     # 1. Check X-Amz-Target header (most reliable for JSON-based services)
     if target:
@@ -1302,6 +1301,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         or path_lower.startswith("/apikeys")
         or path_lower.startswith("/usageplans")
         or path_lower.startswith("/domainnames")
+        or path_lower.startswith("/clientcertificates")
+        or path_lower.startswith("/domainnameaccessassociations")
+        or path_lower.startswith("/rejectdomainnameaccessassociations")
     ):
         return "apigateway"
     # Before the Lambda path check: both live on the Lambda endpoint, and an
@@ -1448,10 +1450,11 @@ def extract_region(headers: dict, query_params=None) -> str:
 
 def extract_access_key_id(headers: dict, query_params=None) -> str:
     """Extract the AWS access key ID from the Authorization header, or from the
-    query-string credentials of a presigned URL — SigV4 ``X-Amz-Credential`` or
-    SigV2 ``AWSAccessKeyId``."""
+    query-string credentials of a presigned URL — SigV4 or SigV4a ``X-Amz-Credential``
+    or SigV2 ``AWSAccessKeyId``. A SigV4a key names the account with AUTH unset too,
+    as a SigV4 one does; only AUTH=true verifies the signature."""
     auth = headers.get("authorization", "")
-    if auth.startswith("AWS4-HMAC"):
+    if auth.startswith(("AWS4-HMAC", "AWS4-ECDSA-P256-SHA256")):
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)

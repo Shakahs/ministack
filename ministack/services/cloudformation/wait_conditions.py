@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from ministack.core.responses import new_uuid
 
-from .custom_resource import _HOST, _PORT
+from .custom_resource import _gateway_url
 
 logger = logging.getLogger("cloudformation")
 
@@ -95,7 +95,7 @@ def validate_resource_signal_timeout(value, logical_id: str) -> int:
 
 
 def handle_url(token: str) -> str:
-    return f"http://{_HOST}:{_PORT}{SIGNAL_PATH}{token}"
+    return f"{_gateway_url()}{SIGNAL_PATH}{token}"
 
 
 def _token_of(url) -> str | None:
@@ -176,17 +176,22 @@ def deliver_signal(token: str, payload: dict) -> bool:
         }
         waiters = [(key, w) for key, w in _waiting.items() if w["token"] == token]
         _changed.notify_all()
+    from ministack.core.arn import parse_arn
+    from ministack.core.responses import request_scope
+
     from .stacks import _add_event
 
     for (stack_id, logical_id), waiter in waiters:
-        _add_event(
-            stack_id,
-            waiter["stack_name"],
-            logical_id,
-            waiter["resource_type"],
-            "CREATE_IN_PROGRESS",
-            f"Received {status} signal with UniqueId {unique_id}",
-        )
+        owner = parse_arn(stack_id)
+        with request_scope(owner.account_id, owner.region):
+            _add_event(
+                stack_id,
+                waiter["stack_name"],
+                logical_id,
+                waiter["resource_type"],
+                "CREATE_IN_PROGRESS",
+                f"Received {status} signal with UniqueId {unique_id}",
+            )
     return True
 
 

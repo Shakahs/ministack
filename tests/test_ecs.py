@@ -3,6 +3,7 @@ import json
 import os
 import time
 import uuid as _uuid_mod
+from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -1862,6 +1863,11 @@ def test_ecs_container_secret_ssm_valuefrom_is_region_scoped():
         # Full ARN resolves by the ARN's region regardless of request region.
         arn_cdef = {"secrets": [{"name": "DB_PASS", "valueFrom": east_arn}]}
         assert ecs_service._resolve_container_secrets(arn_cdef) == {"DB_PASS": "east-secret"}
+
+        # A SecureString reaches the container decrypted, as on AWS.
+        ssm_service._put_parameter({"Name": f"{name}-secure", "Type": "SecureString", "Value": "s3cr3t"})
+        assert ecs_service._resolve_container_secrets(
+            {"secrets": [{"name": "DB_PASS", "valueFrom": f"{name}-secure"}]}) == {"DB_PASS": "s3cr3t"}
     finally:
         ssm_service.reset()
         set_request_account_id(original_account)
@@ -4459,3 +4465,337 @@ def test_ecs_unavailable_registry_secret_fails_start_without_exposing_secret(
     assert not client.images.registry_calls
     if secret:
         assert secret not in task["stoppedReason"]
+
+
+def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
+    cluster = f"cps-{_uuid_mod.uuid4().hex[:8]}"
+    bare = f"{cluster}-bare"
+    fargate = [{"capacityProvider": "FARGATE", "weight": 1}]
+    ecs.create_cluster(clusterName=cluster)
+    ecs.create_cluster(clusterName=bare)
+    put = ecs.put_cluster_capacity_providers(cluster=cluster, capacityProviders=["FARGATE", "FARGATE_SPOT"],
+                                             defaultCapacityProviderStrategy=fargate)["cluster"]
+    # #2455, captured on AWS: the cluster's default strategy also comes back with base 0.
+    with_base = [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+    assert put["defaultCapacityProviderStrategy"] == with_base
+    assert ecs.describe_clusters(clusters=[cluster])["clusters"][0]["defaultCapacityProviderStrategy"] == with_base
+    ecs.register_task_definition(family=cluster, requiresCompatibilities=["FARGATE"], networkMode="awsvpc",
+                                 cpu="256", memory="512",
+                                 containerDefinitions=[{"name": "app", "image": "nginx:alpine", "essential": True}])
+    net = {"awsvpcConfiguration": {"subnets": ["subnet-00000001"]}}
+    try:
+        created = ecs.create_service(cluster=cluster, serviceName="given", taskDefinition=cluster, desiredCount=0,
+                                     capacityProviderStrategy=fargate, networkConfiguration=net)["service"]
+        described = ecs.describe_services(cluster=cluster, services=["given"])["services"][0]
+        # #2455, captured on AWS: a strategy item without base is returned with base 0, in the service and its deployments.
+        for svc in (created, described, created["deployments"][0], described["deployments"][0]):
+            assert svc["capacityProviderStrategy"] == [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+            assert "launchType" not in svc
+        updated = ecs.update_service(cluster=cluster, service="given", capacityProviderStrategy=fargate)["service"]
+        assert updated["capacityProviderStrategy"] == [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+
+        default = ecs.create_service(cluster=cluster, serviceName="default", taskDefinition=cluster,
+                                     desiredCount=0, networkConfiguration=net)["service"]
+        assert default["capacityProviderStrategy"] == with_base and "launchType" not in default
+        plain = ecs.create_service(cluster=bare, serviceName="plain", taskDefinition=cluster, desiredCount=0)["service"]
+        assert plain["launchType"] == "EC2" and "capacityProviderStrategy" not in plain
+
+        with pytest.raises(ClientError) as exc:
+            ecs.create_service(cluster=cluster, serviceName="both", taskDefinition=cluster, launchType="FARGATE",
+                               capacityProviderStrategy=fargate, networkConfiguration=net)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == (
+            "Specifying both a launch type and capacity provider strategy is not supported. Remove one and try again.")
+
+        reverted = ecs.update_service(cluster=cluster, service="given", capacityProviderStrategy=[])["service"]
+        assert reverted["launchType"] == "EC2" and "capacityProviderStrategy" not in reverted
+
+        task = ecs.run_task(cluster=cluster, taskDefinition=cluster, networkConfiguration=net,
+                            capacityProviderStrategy=[{"capacityProvider": "FARGATE_SPOT", "weight": 1}])["tasks"][0]
+        assert (task["launchType"], task["capacityProviderName"]) == ("FARGATE", "FARGATE_SPOT")
+        ecs.stop_task(cluster=cluster, task=task["taskArn"])
+    finally:
+        for c, names in ((cluster, ("given", "default")), (bare, ("plain",))):
+            for name in names:
+                try:
+                    ecs.delete_service(cluster=c, service=name, force=True)
+                except ClientError:
+                    pass
+
+
+
+def test_ecs_runs_a_held_ecr_image_without_pulling(monkeypatch):
+    """A task image from this MiniStack's ECR is loaded into Docker and never pulled from the real registry."""
+    from unittest.mock import MagicMock
+
+    from ministack.services import ecr, ecs
+
+    uri = "111122223333.dkr.ecr.us-east-2.amazonaws.com/held:v1"
+    monkeypatch.setattr(ecr, "_held_image", lambda image: ("111122223333", "us-east-2", "held", "v1")
+                        if image == uri else None)
+    monkeypatch.setattr(ecr, "held_image_readable", lambda image, principal: True)
+    monkeypatch.setattr(ecr, "held_image_archive",
+                        lambda image, arch: (b"archive", "sha256:cfg") if arch == "arm64" else None)
+    client = MagicMock()
+    client.info.return_value = {"Architecture": "aarch64"}
+    ecs._run_docker_container(client, {"image": uri}, {}, refresh_image=True)
+    client.images.load.assert_called_once_with(b"archive")
+    client.images.pull.assert_not_called()
+    client.containers.run.assert_called_once_with(uri)
+
+    # By digest it runs by the loaded image's ID (the manifest digest on containerd's image store).
+    pinned = "111122223333.dkr.ecr.us-east-2.amazonaws.com/held@sha256:" + "a" * 64
+    monkeypatch.setattr(ecr, "_held_image", lambda image: ("111122223333", "us-east-2", "held", "v1"))
+    by_digest = MagicMock(info=MagicMock(return_value={"Architecture": "aarch64"}))
+    by_digest.images.load.return_value = [MagicMock(id="sha256:manifest")]
+    ecs._run_docker_container(by_digest, {"image": pinned}, {}, refresh_image=True)
+    by_digest.containers.run.assert_called_once_with("sha256:manifest")
+
+    other = MagicMock(info=MagicMock(return_value={"Architecture": "x86_64"}))
+    with pytest.raises(ecs._ImagePullError):  # no image for this platform
+        ecs._run_docker_container(other, {"image": uri}, {}, refresh_image=True)
+    monkeypatch.setattr(ecr, "held_image_readable", lambda image, principal: False)
+    with pytest.raises(ecs._ImagePullError, match="repository policy"):
+        ecs._run_docker_container(client, {"image": uri}, {}, refresh_image=True)
+    other.images.pull.assert_not_called()
+
+
+@pytest.mark.auth_contract
+def test_ecr_held_image_from_another_account_needs_its_repository_policy(auth_enabled, monkeypatch):
+    """Under AUTH=true a task reads another account's MiniStack ECR image only when the repository policy
+    allows it, as on AWS; its own account's images and AUTH=false are always readable."""
+    from ministack.core.responses import request_scope
+    from ministack.services import ecr
+
+    monkeypatch.setattr("ministack.app.AUTH", True)
+    with request_scope("222233334444", "us-east-1"):
+        ecr._repositories["shared"] = {"repositoryName": "shared"}
+    uri = "222233334444.dkr.ecr.us-east-1.amazonaws.com/shared:v1"
+    reader = "arn:aws:iam::111122223333:role/exec"
+    try:
+        with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is False
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repo_policies["shared"] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                "Action": "ecr:BatchGetImage"}]})
+            assert ecr.held_image_readable(uri, "arn:aws:iam::222233334444:root") is True
+        with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is False  # layers need GetDownloadUrlForLayer too
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repo_policies["shared"] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]}]})
+        with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is True
+    finally:
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repositories.pop("shared", None)
+            ecr._repo_policies.pop("shared", None)
+
+
+# ---------------------------------------------------------------------------
+# ListServiceDeployments / DescribeServiceDeployments
+#
+# Shapes, filters and error messages follow a real AWS capture (us-east-1,
+# 2026-11-09): ministackorg/ministack#2629.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def deployment_service(ecs):
+    name = f"sd-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=name)
+    td = ecs.register_task_definition(
+        family=name, networkMode="bridge", requiresCompatibilities=["EC2"], cpu="128", memory="64",
+        containerDefinitions=[{"name": "a", "image": "busybox", "essential": True, "memory": 64}],
+    )["taskDefinition"]["taskDefinitionArn"]
+    service = ecs.create_service(cluster=name, serviceName=name, taskDefinition=td, desiredCount=0,
+                                 launchType="EC2")["service"]
+    try:
+        yield name, service
+    finally:
+        ecs.delete_service(cluster=name, service=name, force=True)
+        ecs.deregister_task_definition(taskDefinition=td)
+        ecs.delete_cluster(cluster=name)
+
+
+def test_ecs_list_service_deployments_lists_the_primary_deployment(ecs, deployment_service):
+    name, service = deployment_service
+    briefs = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"]
+    assert len(briefs) == 1
+    brief = briefs[0]
+    assert brief["serviceArn"] == service["serviceArn"]
+    assert brief["clusterArn"] == service["clusterArn"]
+    assert brief["serviceDeploymentArn"].split(":", 5)[5].startswith(f"service-deployment/{name}/{name}/")
+    # The provider matches the PRIMARY deployment's id inside targetServiceRevisionArn.
+    deployment_id = service["deployments"][0]["id"]
+    assert deployment_id.startswith("ecs-svc/")
+    assert brief["targetServiceRevisionArn"].endswith(
+        f":service-revision/{name}/{name}/{deployment_id.split('/', 1)[1]}")
+    assert brief["status"] == "SUCCESSFUL"
+    assert brief["createdAt"] and brief["startedAt"] and brief["finishedAt"]
+
+
+def test_ecs_list_service_deployments_by_arn(ecs, deployment_service):
+    name, service = deployment_service
+    by_arn = ecs.list_service_deployments(cluster=service["clusterArn"], service=service["serviceArn"])
+    assert len(by_arn["serviceDeployments"]) == 1
+
+
+def test_ecs_list_service_deployments_created_at_filter(ecs, deployment_service):
+    name, _ = deployment_service
+    created = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]["createdAt"]
+
+    def listed(**created_at):
+        return len(ecs.list_service_deployments(
+            cluster=name, service=name, createdAt=created_at)["serviceDeployments"])
+
+    one_second = timedelta(seconds=1)
+    assert listed(after=created - one_second) == 1
+    assert listed(after=created + one_second) == 0
+    assert listed(before=created + one_second) == 1
+    assert listed(before=created - one_second) == 0
+    assert listed(after=created - one_second, before=created + one_second) == 1
+
+
+def test_ecs_list_service_deployments_status_filter(ecs, deployment_service):
+    name, _ = deployment_service
+
+    def listed(*status):
+        return len(ecs.list_service_deployments(
+            cluster=name, service=name, status=list(status))["serviceDeployments"])
+
+    assert listed("SUCCESSFUL") == 1
+    assert listed("SUCCESSFUL", "STOPPED") == 1
+    assert listed("IN_PROGRESS") == 0
+    assert listed("STOPPED") == 0
+
+
+def test_ecs_list_service_deployments_invalid_status(ecs, deployment_service):
+    name, _ = deployment_service
+    # The message is the one AWS returned for a bad value.
+    with pytest.raises(ClientError) as exc:
+        ecs.list_service_deployments(cluster=name, service=name, status=["BOGUS"])
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == (
+        "1 validation error detected: Value '[BOGUS]' at 'statusFilter' failed to satisfy constraint: "
+        "Member must satisfy constraint: [Member must satisfy enum value set: [IN_PROGRESS, CREATED, "
+        "ROLLBACK_IN_PROGRESS, STOPPED, STOP_REQUESTED, ROLLBACK_REQUESTED, ROLLBACK_SUCCESSFUL, "
+        "PENDING, ROLLBACK_FAILED, SUCCESSFUL]]")
+
+
+def test_ecs_list_service_deployments_errors(ecs, deployment_service):
+    name, _ = deployment_service
+    for kwargs, code, message in (
+        ({"cluster": name, "service": "nope"}, "ServiceNotFoundException", "Service not found."),
+        ({"cluster": "nope-cluster", "service": name}, "ClusterNotFoundException", "Cluster not found."),
+        ({"service": name}, "ClusterNotFoundException", "Cluster not found."),  # no "default" cluster
+    ):
+        with pytest.raises(ClientError) as exc:
+            ecs.list_service_deployments(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+
+
+def test_ecs_describe_service_deployments(ecs, deployment_service):
+    name, service = deployment_service
+    brief = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]
+    resp = ecs.describe_service_deployments(serviceDeploymentArns=[brief["serviceDeploymentArn"]])
+    assert resp["failures"] == []
+    [detail] = resp["serviceDeployments"]
+    assert detail["serviceDeploymentArn"] == brief["serviceDeploymentArn"]
+    assert detail["serviceArn"] == service["serviceArn"]
+    assert detail["clusterArn"] == service["clusterArn"]
+    assert detail["status"] == "SUCCESSFUL"
+    assert detail["createdAt"] and detail["startedAt"] and detail["finishedAt"] and detail["updatedAt"]
+    assert detail["targetServiceRevision"] == {
+        "arn": brief["targetServiceRevisionArn"],
+        "requestedTaskCount": 0, "runningTaskCount": 0, "pendingTaskCount": 0}
+    assert "sourceServiceRevisions" not in detail
+
+
+def test_ecs_describe_service_deployments_errors(ecs, deployment_service):
+    name, _ = deployment_service
+    arn = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]["serviceDeploymentArn"]
+    unknown = arn.rsplit("/", 1)[0] + "/doesnotexist"
+    for arns, message in (
+        ([unknown], "The ServiceDeployment ARN is invalid."),
+        ([arn, unknown], "The ServiceDeployment ARN is invalid."),  # one unknown fails the whole call
+        (["not-an-arn"], "The Service ARN provided is invalid."),
+        ([], "The Service ARN provided is invalid."),
+    ):
+        with pytest.raises(ClientError) as exc:
+            ecs.describe_service_deployments(serviceDeploymentArns=arns)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == message
+
+
+def test_ecs_service_deployments_after_a_second_deployment(ecs, deployment_service):
+    name, service = deployment_service
+    first = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]
+    ecs.update_service(cluster=name, service=name, forceNewDeployment=True)
+    briefs = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"]
+    assert len(briefs) == 2
+    # Newest first; the replaced deployment stays listed and finished.
+    assert briefs[1] == first
+    newest = briefs[0]
+    assert newest["serviceDeploymentArn"] != first["serviceDeploymentArn"]
+    assert newest["targetServiceRevisionArn"] != first["targetServiceRevisionArn"]
+    details = ecs.describe_service_deployments(
+        serviceDeploymentArns=[b["serviceDeploymentArn"] for b in briefs])["serviceDeployments"]
+    assert [d["serviceDeploymentArn"] for d in details] == [b["serviceDeploymentArn"] for b in briefs]
+    assert details[0]["sourceServiceRevisions"][0]["arn"] == first["targetServiceRevisionArn"]
+    assert "sourceServiceRevisions" not in details[1]
+
+
+# ── ECR pull-through cache: ECS fills the cache, then runs from it ─────
+
+_PTC_IMAGE = "000000000000.dkr.ecr.us-east-1.amazonaws.com/dockerhub/permitio/pdp-v2:0.9.9"
+
+
+class _PtcDaemon:
+    """A container daemon: records every call; ``run`` fails with *fail* when given."""
+
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+        self.images, self.containers = self, self
+
+    def pull(self, ref, **kwargs):
+        self.calls.append(("pull", ref, kwargs))
+
+    def run(self, image, **kwargs):
+        self.calls.append(("run", image, kwargs.get("platform")))
+        if self.fail:
+            raise self.fail
+        return SimpleNamespace(id="c")
+
+
+def test_ptc_fill_runs_before_the_image_is_used(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ecs_service.ecr, "fill_pull_through",
+                        lambda image, principal=None, docker_client=None: seen.append((image, principal, docker_client)))
+    daemon = _PtcDaemon()
+    cdef = {"name": "c", "image": _PTC_IMAGE}
+    ecs_service._fill_pull_through(cdef, {"executionRoleArn": "arn:aws:iam::000000000000:role/exec"}, daemon)
+    assert seen == [(_PTC_IMAGE, "arn:aws:iam::000000000000:role/exec", daemon)]
+    assert cdef == {"name": "c", "image": _PTC_IMAGE}
+
+
+@pytest.mark.parametrize("kind, error", [
+    ("secret", "_SecretResolutionError"), ("unavailable", "_ImagePullError"), ("repository", "_ImagePullError")])
+def test_ptc_fill_miss_fails_the_task_launch(monkeypatch, kind, error):
+    def miss(image, principal=None, docker_client=None):
+        raise ecs_service.ecr.PullThroughMiss(kind, "Unable to reach the upstream registry.")
+    monkeypatch.setattr(ecs_service.ecr, "fill_pull_through", miss)
+    with pytest.raises(getattr(ecs_service, error)):
+        ecs_service._fill_pull_through({"name": "c", "image": _PTC_IMAGE}, {}, _PtcDaemon())
+
+
+def test_pinned_platform_pull_failure_says_the_pull_failed(caplog):
+    from docker.errors import ImageNotFound
+    cdef = {"name": "c", "image": "quay.io/permitio/pdp-v2:0.9.9"}
+    daemon = _PtcDaemon(fail=ImageNotFound("pull access denied for permitio/pdp-v2"))
+    with pytest.raises(ImageNotFound):
+        ecs_service._run_docker_container(daemon, cdef, {"platform": "linux/arm64"})
+    assert "pulling quay.io/permitio/pdp-v2:0.9.9 for linux/arm64 failed" in caplog.text
+    assert "this host cannot run it" not in caplog.text

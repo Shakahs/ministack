@@ -52,6 +52,35 @@ def _require_crypto() -> None:
         x509 = _x509
 
 
+def generate_self_signed(
+    country: str,
+    locality: str,
+    common_name: str,
+    not_before: _dt.datetime,
+    not_after: _dt.datetime,
+) -> str:
+    """A self-signed certificate PEM for subject C/L/CN, valid from *not_before* to *not_after*."""
+    _require_crypto()
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, country),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, locality),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+
 def generate_ca(
     org_name: str = "Ministack",
     common_name: str = "Ministack Local CA",
@@ -353,3 +382,25 @@ def certificate_common_name(cert_pem: str) -> str | None:
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
     names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     return str(names[0].value) if names else None
+
+
+def certificate_names_and_validity(cert_pem: str):
+    """Return ``(common_name, dns_names, not_before, not_after)`` for ``cert_pem``.
+
+    ``common_name`` is None when the subject has none; ``dns_names`` are the DNS entries
+    of the subject alternative name extension, in order, or ``[]`` without one; the
+    dates are timezone-aware UTC. Raises ``ValueError`` when ``cert_pem`` is not a PEM
+    certificate.
+    """
+    _require_crypto()
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_names = san.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        dns_names = []
+    # `not_valid_*_utc` arrived in cryptography 42; the declared floor is 41.
+    not_before = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before.replace(tzinfo=_dt.timezone.utc)
+    not_after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=_dt.timezone.utc)
+    return (str(names[0].value) if names else None, dns_names, not_before, not_after)

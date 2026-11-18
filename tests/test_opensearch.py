@@ -309,6 +309,27 @@ def test_opensearch_describe_domain_change_progress(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+def test_opensearch_domain_change_progress_details_name_the_current_change(os_client):
+    name = f"prog-id-{_uid()}"
+    created = os_client.create_domain(DomainName=name)["DomainStatus"]
+    try:
+        change_id = created["ChangeProgressDetails"]["ChangeId"]
+        assert change_id
+        progress = os_client.describe_domain_change_progress(DomainName=name)["ChangeProgressStatus"]
+        assert progress["ChangeId"] == change_id
+
+        os_client.update_domain_config(DomainName=name, AccessPolicies="{}")
+        details = os_client.describe_domain(DomainName=name)["DomainStatus"]["ChangeProgressDetails"]
+        progress = os_client.describe_domain_change_progress(DomainName=name)["ChangeProgressStatus"]
+        assert details["ChangeId"] == progress["ChangeId"] != change_id
+        assert progress["InitiatedBy"] == "CUSTOMER" and progress["LastUpdatedTime"]
+        # The creation stays readable by its ChangeId (real AWS, us-west-2).
+        first = os_client.describe_domain_change_progress(DomainName=name, ChangeId=change_id)["ChangeProgressStatus"]
+        assert (first["ChangeId"], first["Status"]) == (change_id, "COMPLETED")
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
 # ---------------------------------------------------------------------------
 # Versions
 # ---------------------------------------------------------------------------
@@ -722,3 +743,42 @@ def test_opensearch_cold_image_publishes_the_real_endpoint(fake_docker, monkeypa
         f"readers prefer _Endpoint and it still says {rec['_Endpoint']!r}"
     )
     assert rec["Endpoint"] == "localhost:19200"
+
+
+def test_opensearch_engine_container_has_a_512m_heap(fake_docker, monkeypatch):
+    """Every engine container runs with a 512 MB heap rather than the image's 1 GB."""
+    from ministack.services import opensearch as os_
+
+    runs = []
+    run = fake_docker.containers.run
+    monkeypatch.setattr(
+        fake_docker.containers, "run", lambda **kw: (runs.append(kw), run(**kw))[1]
+    )
+
+    os_.start_engine_container(fake_docker, f"heap-{_uid()}", {}, 19203)
+
+    assert runs[0]["environment"]["OPENSEARCH_JAVA_OPTS"] == "-Xms512m -Xmx512m"
+
+
+@pytest.mark.serial
+def test_opensearch_reaper_spares_the_exited_engine_of_a_live_domain(fake_docker, monkeypatch):
+    """A live domain's engine is recorded under `_ContainerId`; the reaper must read that key."""
+    from ministack.core import container_reaper
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import opensearch as os_
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-os")
+    name = f"reaped-{_uid()}"
+    c = fake_docker.containers.run(
+        name=os_._container_name(name), labels=container_reaper.own_labels("opensearch")
+    )
+    c.status = "exited"
+    c.attrs["State"] = {"FinishedAt": ""}
+    os_._domains[name] = {"DomainName": name, "Created": True, "_ContainerId": c.id}
+
+    assert container_reaper.reap_abandoned(fake_docker) == 0
+    assert os_._container_name(name) in fake_docker.live()
+    os_._domains.pop(name)

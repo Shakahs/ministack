@@ -13,7 +13,13 @@ import threading
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, json_response
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+)
 
 logger = logging.getLogger("rds-data")
 
@@ -322,10 +328,21 @@ def _cluster_resolution_error(resource_arn, engine):
     )
 
 
+def _missing_target_error(resource_arn, engine, cluster):
+    from ministack.services import rds
+
+    # A same-account, same-Region cluster ARN that names no cluster.
+    parsed = rds._parse_rds_arn(resource_arn) if cluster is None else None
+    if (parsed and parsed[1] == "cluster" and parsed[0].account_id == get_account_id()
+            and parsed[0].region == get_region()):
+        return _http_endpoint_not_enabled_error(resource_arn)
+    return _cluster_resolution_error(resource_arn, engine)
+
+
 def _http_endpoint_not_enabled_error(resource_arn):
     return _error(
         "HttpEndpointNotEnabledException",
-        f"HTTP endpoint is not enabled for cluster ARN: {resource_arn}",
+        f"HttpEndpoint is not enabled for resource {resource_arn}.",
     )
 
 
@@ -641,7 +658,7 @@ def _execute_statement(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -687,11 +704,17 @@ def _execute_statement(data):
             # also returns rows. This is not an audit of side effects in CTEs.
             if command == ["SELECT"]:
                 updated = 0
+        mysql_result_set = engine not in ("postgres", "aurora-postgresql") and cursor.description
+        if mysql_result_set:
+            # PyMySQL counts returned rows; AWS reports 0 for a SELECT.
+            updated = 0
 
         response = {
             "numberOfRecordsUpdated": updated,
             "generatedFields": _generated_fields(cursor, engine),
         }
+        if mysql_result_set and not response["generatedFields"]:
+            del response["generatedFields"]
 
         if cursor.description:
             rows = cursor.fetchall()
@@ -738,7 +761,7 @@ def _begin_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
 
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
@@ -784,7 +807,7 @@ def _commit_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -823,7 +846,7 @@ def _rollback_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -866,7 +889,7 @@ def _batch_execute_statement(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
 
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:

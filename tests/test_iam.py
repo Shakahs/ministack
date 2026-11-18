@@ -3,6 +3,7 @@ import uuid as _uuid_mod
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 def test_iam_role_user(iam):
@@ -70,6 +71,52 @@ def test_iam_create_role(iam):
 def test_iam_get_role(iam):
     resp = iam.get_role(RoleName="iam-test-role")
     assert resp["Role"]["RoleName"] == "iam-test-role"
+
+
+_TRUST_ALLOW_ROOT = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                     "Action": "sts:AssumeRole"}
+_TRUST_ALLOW_NOT_PRINCIPAL = {"Effect": "Allow", "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:root"},
+                              "Action": "sts:AssumeRole"}
+_TRUST_DENY_NOT_PRINCIPAL = {"Effect": "Deny", "NotPrincipal": {"AWS": "arn:aws:iam::000000000000:root"},
+                             "Action": "sts:AssumeRole"}
+
+
+@pytest.mark.parametrize("statement, message", [
+    ([_TRUST_ALLOW_NOT_PRINCIPAL], "Allow with NotPrincipal is not allowed."),
+    (_TRUST_ALLOW_NOT_PRINCIPAL, "Allow with NotPrincipal is not allowed."),
+    ([_TRUST_ALLOW_ROOT, _TRUST_DENY_NOT_PRINCIPAL], "AssumeRole policy must not contain NotPrincipal field."),
+    ([_TRUST_DENY_NOT_PRINCIPAL, _TRUST_ALLOW_NOT_PRINCIPAL], "Allow with NotPrincipal is not allowed."),
+], ids=["allow", "allow-object", "deny", "deny-then-allow"])
+def test_iam_role_trust_policy_not_principal_refused(iam, statement, message):
+    name = f"not-principal-role-{_uuid_mod.uuid4().hex[:8]}"
+    refused = json.dumps({"Version": "2012-10-17", "Statement": statement})
+    plain = {"Version": "2012-10-17", "Statement": [_TRUST_ALLOW_ROOT]}
+    with pytest.raises(ClientError) as exc:
+        iam.create_role(RoleName=name, AssumeRolePolicyDocument=refused)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+    assert exc.value.response["Error"]["Message"] == message
+    with pytest.raises(ClientError) as exc:
+        iam.get_role(RoleName=name)
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+    iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(plain))
+    try:
+        with pytest.raises(ClientError) as exc:
+            iam.update_assume_role_policy(RoleName=name, PolicyDocument=refused)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+        assert exc.value.response["Error"]["Message"] == message
+        assert iam.get_role(RoleName=name)["Role"]["AssumeRolePolicyDocument"] == plain
+        # The name and the role's existence are checked before the document.
+        with pytest.raises(ClientError) as exc:
+            iam.create_role(RoleName=name, AssumeRolePolicyDocument=refused)
+        assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+        with pytest.raises(ClientError) as exc:
+            iam.update_assume_role_policy(RoleName=f"{name}-missing", PolicyDocument=refused)
+        assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+    finally:
+        iam.delete_role(RoleName=name)
 
 
 def test_iam_update_role_description(iam):
@@ -1559,3 +1606,369 @@ def test_iam_account_alias_crud(iam):
     iam.delete_account_alias(AccountAlias=alias)
     aliases_after = iam.list_account_aliases()["AccountAliases"]
     assert alias not in aliases_after
+
+
+# -------------------- Service-specific credentials --------------------
+
+def test_iam_service_specific_credential_lifecycle(iam):
+    iam.create_user(UserName="ssc-user")
+    created = iam.create_service_specific_credential(
+        UserName="ssc-user", ServiceName="bedrock.amazonaws.com"
+    )["ServiceSpecificCredential"]
+    assert created["ServiceSpecificCredentialId"].startswith("ACCA")
+    assert created["ServiceName"] == "bedrock.amazonaws.com"
+    assert created["Status"] == "Active"
+    assert created["ServiceCredentialSecret"]
+    cred_id = created["ServiceSpecificCredentialId"]
+
+    listed = iam.list_service_specific_credentials(UserName="ssc-user")["ServiceSpecificCredentials"]
+    assert len(listed) == 1
+    assert listed[0]["ServiceSpecificCredentialId"] == cred_id
+    # AWS only exposes the secret on create/reset, never on list
+    assert "ServiceCredentialSecret" not in listed[0]
+
+    iam.update_service_specific_credential(
+        UserName="ssc-user", ServiceSpecificCredentialId=cred_id, Status="Inactive"
+    )
+    listed = iam.list_service_specific_credentials(UserName="ssc-user")["ServiceSpecificCredentials"]
+    assert listed[0]["Status"] == "Inactive"
+
+    reset = iam.reset_service_specific_credential(
+        UserName="ssc-user", ServiceSpecificCredentialId=cred_id
+    )["ServiceSpecificCredential"]
+    assert reset["ServiceCredentialSecret"] != created["ServiceCredentialSecret"]
+    assert reset["Status"] == "Inactive"
+
+    iam.delete_service_specific_credential(UserName="ssc-user", ServiceSpecificCredentialId=cred_id)
+    assert iam.list_service_specific_credentials(UserName="ssc-user")["ServiceSpecificCredentials"] == []
+
+
+def test_iam_service_specific_credential_service_name_filter(iam):
+    iam.create_user(UserName="ssc-filter-user")
+    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="bedrock.amazonaws.com")
+    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="logs.amazonaws.com")
+    filtered = iam.list_service_specific_credentials(
+        UserName="ssc-filter-user", ServiceName="bedrock.amazonaws.com"
+    )["ServiceSpecificCredentials"]
+    assert len(filtered) == 1
+    assert filtered[0]["ServiceName"] == "bedrock.amazonaws.com"
+    # API reference: NotSupportedService (404) for a service without service-specific credentials.
+    for call in (lambda: iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="a.amazonaws.com"),
+                 lambda: iam.list_service_specific_credentials(UserName="ssc-filter-user", ServiceName="a.amazonaws.com")):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert (exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "NotSupportedService", 404)
+
+
+def test_iam_service_specific_credential_codecommit_user_name_and_password(iam):
+    """API reference example: a CodeCommit credential is a ServiceUserName (<user>-at-<account>) and a
+    ServicePassword, the password only on create and reset."""
+    iam.create_user(UserName="ssc-git-user")
+    created = iam.create_service_specific_credential(
+        UserName="ssc-git-user", ServiceName="codecommit.amazonaws.com")["ServiceSpecificCredential"]
+    account = iam.get_user(UserName="ssc-git-user")["User"]["Arn"].split(":")[4]
+    assert created["ServiceUserName"] == f"ssc-git-user-at-{account}"
+    assert len(created["ServicePassword"]) == 44
+    assert "ServiceCredentialSecret" not in created and "ServiceCredentialAlias" not in created
+    listed = iam.list_service_specific_credentials(UserName="ssc-git-user")["ServiceSpecificCredentials"]
+    assert listed[0]["ServiceUserName"] == created["ServiceUserName"] and "ServicePassword" not in listed[0]
+    reset = iam.reset_service_specific_credential(
+        UserName="ssc-git-user", ServiceSpecificCredentialId=created["ServiceSpecificCredentialId"])
+    assert reset["ServiceSpecificCredential"]["ServicePassword"] != created["ServicePassword"]
+
+
+def test_iam_service_specific_credential_age_days(iam):
+    iam.create_user(UserName="ssc-age-user")
+    cred = iam.create_service_specific_credential(
+        UserName="ssc-age-user", ServiceName="bedrock.amazonaws.com", CredentialAgeDays=30
+    )["ServiceSpecificCredential"]
+    assert "ExpirationDate" in cred
+
+
+def test_iam_service_specific_credential_unknown_user(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.list_service_specific_credentials(UserName="ghost-user-xyz")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_service_specific_credential_username_required_for_non_user(iam):
+    # The default test credentials do not resolve to an IAM user, so AWS
+    # requires UserName explicitly (real AWS: InvalidInput, 400).
+    with pytest.raises(ClientError) as exc:
+        iam.list_service_specific_credentials()
+    assert exc.value.response["Error"]["Code"] == "InvalidInput"
+
+
+def test_iam_service_specific_credential_unknown_id(iam):
+    iam.create_user(UserName="ssc-noid-user")
+    with pytest.raises(ClientError) as exc:
+        iam.update_service_specific_credential(
+            UserName="ssc-noid-user", ServiceSpecificCredentialId="ACCAZZZZZZZZZZZZZZZZZ",
+            Status="Inactive"
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_service_specific_credential_caller_user_inferred(iam):
+    # An IAM user calling with its own access key may omit UserName; AWS takes
+    # it from the caller identity (real AWS observation).
+    import boto3
+    from conftest import ENDPOINT, REGION
+
+    iam.create_user(UserName="ssc-caller")
+    key = iam.create_access_key(UserName="ssc-caller")["AccessKey"]
+    caller_iam = boto3.client(
+        "iam",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=key["AccessKeyId"],
+        aws_secret_access_key=key["SecretAccessKey"],
+        region_name=REGION,
+    )
+    # botocore requires UserName on create client-side; list sends it bare.
+    iam.create_service_specific_credential(UserName="ssc-caller", ServiceName="bedrock.amazonaws.com")
+    listed = caller_iam.list_service_specific_credentials()["ServiceSpecificCredentials"]
+    assert len(listed) == 1
+    assert listed[0]["UserName"] == "ssc-caller"
+
+
+# -------------------- Server certificates --------------------
+
+def _self_signed_pem():
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ministack-test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    return (
+        cert.public_bytes(serialization.Encoding.PEM).decode(),
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ).decode(),
+    )
+
+
+def test_iam_server_certificate_lifecycle(iam):
+    cert_pem, key_pem = _self_signed_pem()
+    md = iam.upload_server_certificate(
+        ServerCertificateName="svc-cert", Path="/cloudfront/prod/",
+        CertificateBody=cert_pem, PrivateKey=key_pem,
+        Tags=[{"Key": "env", "Value": "test"}],
+    )["ServerCertificateMetadata"]
+    assert md["ServerCertificateId"].startswith("ASCA")
+    assert md["Path"] == "/cloudfront/prod/"
+    assert md["Arn"].endswith(":server-certificate/cloudfront/prod/svc-cert")
+    assert "Expiration" in md
+
+    listed = iam.list_server_certificates()["ServerCertificateMetadataList"]
+    assert [m["ServerCertificateName"] for m in listed] == ["svc-cert"]
+
+    got = iam.get_server_certificate(ServerCertificateName="svc-cert")["ServerCertificate"]
+    assert "BEGIN CERTIFICATE" in got["CertificateBody"]
+
+    tags = iam.list_server_certificate_tags(ServerCertificateName="svc-cert")["Tags"]
+    assert {"Key": "env", "Value": "test"} in tags
+
+    iam.update_server_certificate(
+        ServerCertificateName="svc-cert", NewPath="/cdn/", NewServerCertificateName="svc-cert-2"
+    )
+    listed = iam.list_server_certificates()["ServerCertificateMetadataList"]
+    assert [(m["ServerCertificateName"], m["Path"]) for m in listed] == [("svc-cert-2", "/cdn/")]
+
+    iam.delete_server_certificate(ServerCertificateName="svc-cert-2")
+    assert iam.list_server_certificates()["ServerCertificateMetadataList"] == []
+
+
+def test_iam_server_certificate_name_is_unique_and_chain_is_returned(iam):
+    cert_pem, key_pem = _self_signed_pem()
+    iam.upload_server_certificate(ServerCertificateName="uniq-cert", Path="/a/", CertificateBody=cert_pem,
+                                  PrivateKey=key_pem, CertificateChain=cert_pem)
+    try:
+        with pytest.raises(ClientError) as exc:
+            iam.upload_server_certificate(ServerCertificateName="uniq-cert", Path="/b/", CertificateBody=cert_pem,
+                                          PrivateKey=key_pem)
+        assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+        got = iam.get_server_certificate(ServerCertificateName="uniq-cert")["ServerCertificate"]
+        assert got["CertificateChain"] == cert_pem and "PrivateKey" not in got
+    finally:
+        iam.delete_server_certificate(ServerCertificateName="uniq-cert")
+
+
+def test_iam_server_certificate_path_normalized(iam):
+    cert_pem, key_pem = _self_signed_pem()
+    md = iam.upload_server_certificate(
+        ServerCertificateName="bare-cert", CertificateBody=cert_pem, PrivateKey=key_pem
+    )["ServerCertificateMetadata"]
+    assert md["Path"] == "/"
+
+
+def test_iam_server_certificate_malformed(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.upload_server_certificate(
+            ServerCertificateName="bad-cert",
+            CertificateBody="-----BEGIN CERTIFICATE-----\nnot-a-cert\n-----END CERTIFICATE-----",
+            PrivateKey="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        )
+    assert exc.value.response["Error"]["Code"] == "MalformedCertificate"
+
+
+def test_iam_server_certificate_unknown(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.get_server_certificate(ServerCertificateName="ghost-cert-xyz")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_attach_missing_customer_policy_is_no_such_entity(iam):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    missing = f"arn:aws:iam::000000000000:policy/missing-{suffix}"
+    role = iam.create_role(RoleName=f"r-{suffix}", AssumeRolePolicyDocument="{}")["Role"]["RoleName"]
+    user = iam.create_user(UserName=f"u-{suffix}")["User"]["UserName"]
+    group = iam.create_group(GroupName=f"g-{suffix}")["Group"]["GroupName"]
+    for call, kw in ((iam.attach_role_policy, {"RoleName": role}), (iam.attach_user_policy, {"UserName": user}),
+                     (iam.attach_group_policy, {"GroupName": group})):
+        with pytest.raises(ClientError) as exc:
+            call(PolicyArn=missing, **kw)
+        err = exc.value.response
+        assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("NoSuchEntity", 404)
+        assert err["Error"]["Message"] == f"Policy {missing} does not exist or is not attachable."
+    assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
+
+
+def _deny_on(action, condition):
+    return {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": action, "Resource": "*", "Condition": condition}]}
+
+
+def _refused(auth_enabled, call):
+    """With AUTH=true the call is refused by the identity policy; without IAM it goes through."""
+    if not auth_enabled:
+        call()
+        return
+    with pytest.raises(ClientError) as exc:
+        call()
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] in (400, 403)
+    assert "AccessDenied" in exc.value.response["Error"]["Code"] or "not authorized" in exc.value.response["Error"]["Message"]
+
+
+@pytest.mark.auth_contract
+def test_request_field_condition_keys_contract(auth_enabled, iam_user):
+    """Identity-policy denies on request-field keys AWS sets: kms:EncryptionContext, secretsmanager:SecretId,
+    sns:Protocol, ssm:Overwrite, ec2:Region and iam:PermissionsBoundary."""
+    import uuid as _uuid
+    tag = _uuid.uuid4().hex[:8]
+    admin_kms = make_client("kms")
+    key = admin_kms.create_key()["KeyMetadata"]["KeyId"]
+    kms = iam_user(policy=_deny_on("kms:Encrypt", {"StringEquals": {"kms:EncryptionContext:app": "blocked"}})).client("kms")
+    kms.encrypt(KeyId=key, Plaintext=b"x", EncryptionContext={"app": "ok"})
+    _refused(auth_enabled, lambda: kms.encrypt(KeyId=key, Plaintext=b"x", EncryptionContext={"app": "blocked"}))
+
+    sm = iam_user(policy=_deny_on("secretsmanager:GetSecretValue",
+                                  {"StringLike": {"secretsmanager:SecretId": "*blocked*"}})).client("secretsmanager")
+    admin_sm = make_client("secretsmanager")
+    for name in (f"ok-{tag}", f"blocked-{tag}"):
+        admin_sm.create_secret(Name=name, SecretString="v")
+    sm.get_secret_value(SecretId=f"ok-{tag}")
+    _refused(auth_enabled, lambda: sm.get_secret_value(SecretId=f"blocked-{tag}"))
+
+    topic = make_client("sns").create_topic(Name=f"proto-{tag}")["TopicArn"]
+    sns = iam_user(policy=_deny_on("sns:Subscribe", {"StringEquals": {"sns:Protocol": "http"}})).client("sns")
+    sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=f"arn:aws:sqs:us-east-1:000000000000:q-{tag}")
+    _refused(auth_enabled, lambda: sns.subscribe(TopicArn=topic, Protocol="http", Endpoint="http://example.com/h"))
+
+    ssm = iam_user(policy=_deny_on("ssm:PutParameter", {"Bool": {"ssm:Overwrite": "true"}})).client("ssm")
+    ssm.put_parameter(Name=f"/ow/{tag}", Value="a", Type="String")
+    _refused(auth_enabled, lambda: ssm.put_parameter(Name=f"/ow/{tag}", Value="b", Type="String", Overwrite=True))
+
+    ec2 = iam_user(policy=_deny_on("ec2:DescribeVpcs", {"StringEquals": {"ec2:Region": "eu-west-1"}}))
+    ec2.client("ec2", region="us-east-1").describe_vpcs()
+    _refused(auth_enabled, lambda: ec2.client("ec2", region="eu-west-1").describe_vpcs())
+
+    boundary = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    iam = iam_user(policy=_deny_on("iam:CreateRole", {"StringNotEquals": {"iam:PermissionsBoundary": boundary}})).client("iam")
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    iam.create_role(RoleName=f"bounded-{tag}", AssumeRolePolicyDocument=trust, PermissionsBoundary=boundary)
+    _refused(auth_enabled, lambda: iam.create_role(RoleName=f"unbounded-{tag}", AssumeRolePolicyDocument=trust))
+    admin_iam = make_client("iam")
+    for name in (f"bounded-{tag}", f"unbounded-{tag}"):
+        try:
+            admin_iam.delete_role(RoleName=name)
+        except ClientError:
+            pass
+
+
+@pytest.mark.auth_contract
+def test_iam_role_and_user_resources_carry_their_path_contract(auth_enabled):
+    """IAM checks a role or user action on the entity's ARN with its path (AWS capture, #2694)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    import os
+    import uuid as _uuid
+
+    import boto3
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(key="test", secret="test"):
+        return boto3.client("iam", endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    admin, suffix = client(), _uuid.uuid4().hex[:8]
+    role, target = f"path-role-{suffix}", f"path-target-{suffix}"
+    trust = _json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    admin.create_role(RoleName=role, Path="/my/path/", AssumeRolePolicyDocument=trust)
+    admin.create_user(UserName=target, Path="/my/path/")
+
+    def caller(tag, resource, actions):
+        name = f"path-{tag}-{suffix}"
+        admin.create_user(UserName=name)
+        admin.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=_json.dumps({"Version": "2012-10-17",
+                              "Statement": [{"Effect": "Allow", "Action": actions, "Resource": resource}]}))
+        key = admin.create_access_key(UserName=name)["AccessKey"]
+        return client(key["AccessKeyId"], key["SecretAccessKey"])
+
+    doc = _json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "*"}]})
+    path = caller("rp", "arn:aws:iam::000000000000:role/my/path/*", ["iam:GetRole", "iam:PutRolePolicy"])
+    nopath = caller("rn", f"arn:aws:iam::000000000000:role/path-role-*", ["iam:GetRole", "iam:PutRolePolicy"])
+    path.get_role(RoleName=role)
+    path.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc)
+    rn = f"arn:aws:iam::000000000000:user/path-rn-{suffix}"
+    for action, call in (("GetRole", lambda: nopath.get_role(RoleName=role)),
+                         ("PutRolePolicy", lambda: nopath.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc))):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == ("AccessDenied", (
+            f"User: {rn} is not authorized to perform: iam:{action} on resource: role {role} "
+            f"because no identity-based policy allows the iam:{action} action"))
+    caller("up", "arn:aws:iam::000000000000:user/my/path/*", ["iam:GetUser"]).get_user(UserName=target)
+    with pytest.raises(ClientError) as exc:
+        caller("un", f"arn:aws:iam::000000000000:user/path-target-*", ["iam:GetUser"]).get_user(UserName=target)
+    assert exc.value.response["Error"]["Message"] == (
+        f"User: arn:aws:iam::000000000000:user/path-un-{suffix} is not authorized to perform: iam:GetUser on resource: "
+        f"user {target} because no identity-based policy allows the iam:GetUser action")
+    caller("cp", "arn:aws:iam::000000000000:role/my/path/*", ["iam:CreateRole"]).create_role(
+        RoleName=f"path-new-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
+    with pytest.raises(ClientError) as exc:
+        caller("cn", f"arn:aws:iam::000000000000:role/path-new2-*", ["iam:CreateRole"]).create_role(
+            RoleName=f"path-new3-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
+    assert exc.value.response["Error"]["Message"] == (
+        f"User: arn:aws:iam::000000000000:user/path-cn-{suffix} is not authorized to perform: iam:CreateRole on "
+        f"resource: arn:aws:iam::000000000000:role/my/path/path-new3-{suffix} "
+        "because no identity-based policy allows the iam:CreateRole action")

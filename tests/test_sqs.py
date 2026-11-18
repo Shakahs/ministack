@@ -88,6 +88,29 @@ def test_sqs_list_queues(sqs):
     assert any("intg-sqs-list-alpha" in u for u in urls)
     assert any("intg-sqs-list-beta" in u for u in urls)
 
+
+@pytest.mark.auth_contract
+def test_sqs_list_queues_header_without_credential_contract(auth_enabled, iam_user):
+    """Under AUTH=true a header signature without Credential answers IncompleteSignature."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}]}).client("sqs")
+    client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+
+    def strip_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", strip_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "IncompleteSignature", 400)
+        assert response["Error"]["Message"].startswith("Authorization header requires 'Credential' parameter.")
+    else:
+        client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+
 def test_sqs_list_queues_paginates_with_max_results(sqs):
     prefix = f"intg-sqs-page-{_uuid_mod.uuid4().hex[:8]}-"
     for i in range(5):
@@ -314,6 +337,44 @@ def test_sqs_message_attributes(sqs):
     assert attrs["color"]["StringValue"] == "blue"
     assert attrs["count"]["StringValue"] == "42"
 
+def test_sqs_receive_md5_of_filtered_message_attributes(sqs):
+    """MD5OfMessageAttributes on ReceiveMessage must be the digest of the
+    attributes actually returned, not of every attribute sent. SDKs that
+    validate it recompute it from the attributes in the response."""
+    url = sqs.create_queue(QueueName="intg-sqs-md5-filtered")["QueueUrl"]
+    sqs.send_message(
+        QueueUrl=url,
+        MessageBody="md5-filtered",
+        MessageAttributes={
+            "item.color": {"DataType": "String", "StringValue": "red"},
+            "size": {"DataType": "String", "StringValue": "large"},
+        },
+    )
+    # Digests of the SQS binary encoding of the returned attributes.
+    md5_color = "577bde534466fcc0f833e000d746308b"
+    md5_size = "293ff4145d6b9021065be848a611037b"
+    md5_all = "9906f4cd4d08bdd5cf9f22829f9e07f7"
+
+    def receive(**kwargs):
+        resp = sqs.receive_message(QueueUrl=url, VisibilityTimeout=0, **kwargs)
+        return resp["Messages"][0]
+
+    for names, returned, md5 in (
+        (["item.color"], ["item.color"], md5_color),
+        (["item.*"], ["item.color"], md5_color),
+        (["size"], ["size"], md5_size),
+        (["All"], ["item.color", "size"], md5_all),
+    ):
+        msg = receive(MessageAttributeNames=names)
+        assert sorted(msg["MessageAttributes"]) == returned, names
+        assert msg["MD5OfMessageAttributes"] == md5, names
+
+    for kwargs in ({}, {"MessageAttributeNames": ["missing"]}):
+        msg = receive(**kwargs)
+        assert "MessageAttributes" not in msg
+        assert "MD5OfMessageAttributes" not in msg
+    sqs.delete_queue(QueueUrl=url)
+
 def test_sqs_batch_send(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-batchsend")["QueueUrl"]
     resp = sqs.send_message_batch(
@@ -446,6 +507,43 @@ def test_sqs_fifo_deduplication(sqs):
         MessageDeduplicationId="dedup-001",
     )
     assert r1["MessageId"] == r2["MessageId"]
+
+def test_sqs_fifo_dedup_hit_returns_md5_of_current_request(sqs):
+    """A dedup hit keeps the first message, but its response must carry the
+    MD5s of the request just sent, as AWS does. SDKs that verify the digests
+    (.NET, Java) reject a response that repeats the first message's."""
+    url = sqs.create_queue(
+        QueueName="intg-sqs-dedup-md5.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+    )["QueueUrl"]
+
+    def send(body, sent_at):
+        return sqs.send_message(
+            QueueUrl=url,
+            MessageBody=body,
+            MessageGroupId="g1",
+            MessageDeduplicationId="dedup-md5",
+            MessageAttributes={
+                "DateSent": {"DataType": "String", "StringValue": sent_at},
+            },
+        )
+
+    r1 = send("body-one", "2026-10-15T00:00:01Z")
+    r2 = send("body-one", "2026-10-15T00:00:02Z")  # same body, new attribute
+    r3 = send("body-two", "2026-10-15T00:00:03Z")  # new body and attribute
+
+    assert r1["MessageId"] == r2["MessageId"] == r3["MessageId"]
+    # Digests of the SQS binary encoding of each request's attributes.
+    assert r1["MD5OfMessageAttributes"] == "e9721848ab1db43af2ce7e25fce5d807"
+    assert r2["MD5OfMessageAttributes"] == "4079b5e9650ac7c7fd23793b2f8450d7"
+    assert r3["MD5OfMessageAttributes"] == "2a0cd9230604b4d3fcc365096e11817f"
+    assert r1["MD5OfMessageBody"] == r2["MD5OfMessageBody"] == "58bc92401b7ad098acdab54fad72e79a"
+    assert r3["MD5OfMessageBody"] == "6423099901cb7ed39e2a7a6517162e8d"
+
+    attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+    assert attrs["Attributes"]["ApproximateNumberOfMessages"] == "1"
+    sqs.delete_queue(QueueUrl=url)
+
 
 def test_sqs_fifo_dedup_survives_consumption(sqs):
     """A FIFO dedup id is honored for its full 5-minute window even after the
@@ -1899,8 +1997,8 @@ class TestCrossAccountSqs:
             _as(ACCT_B, sqs_svc._act_get_queue_url,
                 {"QueueName": name,
                  "QueueOwnerAWSAccountId": ACCT_A}, "")
-        assert exc.value.code == "AccessDenied"
-        assert exc.value.status == 403
+        assert (exc.value.code, exc.value.status, exc.value.message) == (
+            "QueueDoesNotExist", 400, "The specified queue does not exist or you do not have access to it.")
 
     def test_get_queue_url_same_account_denied_by_explicit_deny(self, auth):
         name = _uniq("xpol-q")
@@ -2598,3 +2696,82 @@ def test_removed_policies_remain_absent_after_persistence_round_trip(queue):
     sqs_svc.load_persisted_state(state)
     assert policies.keys().isdisjoint(_read("json", url, ["All"]))
     assert _read("json", url, ["QueueArn"])["QueueArn"].endswith(":policy-removal")
+
+
+@pytest.mark.auth_contract
+def test_sqs_get_queue_url_of_another_account_contract(auth_enabled):
+    """GetQueueUrl with QueueOwnerAWSAccountId is checked on the owner's queue ARN; a refused or unknown
+    cross-account lookup answers NonExistentQueue (AWS capture, #2689)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    owner, other = "111122223333", "444455556666"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    granted, bare = f"xacct-granted-{suffix}", f"xacct-bare-{suffix}"
+    iam_b = client("iam", other)
+
+    def user(name, actions, queue):
+        iam_b.create_user(UserName=name)
+        iam_b.put_user_policy(UserName=name, PolicyName="sqs", PolicyDocument=_json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": actions,
+                                                    "Resource": f"arn:aws:sqs:us-east-1:{owner}:*"}]}))
+        key = iam_b.create_access_key(UserName=name)["AccessKey"]
+        return client("sqs", key["AccessKeyId"], key["SecretAccessKey"]), f"arn:aws:iam::{other}:user/{name}"
+
+    sqs_b, user_arn = user(f"xacct-user-{suffix}", ["sqs:GetQueueUrl", "sqs:SendMessage"], granted)
+    noget_b, noget_arn = user(f"xacct-noget-{suffix}", ["sqs:SendMessage"], granted)
+    sqs_a = client("sqs", owner)
+    url = sqs_a.create_queue(QueueName=granted)["QueueUrl"]
+    sqs_a.create_queue(QueueName=bare)
+    sqs_a.set_queue_attributes(QueueUrl=url, Attributes={"Policy": _json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": [user_arn, noget_arn]},
+            "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+            "Resource": f"arn:aws:sqs:us-east-1:{owner}:{granted}"}]})})
+
+    assert sqs_b.get_queue_url(QueueName=granted, QueueOwnerAWSAccountId=owner)["QueueUrl"] == url
+    for caller, name in ((sqs_b, bare), (sqs_b, f"xacct-missing-{suffix}"), (noget_b, granted)):
+        with pytest.raises(ClientError) as exc:
+            caller.get_queue_url(QueueName=name, QueueOwnerAWSAccountId=owner)
+        error = exc.value.response
+        assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
+            400, "AWS.SimpleQueueService.NonExistentQueue",
+            "The specified queue does not exist or you do not have access to it.")
+
+
+def test_sqs_sender_id_is_the_user_or_role_session(sqs):
+    """SenderId is the sender's user ID, or role ID and session name (AWS capture, #2693)."""
+    import json as _json
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test", token=None):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret, aws_session_token=token)
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    iam = client("iam", "test")
+    allow = _json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]})
+    user = iam.create_user(UserName=f"sender-user-{suffix}")["User"]
+    iam.put_user_policy(UserName=user["UserName"], PolicyName="sqs", PolicyDocument=allow)
+    key = iam.create_access_key(UserName=user["UserName"])["AccessKey"]
+    role = iam.create_role(RoleName=f"sender-role-{suffix}", AssumeRolePolicyDocument=_json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                                                "Action": "sts:AssumeRole"}]}))["Role"]
+    iam.put_role_policy(RoleName=role["RoleName"], PolicyName="sqs", PolicyDocument=allow)
+    creds = client("sts", "test").assume_role(RoleArn=role["Arn"], RoleSessionName="my-session")["Credentials"]
+    url = sqs.create_queue(QueueName=f"sender-{suffix}")["QueueUrl"]
+    client("sqs", key["AccessKeyId"], key["SecretAccessKey"]).send_message(QueueUrl=url, MessageBody="from-user")
+    client("sqs", creds["AccessKeyId"], creds["SecretAccessKey"], creds["SessionToken"]).send_message_batch(
+        QueueUrl=url, Entries=[{"Id": "1", "MessageBody": "from-role-session"}])
+    seen = {}
+    for _ in range(3):
+        for m in sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10,
+                                     MessageSystemAttributeNames=["SenderId"]).get("Messages", []):
+            seen[m["Body"]] = m["Attributes"]["SenderId"]
+    assert seen == {"from-user": user["UserId"], "from-role-session": f"{role['RoleId']}:my-session"}

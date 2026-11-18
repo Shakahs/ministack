@@ -27,6 +27,8 @@ Data Plane (appconfigdata):
   StartConfigurationSession, GetLatestConfiguration
 """
 
+import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -34,10 +36,18 @@ import logging
 import os
 import re
 import time
+import unicodedata
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    get_account_id,
+    get_region,
+    request_scope,
+    to_output_shape,
+)
+from ministack.services import kms, secretsmanager
 
 logger = logging.getLogger("appconfig")
 
@@ -48,6 +58,8 @@ _DEPLOYMENT_MINUTE_SECONDS = 60.0
 
 # Next-Poll-Interval-In-Seconds for a session that set no RequiredMinimumPollIntervalInSeconds.
 _DEFAULT_POLL_INTERVAL_SECONDS = 30
+
+_SECRETS_MANAGER_SCHEME = "secretsmanager://"
 
 # ---------------------------------------------------------------------------
 # State
@@ -198,10 +210,24 @@ def _get_application(app_id):
     return _json(200, app)
 
 
+def _page(items, query):
+    try:
+        start = int(base64.urlsafe_b64decode(query["next_token"]).decode()) if query.get("next_token") else 0
+        limit = int(query["max_results"]) if query.get("max_results") else None
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return _error(400, "BadRequestException", "Invalid pagination token")
+    if start < 0 or (limit is not None and limit < 1):
+        return _error(400, "BadRequestException", "Invalid pagination token")
+    end = len(items) if limit is None else start + limit
+    out = {"Items": items[start:end]}
+    if end < len(items):
+        out["NextToken"] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return _json(200, out)
+
+
 def _list_applications(query):
-    max_results = int(query.get("max_results", 50))
     items = list(_applications.values())
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _update_application(app_id, body):
@@ -266,22 +292,25 @@ def _create_environment(app_id, body):
     _environments[f"{app_id}/{env_id}"] = record
     _apply_tags(_env_arn(app_id, env_id), body.get("Tags", {}))
     logger.info("CreateEnvironment: %s/%s (%s)", app_id, name, env_id)
-    return _json(201, record)
+    return _json(201, _env_view(record))
 
 
 def _get_environment(app_id, env_id):
     env = _environments.get(f"{app_id}/{env_id}")
     if not env:
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
-    return _json(200, env)
+    return _json(200, _env_view(env))
+
+
+def _env_view(env):
+    return to_output_shape("appconfig", "Environment", env)
 
 
 def _list_environments(app_id, query):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
-    max_results = int(query.get("max_results", 50))
-    items = [e for e in _environments.values() if e["ApplicationId"] == app_id]
-    return _json(200, {"Items": items[:max_results]})
+    items = [_env_view(e) for e in _environments.values() if e["ApplicationId"] == app_id]
+    return _page(items, query)
 
 
 def _update_environment(app_id, env_id, body):
@@ -294,7 +323,7 @@ def _update_environment(app_id, env_id, body):
         env["Description"] = body["Description"]
     if "Monitors" in body:
         env["Monitors"] = body["Monitors"]
-    return _json(200, env)
+    return _json(200, _env_view(env))
 
 
 def _delete_environment(app_id, env_id):
@@ -312,13 +341,220 @@ def _delete_environment(app_id, env_id):
 # ---------------------------------------------------------------------------
 
 
+_RETRIEVAL_ROLE_ARN_PATTERN = (
+    r"^((arn):(aws|aws-cn|aws-iso|aws-iso-[a-z]{1}|aws-us-gov|aws-eusc):(iam)::\d{12}:role[/].*)$")
+
+
+def _is_secrets_manager_uri(location_uri):
+    if location_uri.startswith(_SECRETS_MANAGER_SCHEME):
+        return True
+    try:
+        return parse_arn(location_uri).service == "secretsmanager"
+    except ArnParseError:
+        return False
+
+
+def _string_member_type_error(body, members):
+    """AWS's error for a string member sent as another JSON type, which it
+    reports before any other check, for the first such member by name."""
+    for member in sorted(members):
+        value = body.get(member)
+        if value is None or isinstance(value, str):
+            continue
+        if isinstance(value, bool):
+            message = f"{'TRUE' if value else 'FALSE'}_VALUE can not be converted to a String"
+        elif isinstance(value, (int, float)):
+            message = "NUMBER_VALUE can not be converted to a String"
+        elif isinstance(value, dict):
+            message = "Start of structure or map found where not expected."
+        else:
+            message = "Start of list found where not expected"
+        return _error(400, "BadRequestException", message)
+    return None
+
+
+def _validation_error(errors):
+    count = "1 validation error" if len(errors) == 1 else f"{len(errors)} validation errors"
+    return _error(400, "BadRequestException", f"{count} detected: " + "; ".join(errors))
+
+
+def _secrets_manager_error(message, error_code="ValidationException"):
+    """A Secrets Manager error as AppConfig passes it on."""
+    return _error(400, "BadRequestException",
+                  f"{message} (Service: AWSSecretsManager; Status Code: 400; Error Code: "
+                  f"{error_code}; Request ID: {uuid.uuid4()}; Proxy: null)")
+
+
+def _secret_account(secret_id):
+    """The account whose Secrets Manager holds *secret_id*: an ARN's own
+    account, otherwise the caller's."""
+    try:
+        return parse_arn(secret_id).account_id
+    except ArnParseError:
+        return get_account_id()
+
+
+def _retrieval_session(role_arn):
+    role = parse_arn(role_arn)
+    return (f"arn:{role.partition}:sts::{role.account_id}:assumed-role/"
+            f"{role.resource.rsplit('/', 1)[-1]}/AwsAppConfig-ConfigurationRetriever")
+
+
+def _retrieval_denied(secret_id, role_arn):
+    return _secrets_manager_error(
+        f"User: {_retrieval_session(role_arn)} is not authorized to perform: secretsmanager:GetSecretValue "
+        f"on resource: {secret_id} because no resource-based policy allows the secretsmanager:GetSecretValue action",
+        "AccessDeniedException")
+
+
+def _secret_policy_denies(secret, role_arn):
+    """Under AUTH=true another account's secret is read only if its resource policy lets the
+    retrieval role call GetSecretValue. Called in the secret's own account scope."""
+    from ministack.app import AUTH
+
+    if not AUTH:
+        return False
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    policy = secretsmanager._resource_policies.get(secret["ARN"])
+    ctx = EvalContext(principal_arn=_retrieval_session(role_arn), principal_type="AssumedRole",
+                      principal_account=parse_arn(role_arn).account_id, action="secretsmanager:GetSecretValue",
+                      resource_arn=secret["ARN"], region=get_region())
+    return not policy or evaluate_resource_policy(policy, ctx).decision != "Allow"
+
+
+def _cross_account_secret_error(secret_id, location_uri, role_arn):
+    """AWS reads another account's secret as the retrieval role. A secret
+    that isn't named by its exact ARN can't be shared, so it is refused; one
+    that can't be read (scheduled for deletion, without a value, under that
+    account's AWS managed key) is not found."""
+    secret = secretsmanager.find_secret(secret_id)
+    if not secret or secret["ARN"] != secret_id or _secret_policy_denies(secret, role_arn):
+        return _retrieval_denied(secret_id, role_arn)
+    # Scheduled for deletion, without a value, or under that account's AWS
+    # managed key, it is not found.
+    if not secretsmanager.secret_exists(secret_id) or not _is_customer_managed_key(secret.get("KmsKeyId")):
+        return _error(404, "ResourceNotFoundException", f"Secret {location_uri} not found")
+    return None
+
+
+def _kms_key_fields(identifier):
+    """KmsKeyIdentifier and the KmsKeyArn AWS derives from it as given, without looking the key up."""
+    if identifier.startswith("arn:"):
+        arn = identifier
+    else:
+        prefix = f"arn:aws:kms:{get_region()}:{get_account_id()}:"
+        arn = prefix + (identifier if identifier.startswith("alias/") else f"key/{identifier}")
+    return {"KmsKeyIdentifier": identifier, "KmsKeyArn": arn}
+
+
+def _is_customer_managed_key(key_id):
+    """True if *key_id* names a key in MiniStack's KMS, which holds only
+    customer managed keys; a key ARN is looked up in its own account. A key it
+    can't resolve, such as the AWS managed aws/secretsmanager key, is not one."""
+    try:
+        spec = parse_arn(key_id or "")
+    except ArnParseError:
+        return kms._resolve_key(key_id) is not None
+    with request_scope(spec.account_id, spec.region):
+        return kms._resolve_key(key_id) is not None
+
+
+_ACCOUNT_ID = re.compile(r"[0-9]{12}")
+# The partitions AWS accepts in a secret ARN location.
+_PARTITION = re.compile(r"aws|aws-cn|aws-iso|aws-iso-[a-z]|aws-us-gov|aws-eusc", re.ASCII)
+_SECRET_NAME_CHARS = re.compile(r"[A-Za-z0-9/_+=.@!-]+", re.ASCII)
+_SECRET_NAME = re.compile(r"[A-Za-z0-9/_+=.@!-]{1,512}", re.ASCII)
+
+
+def _is_secret_arn(value):
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return False
+    return (spec.service == "secretsmanager" and bool(spec.region) and _ACCOUNT_ID.fullmatch(spec.account_id)
+            and _PARTITION.fullmatch(spec.partition) is not None and spec.resource.startswith("secret:")
+            and _SECRET_NAME_CHARS.fullmatch(spec.resource[len("secret:"):]) is not None)
+
+
+def _secret_profile_request_error(location_uri, body):
+    """CreateConfigurationProfile's request checks for a Secrets Manager
+    location, which AWS makes before it looks up the application: the
+    RetrievalRoleArn's format with the Name, the profile type, then a
+    missing RetrievalRoleArn."""
+    role, name = body.get("RetrievalRoleArn"), body.get("Name")
+    errors = []
+    if role is not None:
+        # ASCII: Java's \d, which AWS's pattern uses, matches only 0-9.
+        if not re.fullmatch(_RETRIEVAL_ROLE_ARN_PATTERN, role, re.ASCII):
+            errors.append(f"Value '{role}' at 'retrievalRoleArn' failed to satisfy constraint: "
+                          f"Member must satisfy regular expression pattern: {_RETRIEVAL_ROLE_ARN_PATTERN}")
+        if len(role) < 20:
+            errors.append(f"Value '{role}' at 'retrievalRoleArn' failed to satisfy constraint: "
+                          f"Member must have length greater than or equal to 20")
+    if name is None:
+        errors.append("Value null at 'name' failed to satisfy constraint: Member must not be null")
+    elif name == "":
+        errors.append("Value '' at 'name' failed to satisfy constraint: Member must have length "
+                      "greater than or equal to 1")
+    if errors:
+        return _validation_error(errors)
+    if body.get("Type") == "AWS.AppConfig.FeatureFlags":
+        return _error(400, "BadRequestException",
+                      "ConfigurationProfiles of type 'AWS.AppConfig.FeatureFlags' can only have a "
+                      "locationUri of 'hosted'")
+    if role is None:
+        return _validation_error([
+            f"Value null at 'retrievalRoleArn' failed to satisfy constraint: Member must not be null "
+            f"if the request has the following uri: {location_uri}"])
+    return None
+
+
+def _secret_location_error(location_uri, body):
+    """CreateConfigurationProfile's checks of a Secrets Manager location
+    itself, after the application is found."""
+    role = body["RetrievalRoleArn"]
+    secret_id = _secret_id_for_location(location_uri)
+    if secret_id is None:
+        return _error(400, "BadRequestException", f"The Uri: {location_uri} is of an unsupported type")
+    # Secrets Manager reads what follows secretsmanager:// as a secret ARN or
+    # name; an ARN location's name must be a valid name too.
+    if location_uri.startswith(_SECRETS_MANAGER_SCHEME):
+        bad_name = not _is_secret_arn(secret_id) and not _SECRET_NAME.fullmatch(secret_id)
+    else:
+        bad_name = not _is_secret_arn(secret_id)
+    if bad_name:
+        return _secrets_manager_error(
+            "Invalid name. Must be a valid name containing alphanumeric characters, or any of the "
+            "following: -/_+=.@!")
+    account = _secret_account(secret_id)
+    if account != get_account_id():
+        with request_scope(account, get_region()):
+            return _cross_account_secret_error(secret_id, location_uri, role)
+    if not secretsmanager.secret_exists(secret_id):
+        return _error(404, "ResourceNotFoundException", f"Secret {location_uri} not found")
+    return None
+
+
 def _create_configuration_profile(app_id, body):
+    err = _string_member_type_error(body, ("LocationUri", "RetrievalRoleArn"))
+    if err:
+        return err
+    location_uri = body.get("LocationUri", "hosted")
+    secret_location = isinstance(location_uri, str) and _is_secrets_manager_uri(location_uri)
+    if secret_location:
+        err = _secret_profile_request_error(location_uri, body)
+        if err:
+            return err
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
     name = body.get("Name")
     if not name:
         return _error(400, "BadRequestException", "Name is required")
-    location_uri = body.get("LocationUri", "hosted")
+    if secret_location:
+        err = _secret_location_error(location_uri, body)
+        if err:
+            return err
     profile_id = _gen_id()
     record = {
         "ApplicationId": app_id,
@@ -330,25 +566,38 @@ def _create_configuration_profile(app_id, body):
         "Validators": body.get("Validators", []),
         "Type": body.get("Type", "AWS.Freeform"),
     }
+    if body.get("KmsKeyIdentifier"):
+        record.update(_kms_key_fields(body["KmsKeyIdentifier"]))
     _config_profiles[f"{app_id}/{profile_id}"] = record
     _apply_tags(_profile_arn(app_id, profile_id), body.get("Tags", {}))
     logger.info("CreateConfigurationProfile: %s/%s (%s)", app_id, name, profile_id)
-    return _json(201, record)
+    return _json(201, _profile_view(record))
 
 
 def _get_configuration_profile(app_id, profile_id):
     profile = _config_profiles.get(f"{app_id}/{profile_id}")
     if not profile:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
-    return _json(200, profile)
+    return _json(200, _profile_view(profile))
+
+
+def _profile_view(profile):
+    return to_output_shape("appconfig", "ConfigurationProfile", profile)
+
+
+def _profile_summary(profile):
+    summary = to_output_shape("appconfig", "ConfigurationProfileSummary", profile)
+    validator_types = [v["Type"] for v in profile.get("Validators") or [] if v.get("Type")]
+    if validator_types:
+        summary["ValidatorTypes"] = validator_types
+    return summary
 
 
 def _list_configuration_profiles(app_id, query):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
-    max_results = int(query.get("max_results", 50))
-    items = [p for p in _config_profiles.values() if p["ApplicationId"] == app_id]
-    return _json(200, {"Items": items[:max_results]})
+    items = [_profile_summary(p) for p in _config_profiles.values() if p["ApplicationId"] == app_id]
+    return _page(items, query)
 
 
 def _update_configuration_profile(app_id, profile_id, body):
@@ -358,7 +607,12 @@ def _update_configuration_profile(app_id, profile_id, body):
     for field in ("Name", "Description", "RetrievalRoleArn", "Validators"):
         if field in body:
             profile[field] = body[field]
-    return _json(200, profile)
+    if "KmsKeyIdentifier" in body:
+        profile.pop("KmsKeyIdentifier", None)
+        profile.pop("KmsKeyArn", None)
+        if body["KmsKeyIdentifier"]:
+            profile.update(_kms_key_fields(body["KmsKeyIdentifier"]))
+    return _json(200, _profile_view(profile))
 
 
 def _delete_configuration_profile(app_id, profile_id):
@@ -395,7 +649,8 @@ def _next_hosted_version_number(app_id, profile_id):
     return number
 
 
-def _create_hosted_configuration_version(app_id, profile_id, body, content_type, version_label=None):
+def _create_hosted_configuration_version(app_id, profile_id, body, content_type, version_label=None,
+                                         description=None):
     if f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
 
@@ -407,10 +662,13 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type,
         "VersionNumber": version_number,
         "ContentType": content_type,
         "Content": body,
-        "Description": "",
+        "Description": description or "",
     }
     if version_label:
         record["VersionLabel"] = version_label
+    kms_key_arn = _config_profiles[f"{app_id}/{profile_id}"].get("KmsKeyArn")
+    if kms_key_arn:
+        record["KmsKeyArn"] = kms_key_arn
     _hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = record
     logger.info("CreateHostedConfigurationVersion: %s/%s v%d", app_id, profile_id, version_number)
 
@@ -422,6 +680,10 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type,
     }
     if version_label:
         resp_headers["VersionLabel"] = version_label
+    if description:
+        resp_headers["Description"] = description
+    if kms_key_arn:
+        resp_headers["KmsKeyArn"] = kms_key_arn
     return 201, resp_headers, body if isinstance(body, bytes) else body.encode("utf-8")
 
 
@@ -440,13 +702,16 @@ def _get_hosted_configuration_version(app_id, profile_id, version_number):
     }
     if record.get("VersionLabel"):
         resp_headers["VersionLabel"] = record["VersionLabel"]
+    if record.get("Description"):
+        resp_headers["Description"] = record["Description"]
+    if record.get("KmsKeyArn"):
+        resp_headers["KmsKeyArn"] = record["KmsKeyArn"]
     return 200, resp_headers, content if isinstance(content, bytes) else content.encode("utf-8")
 
 
 def _list_hosted_configuration_versions(app_id, profile_id, query):
     if f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
-    max_results = int(query.get("max_results", 50))
     items = []
     for k, v in _hosted_versions.items():
         if k.startswith(f"{app_id}/{profile_id}/"):
@@ -457,8 +722,9 @@ def _list_hosted_configuration_versions(app_id, profile_id, query):
                 "ContentType": v["ContentType"],
                 "Description": v.get("Description", ""),
                 **({"VersionLabel": v["VersionLabel"]} if v.get("VersionLabel") else {}),
+                **({"KmsKeyArn": v["KmsKeyArn"]} if v.get("KmsKeyArn") else {}),
             })
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _delete_hosted_configuration_version(app_id, profile_id, version_number):
@@ -553,9 +819,8 @@ def _get_deployment_strategy(strategy_id):
 
 
 def _list_deployment_strategies(query):
-    max_results = int(query.get("max_results", 50))
     items = [*_deployment_strategies.values(), *_PREDEFINED_DEPLOYMENT_STRATEGIES.values()]
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _update_deployment_strategy(strategy_id, body):
@@ -724,10 +989,276 @@ def _refresh_environment(app_id, env_id):
 def _deployment_view(record):
     view = {k: v for k, v in record.items() if not k.startswith("_")}
     view["EventLog"] = list(reversed(record.get("_Events", [])))  # most recent first
-    return view
+    return to_output_shape("appconfig", "Deployment", view)
 
 
-def _start_deployment(app_id, env_id, body):
+def _secret_id_for_location(location_uri):
+    """The Secrets Manager secret a profile's LocationUri names
+    (`secretsmanager://<name or ARN>` or a secret ARN), or None. AWS calls an
+    ARN without a known partition, a region, a 12-digit account or a `secret:`
+    resource "of an unsupported type"."""
+    if location_uri.startswith(_SECRETS_MANAGER_SCHEME):
+        return location_uri[len(_SECRETS_MANAGER_SCHEME):]
+    try:
+        spec = parse_arn(location_uri)
+    except ArnParseError:
+        return None
+    if (spec.service != "secretsmanager" or not spec.region or not _ACCOUNT_ID.fullmatch(spec.account_id)
+            or not _PARTITION.fullmatch(spec.partition) or not spec.resource.startswith("secret:")):
+        return None
+    return location_uri
+
+
+def _first_utf16_units(text, count):
+    """The first *count* UTF-16 code units of *text*, as Secrets Manager cuts
+    a long value in its message; half of a split character shows as "?"."""
+    units = text.encode("utf-16-le", "surrogatepass")[:count * 2]
+    return units.decode("utf-16-le", "surrogatepass").encode("utf-8", "replace").decode("utf-8")
+
+
+def _secret_version_length_error(version):
+    """Secrets Manager's VersionId length check, as AppConfig passes it on."""
+    if len(version) < 32:
+        constraint = "Member must have length greater than or equal to 32"
+    elif len(version) > 64:
+        constraint = "Member must have length less than or equal to 64"
+    else:
+        return None
+    shown = version if len(version) <= 64 else _first_utf16_units(version, 64) + " ..."
+    return _error(400, "BadRequestException",
+                  f"1 validation error detected: Value '{shown}' at 'versionId' failed to satisfy "
+                  f"constraint: {constraint} (Service: AWSSecretsManager; Status Code: 400; "
+                  f"Error Code: ValidationException; Request ID: {uuid.uuid4()}; Proxy: null)")
+
+
+# What AWS types as JSON when it serves a SecretString. Its parser reads only
+# the first JSON value: whitespace alone counts, anything after an array or
+# object or a string is ignored, a number at the top level must be followed by
+# whitespace or the end, and a literal can't run on into an identifier character. It allows 1000 levels of
+# nesting, an integer of up to 1000 digits, and a number with a fraction or
+# exponent of up to 1001 digits in all (signs don't count). Checked without
+# recursion, so the depth doesn't depend on Python's recursion limit.
+_MAX_JSON_DEPTH = 1000
+_JSON_SPACE = " \t\n\r"
+_JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE][+-]?([0-9]+))?", re.ASCII)
+_JSON_STRING = re.compile(r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"')
+_JSON_LITERALS = ("true", "false", "null")
+
+
+# Unicode categories Java counts as part of an identifier, besides letters and
+# digits: currency signs, connectors, letter numbers, marks and format characters.
+_JAVA_IDENTIFIER_CATEGORIES = {"Sc", "Pc", "Nl", "Mn", "Mc", "Cf"}
+
+
+def _runs_into_literal(ch):
+    """Whether *ch* right after true/false/null makes AWS refuse the literal:
+    a character from "0" up, other than "]" and "}", that Java counts as part
+    of an identifier (so "$" and "." don't, a letter, digit, "_", DEL or a
+    C1 control does)."""
+    if ch < "0" or ch in "]}":
+        return False
+    if ch.isalnum() or ch == "_" or "\x7f" <= ch <= "\x9f":
+        return True
+    return unicodedata.category(ch) in _JAVA_IDENTIFIER_CATEGORIES
+
+
+def _json_scalar_end(text, i):
+    """The end of the JSON number, string or literal at *i*, or -1."""
+    match = _JSON_STRING.match(text, i)
+    if match:
+        return match.end()
+    match = _JSON_NUMBER.match(text, i)
+    if match:
+        whole, fraction, exponent = match.groups()
+        if fraction is None and exponent is None:
+            too_long = len(whole) > 1000
+        else:
+            too_long = len(whole) + len(fraction or "") + len(exponent or "") > 1001
+        return -1 if too_long else match.end()
+    for literal in _JSON_LITERALS:
+        if text.startswith(literal, i):
+            end = i + len(literal)
+            if end < len(text) and _runs_into_literal(text[end]):
+                return -1
+            return end
+    return -1
+
+
+def _is_json(text):
+    def skip(i):
+        while i < len(text) and text[i] in _JSON_SPACE:
+            i += 1
+        return i
+
+    i = skip(0)
+    if i == len(text):
+        return True
+    stack = []          # open "[" / "{"
+    expect = "value"    # value | key | colon | next
+    while True:
+        i = skip(i)
+        if i == len(text):
+            return False
+        ch = text[i]
+        if expect == "value":
+            if ch in "[{":
+                stack.append(ch)
+                if len(stack) > _MAX_JSON_DEPTH:
+                    return False
+                i = skip(i + 1)
+                if i < len(text) and text[i] == ("]" if ch == "[" else "}"):
+                    stack.pop()
+                    i += 1
+                    if not stack:
+                        return True
+                    expect = "next"
+                else:
+                    expect = "value" if ch == "[" else "key"
+                continue
+            end = _json_scalar_end(text, i)
+            if end < 0:
+                return False
+            if not stack:
+                return text[i].isalpha() or end == len(text) or text[end] in _JSON_SPACE or text[i] == '"'
+            i, expect = end, "next"
+        elif expect == "key":
+            match = _JSON_STRING.match(text, i)
+            if not match:
+                return False
+            i, expect = match.end(), "colon"
+        elif expect == "colon":
+            if ch != ":":
+                return False
+            i, expect = i + 1, "value"
+        else:  # next: a comma or the close of the open container
+            if ch == ",":
+                i, expect = i + 1, ("value" if stack[-1] == "[" else "key")
+            elif ch == ("]" if stack[-1] == "[" else "}"):
+                stack.pop()
+                i += 1
+                if not stack:
+                    return True
+            else:
+                return False
+
+
+def _deployed_secret_content(secret_id, location_uri, version, body, role_arn=""):
+    """Returns ((content, content_type), None) for the secret version a
+    deployment names, or (None, error)."""
+    err = _secret_version_length_error(version)
+    if err:
+        return None, err
+    # Another account's secret, and its key, are read in that account.
+    caller, owner = get_account_id(), _secret_account(secret_id)
+    with request_scope(owner, get_region()):
+        secret, secret_version = secretsmanager.resolve_secret_version(secret_id, version)
+        customer_key = secret is not None and _is_customer_managed_key(secret.get("KmsKeyId"))
+        denied = (secret is not None and owner != caller and role_arn
+                  and _secret_policy_denies(secret, role_arn))
+    if denied:
+        return None, _retrieval_denied(secret_id, role_arn)
+    # A version without a value (MiniStack's Secrets Manager makes one for a
+    # secret created without a value) doesn't exist on AWS; the version is
+    # checked before the key.
+    if not secret_version or (secret_version.get("SecretString") is None
+                              and secret_version.get("SecretBinary") is None):
+        return None, _error(404, "ResourceNotFoundException", f"Secret {location_uri} not found")
+    if customer_key and not body.get("KmsKeyIdentifier"):
+        return None, _error(400, "BadRequestException",
+                            "KmsKeyIdentifier required when deploying an AWS Secrets Manager secret "
+                            "that is encrypted with a customer managed key (CMK)")
+    if secret_version.get("SecretString") is None:
+        try:
+            content = base64.b64decode(secret_version["SecretBinary"], validate=True)
+        except (binascii.Error, TypeError, ValueError):
+            # AWS refuses such a SecretBinary at CreateSecret; MiniStack's
+            # Secrets Manager stores it, so there is no version to serve.
+            return None, _error(404, "ResourceNotFoundException", f"Secret {location_uri} not found")
+        return (content, "application/octet-stream"), None
+    text = secret_version["SecretString"]
+    content_type = "application/json" if _is_json(text) else "application/octet-stream"
+    # A lone surrogate comes back from AWS as "?".
+    return (text.encode("utf-8", "replace"), content_type), None
+
+
+_DEPLOYMENT_STRATEGY_ID_PATTERN = r"(^[a-z0-9]{4,7}$|^AppConfig\.[A-Za-z0-9]{9,40}$)"
+
+
+def _kms_error(message, code):
+    return _error(400, "BadRequestException",
+                  f"{message} (Service: AWSKMS; Status Code: 400; Error Code: {code}; "
+                  f"Request ID: {uuid.uuid4()}; Proxy: null)")
+
+
+def _hosted_version_key_error(key_identifier, caller_arn):
+    """StartDeployment of a hosted version encrypted with a customer managed key (captured on AWS)."""
+    if not key_identifier:
+        return _error(400, "BadRequestException",
+                      "KmsKeyIdentifier required when deploying a hosted configuration version that is "
+                      "encrypted with a customer managed key (CMK)")
+    try:
+        spec = parse_arn(key_identifier)
+        scope = (spec.account_id, spec.region)
+    except ArnParseError:
+        scope = (get_account_id(), get_region())
+    if scope[0] != get_account_id():
+        return _kms_error(
+            f"User: {caller_arn} is not authorized to perform: kms:GenerateDataKey on this resource because the "
+            "resource does not exist in this Region, no resource-based policies allow access, or a resource-based "
+            "policy explicitly denies access", "AccessDeniedException")
+    with request_scope(*scope):
+        key = kms._resolve_key(key_identifier)
+    if key is None:
+        return _kms_error(f"Key '{key_identifier}' does not exist", "NotFoundException")
+    if key.get("KeyState") == "Disabled" or key.get("Enabled") is False:
+        return _kms_error(f"{key_identifier} is disabled.", "DisabledException")
+    return None
+
+
+def _caller_arn(headers):
+    from ministack.services import sts
+
+    identity = sts._caller_identity(headers or {})
+    if isinstance(identity, dict) and identity.get("userArn"):
+        return identity["userArn"]
+    return f"arn:aws:iam::{get_account_id()}:root"
+
+
+def _start_deployment_validation_errors(body):
+    """StartDeployment's member constraints, listed in the order AWS reports them."""
+    errors = []
+    for member, wire, required, max_length in (("ConfigurationVersion", "configurationVersion", True, 1024),
+                                               ("KmsKeyIdentifier", "kmsKeyIdentifier", False, 2048),
+                                               ("ConfigurationProfileId", "configurationProfileId", True, 128),
+                                               ("Description", "description", False, 1024),
+                                               ("DeploymentStrategyId", "deploymentStrategyId", True, None)):
+        value = body.get(member)
+        if value is None:
+            if required:
+                errors.append(f"Value null at '{wire}' failed to satisfy constraint: Member must not be null")
+        elif member == "DeploymentStrategyId":
+            if not re.fullmatch(_DEPLOYMENT_STRATEGY_ID_PATTERN, value, re.ASCII):
+                errors.append(f"Value '{value}' at '{wire}' failed to satisfy constraint: Member must "
+                              f"satisfy regular expression pattern: {_DEPLOYMENT_STRATEGY_ID_PATTERN}")
+        elif value == "" and member != "Description":
+            errors.append(f"Value '' at '{wire}' failed to satisfy constraint: Member must have "
+                          f"length greater than or equal to 1")
+        elif len(value) > max_length:
+            errors.append(f"Value '{value}' at '{wire}' failed to satisfy constraint: Member must have "
+                          f"length less than or equal to {max_length}")
+    return errors
+
+
+def _start_deployment(app_id, env_id, body, caller_arn=None):
+    err = _string_member_type_error(body, ("ConfigurationVersion", "KmsKeyIdentifier", "ConfigurationProfileId",
+                                           "DeploymentStrategyId", "Description"))
+    if err:
+        return err
+    errors = _start_deployment_validation_errors(body)
+    if errors:
+        return _validation_error(errors)
+    version = body["ConfigurationVersion"]
+
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
     if f"{app_id}/{env_id}" not in _environments:
@@ -735,28 +1266,45 @@ def _start_deployment(app_id, env_id, body):
 
     strategy_id = body.get("DeploymentStrategyId", "")
     profile_id = body.get("ConfigurationProfileId", "")
-    version = body.get("ConfigurationVersion", "")
+
+    # After the request itself, AWS checks for a deployment in progress, then
+    # the profile, the secret, the strategy and LatestDeploymentNumber.
+    existing = _refresh_environment(app_id, env_id)
+    in_progress = [d for d in existing if d["State"] in _IN_PROGRESS_STATES]
+    if in_progress:
+        state = _ENVIRONMENT_STATE_BY_DEPLOYMENT_STATE[in_progress[-1]["State"]]
+        return _error(409, "ConflictException",
+                      f"Environment {env_id} currently has a state of {state}. The current "
+                      f"deployment must finish before a new deployment can be started.")
 
     if profile_id and f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
+
+    location_uri = _config_profiles.get(f"{app_id}/{profile_id}", {}).get("LocationUri", "hosted")
+    secret_id = _secret_id_for_location(location_uri) if isinstance(location_uri, str) else None
+    secret_content = None
+    if secret_id is not None:
+        role_arn = _config_profiles[f"{app_id}/{profile_id}"].get("RetrievalRoleArn", "")
+        secret_content, err = _deployed_secret_content(secret_id, location_uri, version, body, role_arn)
+        if err:
+            return err
+    elif _hosted_versions.get(f"{app_id}/{profile_id}/{version}", {}).get("KmsKeyArn"):
+        err = _hosted_version_key_error(body.get("KmsKeyIdentifier"),
+                                        caller_arn or f"arn:aws:iam::{get_account_id()}:root")
+        if err:
+            return err
 
     strategy = _find_deployment_strategy(strategy_id)
     if not strategy:
         return _error(404, "ResourceNotFoundException",
                       f"DeploymentStrategy with Id {strategy_id} could not be found.")
 
-    existing = _refresh_environment(app_id, env_id)
     latest_number = existing[-1]["DeploymentNumber"] if existing else 0
     expected = body.get("LatestDeploymentNumber")
     if expected is not None and expected != latest_number:
         return _error(409, "ConflictException",
                       f"LatestDeploymentNumber {expected} does not match the latest deployment "
                       f"number {latest_number}.")
-    in_progress = [d for d in existing if d["State"] in _IN_PROGRESS_STATES]
-    if in_progress:
-        return _error(409, "ConflictException",
-                      f"Deployment {in_progress[-1]['DeploymentNumber']} is already in progress "
-                      f"in environment {env_id}.")
     deploy_num = latest_number + 1
 
     now = time.time()
@@ -767,7 +1315,7 @@ def _start_deployment(app_id, env_id, body):
         "ConfigurationProfileId": profile_id,
         "DeploymentNumber": deploy_num,
         "ConfigurationName": _config_profiles.get(f"{app_id}/{profile_id}", {}).get("Name", ""),
-        "ConfigurationLocationUri": "hosted",
+        "ConfigurationLocationUri": location_uri if secret_id is not None else "hosted",
         "ConfigurationVersion": version,
         "Description": body.get("Description", ""),
         **_deployment_params_from_strategy(strategy),
@@ -776,9 +1324,15 @@ def _start_deployment(app_id, env_id, body):
         "StartedAt": _iso(now),
         "_StartedEpoch": now,
     }
+    if secret_content is not None:
+        # Kept with the deployment: AWS still serves it after the secret is deleted.
+        record["_Content"], record["_ContentType"] = secret_content
     version_label = _hosted_versions.get(f"{app_id}/{profile_id}/{version}", {}).get("VersionLabel")
     if version_label:
         record["VersionLabel"] = version_label
+    if body.get("KmsKeyIdentifier"):
+        record.update(_kms_key_fields(body["KmsKeyIdentifier"]))
+    _apply_tags(_deployment_arn(app_id, env_id, deploy_num), body.get("Tags") or {})
     _add_deployment_event(record, "DEPLOYMENT_STARTED", "USER", "Deployment started", now)
     _deployments[f"{app_id}/{env_id}/{deploy_num}"] = record
     _refresh_environment(app_id, env_id)
@@ -798,13 +1352,13 @@ def _get_deployment(app_id, env_id, deploy_num):
 def _list_deployments(app_id, env_id, query):
     if f"{app_id}/{env_id}" not in _environments:
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
-    max_results = int(query.get("max_results", 50))
     items = []
-    for v in _refresh_environment(app_id, env_id):
+    for v in reversed(_refresh_environment(app_id, env_id)):
         item = {
             "DeploymentNumber": v["DeploymentNumber"],
+            "ConfigurationProfileId": v.get("ConfigurationProfileId", ""),
             "ConfigurationName": v.get("ConfigurationName", ""),
-            "ConfigurationVersion": v.get("ConfigurationVersion", ""),
+            "ConfigurationVersion": str(v.get("ConfigurationVersion", "")),
             "DeploymentDurationInMinutes": v.get("DeploymentDurationInMinutes", 0),
             "GrowthType": v.get("GrowthType", "LINEAR"),
             "GrowthFactor": v.get("GrowthFactor", 100.0),
@@ -812,12 +1366,13 @@ def _list_deployments(app_id, env_id, query):
             "State": v.get("State", "COMPLETE"),
             "PercentageComplete": v.get("PercentageComplete", 100.0),
             "StartedAt": v.get("StartedAt", ""),
+            "Type": "USER",
         }
         for optional in ("CompletedAt", "VersionLabel"):
             if v.get(optional):
                 item[optional] = v[optional]
         items.append(item)
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _stop_deployment(app_id, env_id, deploy_num, allow_revert=False):
@@ -929,6 +1484,9 @@ def _resolve_tag_resource_arn(resource_arn):
 
 
 def _tag_resource(resource_arn, body):
+    err = _tag_arn_account_error(resource_arn)
+    if err:
+        return err
     resource_arn, err = _resolve_tag_resource_arn(resource_arn)
     if err:
         return err
@@ -938,6 +1496,9 @@ def _tag_resource(resource_arn, body):
 
 
 def _untag_resource(resource_arn, tag_keys):
+    err = _tag_arn_account_error(resource_arn)
+    if err:
+        return err
     resource_arn, err = _resolve_tag_resource_arn(resource_arn)
     if err:
         return err
@@ -947,7 +1508,28 @@ def _untag_resource(resource_arn, tag_keys):
     return _json(204, {})
 
 
+def _tag_arn_account_error(resource_arn):
+    """The tag APIs' answer for an AppConfig ARN without this account (captured on AWS)."""
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None
+    if spec.service != "appconfig":
+        return None
+    if not spec.account_id:
+        return _error(400, "BadRequestException",
+                      f"ARN {resource_arn} is invalid due to not containing an account ID.")
+    if spec.account_id != get_account_id():
+        return _error(403, "AccessDeniedException",
+                      f"Cross-account resources are not permitted for this API. ARN {resource_arn} references "
+                      f"a resource outside of account {get_account_id()}.")
+    return None
+
+
 def _list_tags_for_resource(resource_arn):
+    err = _tag_arn_account_error(resource_arn)
+    if err:
+        return err
     resource_arn, err = _resolve_tag_resource_arn(resource_arn)
     if err:
         return err
@@ -1056,7 +1638,10 @@ def _get_latest_configuration(token):
     deployment = _served_deployment(app_id, env_id, profile_id, session_id)
     if deployment:
         cfg_version = deployment.get("ConfigurationVersion", "")
-        version_record = _hosted_versions.get(f"{app_id}/{profile_id}/{cfg_version}")
+        if "_Content" in deployment:
+            version_record = {"Content": deployment["_Content"], "ContentType": deployment["_ContentType"]}
+        else:
+            version_record = _hosted_versions.get(f"{app_id}/{profile_id}/{cfg_version}")
         if version_record:
             content_type = version_record.get("ContentType", "application/octet-stream")
             version_label = version_record.get("VersionLabel")
@@ -1065,8 +1650,12 @@ def _get_latest_configuration(token):
             if session.get("LastServedVersion") != cfg_version:
                 raw = version_record["Content"]
                 content = raw if isinstance(raw, bytes) else raw.encode("utf-8")
-                content = _retrieval_time_content(app_id, profile_id, content)
+                if "_Content" not in deployment:  # only a hosted profile can be AWS.AppConfig.FeatureFlags
+                    content = _retrieval_time_content(app_id, profile_id, content)
                 session["LastServedVersion"] = cfg_version
+            else:
+                # AWS types the empty body of an unchanged poll as JSON.
+                content_type = "application/json"
 
     next_token = uuid.uuid4().hex
     _sessions[next_token] = session
@@ -1132,7 +1721,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         app_id, profile_id = m.group(1), m.group(2)
         ct = content_type or "application/octet-stream"
         return await _a(_create_hosted_configuration_version(app_id, profile_id, body_bytes, ct,
-                                                             headers.get("versionlabel")))
+                                                             headers.get("versionlabel"),
+                                                             headers.get("description")))
 
     m = re.fullmatch(
         r"/applications/([^/]+)/configurationprofiles/([^/]+)/hostedconfigurationversions/(\d+)",
@@ -1181,7 +1771,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if m:
         app_id, env_id = m.group(1), m.group(2)
         if method == "POST":
-            return await _a(_start_deployment(app_id, env_id, body))
+            return await _a(_start_deployment(app_id, env_id, body, _caller_arn(headers)))
         if method == "GET":
             return await _a(_list_deployments(app_id, env_id, query))
 
